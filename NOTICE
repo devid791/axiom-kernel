@@ -1,0 +1,12 @@
+Axiom Kernel
+Copyright (c) 2026 Davide Zenati / SynapseCorp
+
+This repository contains a vendored source snapshot of FlashInfer under
+third_party/flashinfer. FlashInfer is distributed under the Apache License,
+Version 2.0. Its upstream license and notice are preserved in:
+
+  third_party/flashinfer/LICENSE
+  third_party/flashinfer/NOTICE
+
+All other third-party code, if introduced by a downstream build or model
+adapter, remains subject to that component's own license.

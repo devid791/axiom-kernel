@@ -1,0 +1,32 @@
+{
+  "release_id": "axiom-kernel-public-2026-08-20",
+  "project": "Axiom Kernel",
+  "license": "MIT",
+  "source_commit": "7945f8bf595039c5e3be50896b16bdf86ca3fa1c",
+  "public_history": "fresh-public-snapshot",
+  "artifact_hashes": {
+    "lib/libaxiom.so": "d87f251db00b33374b23e12b664fcfa385e83bfcbf3e5fba88cb522680b08350",
+    "bin/axiom-qwen38-generate": "44f9f0bb085f8225a4cc1f764ea815ec64871981c6900cb31d2ffe9860be6bc1"
+  },
+  "config_hashes": {
+    "Makefile": "8fffddc329b7d6f7d004dabd87e7ae8d347b2b1fd3c2300be87469d41d5825c8"
+  },
+  "checkpoint_hashes": {},
+  "gate_results": {
+    "public_scan": "pass",
+    "host_tests": "pass",
+    "cuda_compile_sm120": "pass",
+    "cuda_link": "pass",
+    "model_runtime_gate": "not_run-model-artifacts-not-published",
+    "gpu_benchmark": "not_run-production-gpu-left-undisturbed"
+  },
+  "installed_paths": [],
+  "health_snapshot": {
+    "public_kernel": "library-and-cli-linked",
+    "production_service_touched": false,
+    "weights_in_repository": false,
+    "private_endpoints_in_repository": false,
+    "activation_steering_in_public_build": false,
+    "dflash2_executor_in_public_build": false
+  }
+}

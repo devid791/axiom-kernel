@@ -1,0 +1,8 @@
+FlashInfer source headers in this directory are an Apache-2.0 source snapshot
+provided with the Qwen3.8 target single-prefill bundle.
+
+Upstream project: https://github.com/flashinfer-ai/flashinfer
+Copyright (c) 2023-2026 FlashInfer contributors.
+
+The Axiom-native integration in src/axiom_qwen38_flashinfer.cu is original
+glue code and does not introduce a Python, TVM, or SGLang runtime dependency.

@@ -1,0 +1,40 @@
+# Project Axiom — line-ending & diff policy.
+# Goal: stop the CRLF/LF drift (src/axiom_cuda.cu is currently CRLF while every
+# other source is LF). Text files are normalized to LF *in the repository*.
+#
+# NOTE: adding this file does NOT rewrite existing files. To fix the legacy
+# CRLF in src/axiom_cuda.cu in one coordinated commit, run:
+#     git add --renormalize .
+#     git commit -m "chore: normalize line endings to LF"
+# (kept as a separate step so it doesn't collide with in-flight work.)
+
+# Default: treat as text, normalize to LF on commit.
+*               text=auto eol=lf
+
+# Explicit source/text types -> always LF.
+*.c             text eol=lf
+*.h             text eol=lf
+*.cpp           text eol=lf
+*.cu            text eol=lf
+*.cuh           text eol=lf
+*.py            text eol=lf
+*.sh            text eol=lf
+*.md            text eol=lf
+*.toml          text eol=lf
+*.json          text eol=lf
+*.jsonl         text eol=lf
+*.env           text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+Makefile        text eol=lf
+.gitattributes  text eol=lf
+.gitignore      text eol=lf
+
+# Binary / generated — never touch, never diff.
+*.png           binary
+*.snap          binary
+*.gguf          binary
+*.safetensors   binary
+*.tgz           binary
+*.so            binary
+*.o             binary
