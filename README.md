@@ -6,6 +6,8 @@ it contains kernel code, public headers, tests, performance probes and design
 documentation; it does not contain model weights, private service daemons,
 deployment files, credentials, internal endpoints, or production machines.
 
+Axiom is an owned GPU inference kernel and a multi-family, OpenAI-compatible inference daemon, written and owned by Davide Zenati. It is not vLLM, llama.cpp, GGML, or a fork of any of them. This public repository is the sanitized kernel source release; the private serving daemon and its adapters are intentionally maintained outside this repository.
+
 The runtime is multi-family by design. The stable C ABI and the family-agnostic
 step-engine ABI are separate from model-specific math. The public snapshot
 includes the native Qwen3.8 path as the primary complete integration, reusable

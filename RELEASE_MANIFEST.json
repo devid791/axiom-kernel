@@ -9,7 +9,8 @@
     "bin/axiom-qwen38-generate": "44f9f0bb085f8225a4cc1f764ea815ec64871981c6900cb31d2ffe9860be6bc1"
   },
   "config_hashes": {
-    "Makefile": "8fffddc329b7d6f7d004dabd87e7ae8d347b2b1fd3c2300be87469d41d5825c8"
+    "Makefile": "8fffddc329b7d6f7d004dabd87e7ae8d347b2b1fd3c2300be87469d41d5825c8",
+    "README.md": "957bbfcec6e1edbec451d062ca903826478bb069ee1c0f14f5aea36180f0d978"
   },
   "checkpoint_hashes": {},
   "gate_results": {
