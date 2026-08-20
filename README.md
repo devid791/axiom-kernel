@@ -77,6 +77,13 @@ fixture-specific observation, not a universal guarantee of this source tree or
 of another GPU. Reproduce performance only with the same weights, toolchain,
 CUDA architecture, sampling policy and benchmark protocol.
 
+## Community
+
+Please read [CONTRIBUTING](CONTRIBUTING.md), [CODE_OF_CONDUCT](CODE_OF_CONDUCT.md)
+and [SECURITY](SECURITY.md) before opening an issue or pull request. Use the
+repository templates so reports include reproducible environment details
+without exposing private data.
+
 ## Licensing
 
 Axiom-owned source is released under the MIT License. Vendored dependencies
