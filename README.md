@@ -1,5 +1,11 @@
 # Axiom Kernel
 
+**Model-agnostic GPU inference core with native family backends.**
+
+> **Axiom is the kernel. Qwen3.8 is the current production reference backend,
+> not the name or architectural limit of the project.** File and symbol names
+> prefixed with `qwen38` are intentionally scoped to that backend.
+
 Axiom is a native C++17/CUDA inference kernel for quantized and mixed-precision
 large language model execution. The public tree is a sanitized source release:
 it contains kernel code, public headers, tests, performance probes and design
@@ -8,12 +14,24 @@ deployment files, credentials, internal endpoints, or production machines.
 
 Axiom is an owned GPU inference kernel and a multi-family, OpenAI-compatible inference daemon, written and owned by Davide Zenati. It is not vLLM, llama.cpp, GGML, or a fork of any of them. This public repository is the sanitized kernel source release; the private serving daemon and its adapters are intentionally maintained outside this repository.
 
-The runtime is multi-family by design. The stable C ABI and the family-agnostic
+The runtime is multi-family by design. The stable C ABI and family-neutral
 step-engine ABI are separate from model-specific math. The public snapshot
-includes the native Qwen3.8 path as the primary complete integration, reusable
-NVFP4/FP8 primitives, the generic engine contracts and a standalone Gemma-4
-reference adapter. Private/legacy service adapters are intentionally outside
-this public kernel snapshot.
+includes the native Qwen3.8 path as its first complete reference integration,
+reusable NVFP4/FP8/BF16 primitives, generic engine contracts and additional
+family onboarding work. Private service adapters remain outside this public
+kernel snapshot.
+
+## Architecture at a glance
+
+| Layer | Responsibility | Public examples |
+| --- | --- | --- |
+| Axiom core | Stable C ABI, tensor/model I/O, scheduling and family-neutral execution contracts | `axiom.h`, `axiom_engine.h`, `axiom_runtime.cpp` |
+| Device primitives | Quantized linear algebra, attention, RoPE, MoE and paged KV building blocks | `axiom_cuda*.cu` |
+| Model backends | Architecture-specific topology, weights, token flow and verification | `qwen38_*` reference backend; Gemma and DeepSeek integration components |
+| Serving layer | HTTP protocols, authentication, tools and deployment policy | Deliberately outside this public repository |
+
+See [Architecture and model backends](docs/ARCHITECTURE.md) for the exact
+boundary and maturity of each public integration.
 
 ## Included capabilities
 
@@ -21,7 +39,7 @@ this public kernel snapshot.
 | --- | --- |
 | Native execution | C++17 host ABI, CUDA device runtime, Blackwell-oriented kernels |
 | Quantization | NVIDIA NVFP4/E2M1, FP8 E4M3, BF16 and fused MoE primitives |
-| Qwen3.8 | Native 27B decoder, GDN, attention, MLP banks, NVFP4/FP8 LM head |
+| Reference backend | Qwen3.8 native 27B decoder, GDN, attention, MLP banks and NVFP4/FP8 LM head |
 | Decode path | DSpark/M8 temporal speculative path and device-side verification ABI |
 | Attention | FlashInfer headers vendored under their upstream license |
 | KV | Paged KV, persistent sessions, hot GPU pages, cold NVMe pages and bounded crash-safe lifecycle GC |

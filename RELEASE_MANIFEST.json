@@ -1,6 +1,7 @@
 {
-  "release_id": "axiom-kernel-v0.3.0-public",
+  "release_id": "axiom-kernel-v0.3.1-public",
   "release_date": "2026-08-22",
+  "release_type": "documentation-clarification",
   "project": "Axiom Kernel",
   "license": "MIT",
   "source_commit": "3ae57422ff8fcb7ebcf8f12074a2c16d921eed53",
@@ -22,7 +23,9 @@
   },
   "config_hashes": {
     "Makefile": "be3c3f6dcbb94715a2eac8e060329274244a3dc255273e855d1d1393a4539708",
-    "README.md": "14a03f14ddb17573f51bc8eb9a44ccdbdafea867b579ca92c5deca0f0a07fa13"
+    "README.md": "81b60e7d44b946b43d81839b1a159f55903409d945cda344310ed80ab9059cb4",
+    "docs/ARCHITECTURE.md": "c9e074e2768c020ed43854c6adf2fd64429a976dd1e1886cafc35a29e3bfa8d5",
+    "docs/PUBLIC_SCOPE.md": "419968860e74511c57052fb1a58c5bd7347b0357606ed9a1d773ac5987cce815"
   },
   "checkpoint_hashes": {},
   "gate_results": {
@@ -39,6 +42,7 @@
     "production_lifecycle_gc": "pass-active-session-protection-and-idempotent-cleanup",
     "production_http_benchmark": "pass-four-consecutive-byte-exact-runs"
   },
+  "runtime_delta_from_v0_3_0_public": "none",
   "benchmark_snapshot": {
     "gpu_class": "RTX 5090",
     "prompt_tokens": 1002,

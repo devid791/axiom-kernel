@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.1-public — 2026-08-22
+
+- Clarified that Axiom is the model-agnostic kernel and Qwen3.8 is its current
+  complete production reference backend.
+- Documented the boundary between the generic ABI, reusable CUDA primitives,
+  model-family backends and the separately maintained serving layer.
+- Added an evidence-based model-backend maturity matrix. No runtime code or
+  benchmark result changed in this documentation release.
+
 ## v0.3.0-public — 2026-08-22
 
 - Added configurable TTL/LRU retention for complete persistent-session
