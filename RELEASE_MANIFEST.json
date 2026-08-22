@@ -1,13 +1,20 @@
 {
-  "release_id": "axiom-kernel-v0.2.0-public",
+  "release_id": "axiom-kernel-v0.3.0-public",
   "release_date": "2026-08-22",
   "project": "Axiom Kernel",
   "license": "MIT",
-  "source_commit": "41403d5fed91f3481d92ae111e83fa75f544dcbb",
-  "production_evidence_commit": "a02799e241d68c24433e429ed96fdaa7159b653a",
+  "source_commit": "3ae57422ff8fcb7ebcf8f12074a2c16d921eed53",
+  "production_evidence_commit": "defb646261b021766f5fbde40894a27aa7b417fe",
   "public_history": "sanitized-public-snapshot",
+  "build_snapshot": {
+    "cuda_toolkit": "13.3.73",
+    "host_compiler": "g++ 13.3.0",
+    "cuda_arch": "sm_120",
+    "vision": true,
+    "media_decoder": false
+  },
   "artifact_hashes": {
-    "lib/libaxiom.so": "cee469800501a0b0e81c0be00fa14fece80ed9577748b0c6ee34bb27cedcd5dd",
+    "lib/libaxiom.so": "10b10683af4360a39b4d0b07c1939a01bd6adb907270415a4d1c5abd0f26a517",
     "bin/axiom-qwen38-generate": "44f9f0bb085f8225a4cc1f764ea815ec64871981c6900cb31d2ffe9860be6bc1",
     "bin/axiom-qwen38-temporal-gate": "83f12860fef201d2128fc6d7df560e3d73eb96661f188d3db993cf55142a60d0",
     "bin/axiom-qwen38-speculative-graph-gate": "6a989e0fd574ab21906ba020a38b0ec4e21c3b04a7d3fb633f647f870156df25",
@@ -15,30 +22,45 @@
   },
   "config_hashes": {
     "Makefile": "be3c3f6dcbb94715a2eac8e060329274244a3dc255273e855d1d1393a4539708",
-    "README.md": "6ac9872eba852084c1e0ab5e3816bd57d8bf2b3f9add534139629a3c08f0a67e"
+    "README.md": "14a03f14ddb17573f51bc8eb9a44ccdbdafea867b579ca92c5deca0f0a07fa13"
   },
   "checkpoint_hashes": {},
   "gate_results": {
     "public_scan": "pass",
     "host_tests": "pass",
+    "host_asan_ubsan": "pass",
     "cuda_compile_sm120": "pass",
     "cuda_link": "pass",
-    "public_gate_binaries": "pass-temporal-speculative-graph-paged-runtime",
+    "public_gate_binaries": "pass-built-and-linked-temporal-speculative-graph-paged-runtime",
     "public_model_runtime_gate": "not_run-model-artifacts-not-published",
     "production_temporal_parity": "pass-zero-logit-and-tap-error",
     "production_paged_runtime": "pass-300-tokens-across-page-256",
+    "production_multisession_resume": "pass-exact-prefix-and-stateful-tail",
+    "production_lifecycle_gc": "pass-active-session-protection-and-idempotent-cleanup",
     "production_http_benchmark": "pass-four-consecutive-byte-exact-runs"
   },
   "benchmark_snapshot": {
     "gpu_class": "RTX 5090",
     "prompt_tokens": 1002,
     "generated_tokens": 256,
-    "speculative_cycles": 33,
+    "speculative_cycles": 32,
     "accepted_proposals": 223,
     "eligible_proposals": 224,
-    "decode_tokens_per_second_median": 384.1583,
-    "visible_tokens_per_second_median": 385.6648,
+    "decode_tokens_per_second_runs": [383.6865, 383.1897, 382.5082, 383.1387],
+    "visible_tokens_per_second_runs": [385.191, 384.692, 384.008, 384.641],
+    "decode_tokens_per_second_median": 383.1642,
+    "visible_tokens_per_second_median": 384.6665,
     "output_sha256": "b0d7b6f4bad084c8bdba57559fccbbb3b4acef5d085274123c829aa0eb793b5b"
+  },
+  "lifecycle_snapshot": {
+    "gc_state": "pass",
+    "persistence_pending": 0,
+    "active_leases": 0,
+    "unsafe_namespaces": 0,
+    "reclaimed_bytes": 3939336192,
+    "ttl_seconds": 604800,
+    "max_namespaces": 128,
+    "gc_interval_seconds": 300
   },
   "installed_paths": [],
   "health_snapshot": {

@@ -24,7 +24,7 @@ this public kernel snapshot.
 | Qwen3.8 | Native 27B decoder, GDN, attention, MLP banks, NVFP4/FP8 LM head |
 | Decode path | DSpark/M8 temporal speculative path and device-side verification ABI |
 | Attention | FlashInfer headers vendored under their upstream license |
-| KV | Paged KV, persistent session store, hot device pages and cold NVMe pages |
+| KV | Paged KV, persistent sessions, hot GPU pages, cold NVMe pages and bounded crash-safe lifecycle GC |
 | Context | YaRN-compatible long-context plumbing and deterministic compaction hooks |
 | Vision | Native image preprocessing/vision tower; unsupported video containers return an explicit error |
 | Agents | C++ swarm scheduler and generic continuous-batching engine contracts |
@@ -70,13 +70,12 @@ use `make MEDIA=1` only on a machine where the decoder toolchain is verified.
 
 ## Performance record
 
-The 2026-08-22 kernel update sustained a median **384.158 decoded tokens/s**
-across four consecutive requests to a separate private production fixture on
-one RTX 5090. The fixed test used a 1,002-token prompt, generated 256 tokens
-through 33 speculative cycles and produced the same output SHA-256 on every
-run. Individual decode rates were 382.972, 384.249, 384.256 and 384.067
-tokens/s; visible transport rates were 384.474, 385.756, 385.763 and 385.574
-tokens/s.
+The lifecycle update sustained a median **383.164 decoded tokens/s** across
+four consecutive requests to a separate private production fixture on one RTX
+5090. The fixed test used a 1,002-token prompt, generated 256 tokens through 32
+speculative cycles and produced the same output SHA-256 on every run. Individual
+decode rates were 383.686, 383.190, 382.508 and 383.139 tokens/s. This is within
+0.26% of the preceding 384.158 tokens/s median and is not a material regression.
 
 This is a measured result for one exact fixture, not a universal guarantee for
 this source tree, another GPU or another checkpoint. The private HTTP daemon,

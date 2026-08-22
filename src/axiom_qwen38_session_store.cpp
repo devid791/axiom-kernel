@@ -1,5 +1,6 @@
 #include "axiom/qwen38_session_store.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -9,9 +10,12 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits>
+#include <new>
 #include <sstream>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <unordered_set>
 #include <unistd.h>
 #include <utility>
 
@@ -27,6 +31,7 @@ constexpr size_t kNamespaceIdBytes = 33u;
 constexpr size_t kNamespaceTextBytes = 1536u;
 constexpr size_t kProfileBytes = 32u;
 constexpr size_t kMaxRecurrentBytes = 1024u * 1024u * 1024u;
+constexpr size_t kMaxGcArtifactsPerNamespace = 16384u;
 
 #pragma pack(push, 1)
 struct manifest_disk_header {
@@ -55,6 +60,45 @@ static_assert(sizeof(manifest_disk_header) == kManifestHeaderBytes,
               "Qwen3.8 session manifest header must remain 4096 bytes");
 
 std::atomic<uint64_t> g_temp_sequence{0u};
+
+class scoped_fd {
+public:
+    explicit scoped_fd(const int value = -1) : value_(value) {}
+    scoped_fd(const scoped_fd &) = delete;
+    scoped_fd &operator=(const scoped_fd &) = delete;
+    ~scoped_fd() { reset(); }
+
+    int get() const { return value_; }
+    int release() {
+        const int value = value_;
+        value_ = -1;
+        return value;
+    }
+    void reset(const int value = -1) {
+        if (value_ >= 0) ::close(value_);
+        value_ = value;
+    }
+
+private:
+    int value_ = -1;
+};
+
+class scoped_directory {
+public:
+    explicit scoped_directory(DIR *value = nullptr) : value_(value) {}
+    scoped_directory(const scoped_directory &) = delete;
+    scoped_directory &operator=(const scoped_directory &) = delete;
+    ~scoped_directory() { reset(); }
+
+    DIR *get() const { return value_; }
+    void reset(DIR *value = nullptr) {
+        if (value_) ::closedir(value_);
+        value_ = value;
+    }
+
+private:
+    DIR *value_ = nullptr;
+};
 
 uint64_t fnv_update(uint64_t hash, const void *data, size_t bytes) {
     const uint8_t *cursor = static_cast<const uint8_t *>(data);
@@ -199,6 +243,7 @@ bool parse_generation_filename(
         return false;
     }
     const size_t digits_end = name.size() - suffix_size;
+    if (name[prefix.size()] == '0') return false;
     uint64_t value = 0u;
     for (size_t index = prefix.size(); index < digits_end; ++index) {
         const unsigned char character = static_cast<unsigned char>(name[index]);
@@ -214,7 +259,394 @@ bool parse_generation_filename(
     return true;
 }
 
+bool is_lower_hex_32(const std::string &text) {
+    if (text.size() != 32u) return false;
+    for (const unsigned char character : text) {
+        if (!((character >= '0' && character <= '9') ||
+              (character >= 'a' && character <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool exact_positive_decimal_components(
+        const std::string &text,
+        const size_t expected_components) {
+    if (text.empty() || expected_components == 0u ||
+        text.front() == '.' || text.back() == '.') {
+        return false;
+    }
+    size_t components = 1u;
+    uint64_t value = 0u;
+    bool have_digit = false;
+    for (const unsigned char character : text) {
+        if (character >= '0' && character <= '9') {
+            if (!have_digit && character == '0') return false;
+            const uint64_t digit = static_cast<uint64_t>(character - '0');
+            if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10u) {
+                return false;
+            }
+            value = value * 10u + digit;
+            have_digit = true;
+            continue;
+        }
+        if (character != '.' || !have_digit || value == 0u ||
+            components >= expected_components) {
+            return false;
+        }
+        ++components;
+        value = 0u;
+        have_digit = false;
+    }
+    return components == expected_components && have_digit && value != 0u;
+}
+
+bool parse_session_artifact(
+        const std::string &name,
+        std::string *session_stem) {
+    if (!session_stem || name.size() <= 32u) return false;
+    const std::string stem = name.substr(0u, 32u);
+    if (!is_lower_hex_32(stem)) return false;
+    const std::string suffix = name.substr(32u);
+    bool valid = suffix == ".manifest";
+    uint64_t generation = 0u;
+    if (!valid) valid = parse_generation_filename(name, stem, &generation);
+    constexpr const char *temporary_prefix = ".manifest.tmp.";
+    if (!valid && suffix.compare(0u, std::strlen(temporary_prefix),
+                                 temporary_prefix) == 0) {
+        valid = exact_positive_decimal_components(
+                suffix.substr(std::strlen(temporary_prefix)), 2u);
+    }
+    if (!valid) return false;
+    *session_stem = stem;
+    return true;
+}
+
+bool parse_gc_tombstone(
+        const std::string &name,
+        std::string *namespace_id) {
+    constexpr const char *prefix = ".gc.";
+    if (!namespace_id || name.size() <= 4u + 32u + 1u ||
+        name.compare(0u, 4u, prefix) != 0) {
+        return false;
+    }
+    const std::string candidate = name.substr(4u, 32u);
+    if (!is_lower_hex_32(candidate) || name[36u] != '.' ||
+        !exact_positive_decimal_components(name.substr(37u), 3u)) {
+        return false;
+    }
+    *namespace_id = candidate;
+    return true;
+}
+
+bool rename_directory_noreplace(
+        const int root_fd,
+        const std::string &source,
+        const std::string &destination) {
+#ifdef SYS_renameat2
+    constexpr unsigned int kRenameNoReplace = 1u;
+    if (::syscall(SYS_renameat2, root_fd, source.c_str(), root_fd,
+                  destination.c_str(), kRenameNoReplace) == 0) {
+        return true;
+    }
+    if (errno != ENOSYS && errno != EINVAL) return false;
+#endif
+    /* Old kernels lack renameat2. The daemon is a singleton and lifecycle GC
+     * is serialized, so an explicit no-target check preserves the same local
+     * invariant on that compatibility path. */
+    struct stat status{};
+    if (::fstatat(root_fd, destination.c_str(), &status, AT_SYMLINK_NOFOLLOW) == 0) {
+        errno = EEXIST;
+        return false;
+    }
+    if (errno != ENOENT) return false;
+    return ::renameat(root_fd, source.c_str(), root_fd, destination.c_str()) == 0;
+}
+
+uint64_t allocated_bytes(const struct stat &status) {
+    if (status.st_blocks <= 0) return 0u;
+    const uint64_t blocks = static_cast<uint64_t>(status.st_blocks);
+    if (blocks > std::numeric_limits<uint64_t>::max() / 512u) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return blocks * 512u;
+}
+
+uint64_t add_saturating(const uint64_t left, const uint64_t right) {
+    return right > std::numeric_limits<uint64_t>::max() - left
+            ? std::numeric_limits<uint64_t>::max() : left + right;
+}
+
+uint64_t mtime_seconds(const struct stat &status) {
+    return status.st_mtim.tv_sec > 0
+            ? static_cast<uint64_t>(status.st_mtim.tv_sec) : 0u;
+}
+
+bool private_owned_directory(const struct stat &status) {
+    return S_ISDIR(status.st_mode) && status.st_uid == ::geteuid() &&
+            (status.st_mode & (S_IRWXG | S_IRWXO)) == 0u;
+}
+
+bool validate_private_directory(
+        const std::string &path,
+        std::string *error) {
+    if (!error) return false;
+    const int fd = ::open(
+            path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0) {
+        *error = "cannot open private persistent KV directory " + path + ": " +
+                std::string(std::strerror(errno));
+        return false;
+    }
+    struct stat status{};
+    const int stat_rc = ::fstat(fd, &status);
+    const int saved_errno = stat_rc == 0 ? 0 : errno;
+    const bool valid = stat_rc == 0 && private_owned_directory(status);
+    ::close(fd);
+    if (!valid) {
+        *error = "persistent KV directory is not private and owned by the daemon: " +
+                path + (saved_errno != 0
+                        ? ": " + std::string(std::strerror(saved_errno)) : "");
+    }
+    return valid;
+}
+
+struct gc_namespace_entry {
+    std::string namespace_id;
+    std::string directory_name;
+    std::string session_stem;
+    std::vector<std::string> files;
+    uint64_t last_used_unix_seconds = 0u;
+    uint64_t allocated_bytes = 0u;
+    bool protected_namespace = false;
+    bool remove = false;
+};
+
+bool scan_gc_namespace(
+        const int root_fd,
+        const std::string &directory_name,
+        const std::string &namespace_id,
+        const size_t artifact_budget,
+        size_t *total_artifacts,
+        int *failure_status,
+        gc_namespace_entry *out,
+        std::string *error) {
+    if (root_fd < 0 || !total_artifacts || !failure_status || !out || !error ||
+        !is_lower_hex_32(namespace_id)) return false;
+    *failure_status = AXIOM_OK;
+    struct stat directory_status{};
+    if (::fstatat(root_fd, directory_name.c_str(), &directory_status,
+                  AT_SYMLINK_NOFOLLOW) != 0 ||
+        !private_owned_directory(directory_status)) {
+        *error = "persistent KV session namespace is not a safe directory: " +
+                directory_name;
+        return false;
+    }
+    scoped_fd namespace_fd(::openat(
+            root_fd, directory_name.c_str(),
+            O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW));
+    if (namespace_fd.get() < 0) {
+        *error = "cannot open persistent KV session namespace: " +
+                std::string(std::strerror(errno));
+        return false;
+    }
+    DIR *raw_directory = ::fdopendir(namespace_fd.get());
+    if (!raw_directory) {
+        const int saved_errno = errno;
+        *error = "cannot scan persistent KV session namespace: " +
+                std::string(std::strerror(saved_errno));
+        return false;
+    }
+    (void)namespace_fd.release();
+    scoped_directory directory(raw_directory);
+    const int fd = ::dirfd(directory.get());
+
+    gc_namespace_entry entry;
+    entry.namespace_id = namespace_id;
+    entry.directory_name = directory_name;
+    entry.last_used_unix_seconds = mtime_seconds(directory_status);
+    entry.allocated_bytes = allocated_bytes(directory_status);
+    bool ok = true;
+    int saved_errno = 0;
+    while (ok) {
+        errno = 0;
+        dirent *item = ::readdir(directory.get());
+        if (!item) {
+            if (errno != 0) {
+                ok = false;
+                saved_errno = errno;
+            }
+            break;
+        }
+        const std::string name(item->d_name);
+        if (name == "." || name == "..") continue;
+        struct stat status{};
+        if (::fstatat(fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
+            ok = false;
+            saved_errno = errno;
+            break;
+        }
+        std::string stem;
+        if (!S_ISREG(status.st_mode) || status.st_nlink != 1 ||
+            !parse_session_artifact(name, &stem) ||
+            (!entry.session_stem.empty() && entry.session_stem != stem)) {
+            ok = false;
+            saved_errno = EINVAL;
+            break;
+        }
+        entry.session_stem = std::move(stem);
+        if (entry.files.size() >= kMaxGcArtifactsPerNamespace ||
+            *total_artifacts >= artifact_budget) {
+            ok = false;
+            saved_errno = EOVERFLOW;
+            *failure_status = AXIOM_ERR_BUDGET;
+            break;
+        }
+        try {
+            entry.files.push_back(name);
+            ++*total_artifacts;
+        } catch (...) {
+            ok = false;
+            saved_errno = ENOMEM;
+            *failure_status = AXIOM_ERR_BUDGET;
+            break;
+        }
+        entry.last_used_unix_seconds = std::max(
+                entry.last_used_unix_seconds, mtime_seconds(status));
+        entry.allocated_bytes = add_saturating(
+                entry.allocated_bytes, allocated_bytes(status));
+    }
+    if (!ok) {
+        *error = "unsafe or unreadable persistent KV session namespace " +
+                directory_name + ": " + std::string(std::strerror(saved_errno));
+        return false;
+    }
+    *out = std::move(entry);
+    return true;
+}
+
+bool remove_gc_namespace(
+        const int root_fd,
+        const gc_namespace_entry &entry,
+        uint64_t *removed_files,
+        uint64_t *reclaimed_bytes,
+        std::string *error) {
+    if (root_fd < 0 || !removed_files || !reclaimed_bytes || !error) return false;
+    scoped_fd tombstone_fd(::openat(
+            root_fd, entry.directory_name.c_str(),
+            O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW));
+    if (tombstone_fd.get() < 0) {
+        *error = "cannot open persistent KV GC tombstone: " +
+                std::string(std::strerror(errno));
+        return false;
+    }
+    const int fd = tombstone_fd.get();
+    bool ok = true;
+    int saved_errno = 0;
+    uint64_t files = 0u;
+    struct stat directory_status{};
+    const int directory_stat_rc = ::fstat(fd, &directory_status);
+    if (directory_stat_rc != 0 || !private_owned_directory(directory_status)) {
+        const int status_errno = directory_stat_rc == 0 ? EACCES : errno;
+        *error = "cannot stat persistent KV GC tombstone: " +
+                std::string(std::strerror(status_errno));
+        return false;
+    }
+    uint64_t bytes = allocated_bytes(directory_status);
+    for (const std::string &name : entry.files) {
+        struct stat status{};
+        if (::fstatat(fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) continue;
+            ok = false;
+            saved_errno = errno;
+            break;
+        }
+        if (!S_ISREG(status.st_mode) || status.st_nlink != 1) {
+            ok = false;
+            saved_errno = EINVAL;
+            break;
+        }
+        if (::unlinkat(fd, name.c_str(), 0) != 0) {
+            if (errno == ENOENT) continue;
+            ok = false;
+            saved_errno = errno;
+            break;
+        }
+        ++files;
+        bytes = add_saturating(bytes, allocated_bytes(status));
+    }
+    if (ok && ::fsync(fd) != 0) {
+        ok = false;
+        saved_errno = errno;
+    }
+    tombstone_fd.reset();
+    if (ok && ::unlinkat(root_fd, entry.directory_name.c_str(), AT_REMOVEDIR) != 0) {
+        ok = false;
+        saved_errno = errno;
+    }
+    if (ok && ::fsync(root_fd) != 0) {
+        ok = false;
+        saved_errno = errno;
+    }
+    *removed_files = add_saturating(*removed_files, files);
+    *reclaimed_bytes = add_saturating(*reclaimed_bytes, bytes);
+    if (!ok) {
+        *error = "persistent KV session tombstone cleanup failed: " +
+                std::string(std::strerror(saved_errno));
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
+
+int qwen38_build_stateful_resume_prompt(
+        const qwen38_session_manifest &manifest,
+        const std::vector<uint32_t> &session_suffix_ids,
+        const uint32_t im_end_token_id,
+        const uint32_t endoftext_token_id,
+        const uint32_t vocab_size,
+        const uint32_t prompt_limit,
+        std::vector<uint32_t> *out,
+        bool *usable) {
+    if (!out || !usable || vocab_size == 0u ||
+        manifest.committed_tokens > manifest.token_ids.size()) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    out->clear();
+    *usable = false;
+    if (manifest.committed_tokens == 0u || session_suffix_ids.empty() ||
+        im_end_token_id == AXIOM_TOKEN_ID_INVALID ||
+        manifest.next_token >= vocab_size) {
+        return AXIOM_OK;
+    }
+    /* An end-of-text cursor is not a ChatML assistant boundary.  Resetting and
+     * replaying the wire prompt is safer than inventing a transition. */
+    if (manifest.next_token == endoftext_token_id) return AXIOM_OK;
+    const bool needs_chatml_close = manifest.next_token != im_end_token_id;
+    const uint64_t candidate_tokens =
+            static_cast<uint64_t>(manifest.committed_tokens) + 1u +
+            (needs_chatml_close ? 1u : 0u) + session_suffix_ids.size();
+    if (candidate_tokens > prompt_limit ||
+        candidate_tokens > std::numeric_limits<size_t>::max()) {
+        return AXIOM_OK;
+    }
+    try {
+        out->reserve(static_cast<size_t>(candidate_tokens));
+        out->insert(
+                out->end(), manifest.token_ids.begin(),
+                manifest.token_ids.begin() + manifest.committed_tokens);
+        out->push_back(manifest.next_token);
+        if (needs_chatml_close) out->push_back(im_end_token_id);
+        out->insert(out->end(), session_suffix_ids.begin(), session_suffix_ids.end());
+    } catch (...) {
+        out->clear();
+        return AXIOM_ERR_BUDGET;
+    }
+    *usable = true;
+    return AXIOM_OK;
+}
 
 qwen38_persistent_session_store::qwen38_persistent_session_store(
         std::string base_path,
@@ -310,11 +742,13 @@ int qwen38_persistent_session_store::prepare(
         *error = "cannot create persistent KV root: " + root_path_;
         return AXIOM_ERR_IO;
     }
+    if (!validate_private_directory(root_path_, error)) return AXIOM_ERR_IO;
     *out = paths_for(key, generation);
     if (!make_directory_recursive(out->namespace_dir)) {
         *error = "cannot create persistent KV namespace: " + out->namespace_dir;
         return AXIOM_ERR_IO;
     }
+    if (!validate_private_directory(out->namespace_dir, error)) return AXIOM_ERR_IO;
     return AXIOM_OK;
 }
 
@@ -617,6 +1051,246 @@ int qwen38_persistent_session_store::prune_obsolete_generations(
         return AXIOM_ERR_IO;
     }
     return AXIOM_OK;
+}
+
+int qwen38_persistent_session_store::prune_stale_sessions(
+        const qwen38_session_gc_policy &policy,
+        qwen38_session_gc_result *result,
+        std::string *error) const {
+    if (result) *result = qwen38_session_gc_result{};
+    if (!result || !error || !enabled() || policy.now_unix_seconds == 0u ||
+        policy.scan_namespace_budget == 0u || policy.scan_artifact_budget == 0u ||
+        policy.scan_namespace_budget > std::numeric_limits<size_t>::max() ||
+        policy.scan_artifact_budget > std::numeric_limits<size_t>::max()) {
+        if (error) *error = "invalid persistent KV session lifecycle GC arguments";
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    error->clear();
+
+    try {
+    scoped_fd root_handle(::open(
+            root_path_.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW));
+    const int root_fd = root_handle.get();
+    if (root_fd < 0) {
+        if (errno == ENOENT) return AXIOM_OK;
+        *error = "cannot open persistent KV session root for lifecycle GC: " +
+                std::string(std::strerror(errno));
+        return AXIOM_ERR_IO;
+    }
+    struct stat root_status{};
+    const int root_stat_rc = ::fstat(root_fd, &root_status);
+    if (root_stat_rc != 0 || !private_owned_directory(root_status)) {
+        const int saved_errno = root_stat_rc == 0 ? EACCES : errno;
+        *error = "persistent KV session root is not private and owned by the daemon";
+        if (saved_errno != 0) {
+            *error += ": " + std::string(std::strerror(saved_errno));
+        }
+        return AXIOM_ERR_IO;
+    }
+    scoped_fd scan_handle(::fcntl(root_fd, F_DUPFD_CLOEXEC, 0));
+    if (scan_handle.get() < 0) {
+        const int saved_errno = errno;
+        *error = "cannot duplicate persistent KV session root for lifecycle GC: " +
+                std::string(std::strerror(saved_errno));
+        return AXIOM_ERR_IO;
+    }
+    DIR *raw_root = ::fdopendir(scan_handle.get());
+    if (!raw_root) {
+        const int saved_errno = errno;
+        *error = "cannot scan persistent KV session root for lifecycle GC: " +
+                std::string(std::strerror(saved_errno));
+        return AXIOM_ERR_IO;
+    }
+    (void)scan_handle.release();
+    scoped_directory root(raw_root);
+
+    std::unordered_set<std::string> protected_namespaces;
+    try {
+        protected_namespaces.reserve(policy.protected_namespace_ids.size());
+        for (const std::string &namespace_id_value : policy.protected_namespace_ids) {
+            if (is_lower_hex_32(namespace_id_value)) {
+                protected_namespaces.insert(namespace_id_value);
+            }
+        }
+    } catch (...) {
+        *error = "persistent KV session lifecycle protection set allocation failed";
+        return AXIOM_ERR_BUDGET;
+    }
+    std::vector<gc_namespace_entry> sessions;
+    std::vector<gc_namespace_entry> tombstones;
+    size_t total_artifacts = 0u;
+    bool scan_ok = true;
+    int scan_errno = 0;
+    while (scan_ok) {
+        errno = 0;
+        dirent *item = ::readdir(root.get());
+        if (!item) {
+            if (errno != 0) {
+                scan_ok = false;
+                scan_errno = errno;
+            }
+            break;
+        }
+        const std::string name(item->d_name);
+        if (name == "." || name == "..") continue;
+        std::string namespace_id_value;
+        const bool tombstone = parse_gc_tombstone(name, &namespace_id_value);
+        if (!tombstone) {
+            if (!is_lower_hex_32(name)) {
+                if (result->unsafe_namespaces == 0u) {
+                    *error = "unknown persistent KV session root entry: " + name;
+                }
+                ++result->unsafe_namespaces;
+                continue;
+            }
+            namespace_id_value = name;
+            ++result->scanned_sessions;
+        }
+        gc_namespace_entry entry;
+        std::string scan_error;
+        int namespace_scan_status = AXIOM_OK;
+        if (!scan_gc_namespace(
+                    root_fd, name, namespace_id_value,
+                    static_cast<size_t>(policy.scan_artifact_budget),
+                    &total_artifacts, &namespace_scan_status,
+                    &entry, &scan_error)) {
+            if (namespace_scan_status != AXIOM_OK) {
+                *error = scan_error;
+                return namespace_scan_status;
+            }
+            if (result->unsafe_namespaces == 0u) *error = scan_error;
+            ++result->unsafe_namespaces;
+            continue;
+        }
+        if (sessions.size() + tombstones.size() >=
+            static_cast<size_t>(policy.scan_namespace_budget)) {
+            scan_ok = false;
+            scan_errno = EOVERFLOW;
+            break;
+        }
+        if (tombstone) {
+            try {
+                tombstones.push_back(std::move(entry));
+            } catch (...) {
+                scan_ok = false;
+                scan_errno = ENOMEM;
+            }
+            continue;
+        }
+        entry.protected_namespace =
+                protected_namespaces.find(namespace_id_value) !=
+                protected_namespaces.end();
+        if (entry.protected_namespace) ++result->protected_sessions;
+        try {
+            sessions.push_back(std::move(entry));
+        } catch (...) {
+            scan_ok = false;
+            scan_errno = ENOMEM;
+            break;
+        }
+    }
+    root.reset();
+    if (!scan_ok) {
+        *error = "persistent KV session lifecycle GC root scan failed: " +
+                std::string(std::strerror(scan_errno));
+        return (scan_errno == ENOMEM || scan_errno == EOVERFLOW)
+                ? AXIOM_ERR_BUDGET
+                : AXIOM_ERR_IO;
+    }
+
+    /* A prior crash may have occurred after the atomic namespace rename but
+     * before the unlink phase. Finish those tombstones before selecting new
+     * victims; they are already invisible to session lookup. */
+    for (const gc_namespace_entry &entry : tombstones) {
+        if (!remove_gc_namespace(
+                    root_fd, entry, &result->removed_files,
+                    &result->reclaimed_bytes, error)) {
+            result->retained_sessions = result->scanned_sessions;
+            return AXIOM_ERR_IO;
+        }
+    }
+
+    uint64_t selected = 0u;
+    if (policy.ttl_seconds != 0u) {
+        for (gc_namespace_entry &entry : sessions) {
+            if (entry.protected_namespace ||
+                entry.last_used_unix_seconds > policy.now_unix_seconds) {
+                continue;
+            }
+            const uint64_t age =
+                    policy.now_unix_seconds - entry.last_used_unix_seconds;
+            if (age >= policy.ttl_seconds) {
+                entry.remove = true;
+                ++selected;
+            }
+        }
+    }
+    std::sort(sessions.begin(), sessions.end(),
+              [](const gc_namespace_entry &left,
+                 const gc_namespace_entry &right) {
+                  if (left.last_used_unix_seconds != right.last_used_unix_seconds) {
+                      return left.last_used_unix_seconds < right.last_used_unix_seconds;
+                  }
+                  return left.namespace_id < right.namespace_id;
+              });
+    const uint64_t managed_sessions = static_cast<uint64_t>(sessions.size());
+    uint64_t projected_sessions = managed_sessions > selected
+            ? managed_sessions - selected : 0u;
+    if (policy.max_sessions != 0u &&
+        projected_sessions > policy.max_sessions) {
+        for (gc_namespace_entry &entry : sessions) {
+            if (projected_sessions <= policy.max_sessions) break;
+            if (entry.protected_namespace || entry.remove) continue;
+            entry.remove = true;
+            ++selected;
+            --projected_sessions;
+        }
+    }
+
+    result->retained_sessions = result->scanned_sessions;
+    for (gc_namespace_entry &entry : sessions) {
+        if (!entry.remove) continue;
+        const uint64_t sequence = g_temp_sequence.fetch_add(1u) + 1u;
+        const std::string tombstone_name = ".gc." + entry.namespace_id + "." +
+                std::to_string(static_cast<unsigned long long>(::getpid())) + "." +
+                std::to_string(static_cast<unsigned long long>(policy.now_unix_seconds)) + "." +
+                std::to_string(static_cast<unsigned long long>(sequence));
+        if (!rename_directory_noreplace(
+                    root_fd, entry.directory_name, tombstone_name)) {
+            const int saved_errno = errno;
+            *error = "cannot atomically tombstone stale persistent KV session: " +
+                    std::string(std::strerror(saved_errno));
+            return AXIOM_ERR_IO;
+        }
+        if (::fsync(root_fd) != 0) {
+            const int saved_errno = errno;
+            *error = "cannot sync persistent KV session tombstone rename: " +
+                    std::string(std::strerror(saved_errno));
+            return AXIOM_ERR_IO;
+        }
+        entry.directory_name = tombstone_name;
+        ++result->removed_sessions;
+        if (result->retained_sessions != 0u) --result->retained_sessions;
+        if (policy.before_unlink) {
+            policy.before_unlink(
+                    root_path_ + "/" + tombstone_name,
+                    entry.files,
+                    policy.before_unlink_context);
+        }
+        if (!remove_gc_namespace(
+                    root_fd, entry, &result->removed_files,
+                    &result->reclaimed_bytes, error)) {
+            return AXIOM_ERR_IO;
+        }
+    }
+    return AXIOM_OK;
+    } catch (const std::bad_alloc &) {
+        *error = "persistent KV session lifecycle allocation failed";
+        return AXIOM_ERR_BUDGET;
+    } catch (...) {
+        *error = "persistent KV session lifecycle failed with an unexpected exception";
+        return AXIOM_ERR_RUNTIME;
+    }
 }
 
 }  // namespace qwen38

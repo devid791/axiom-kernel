@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.3.0-public — 2026-08-22
+
+- Added configurable TTL/LRU retention for complete persistent-session
+  namespaces, with explicit protection for active sessions.
+- Added atomic GC tombstones and idempotent crash recovery. Cleanup uses
+  directory-relative file operations, rejects symlinks and hard links, and
+  fails closed on malformed namespaces or scan-budget exhaustion.
+- Added exact stateful-resume prompt construction for clients that can resend
+  only normalized visible history while the durable state contains hidden
+  thinking or tool-call tokens.
+- Added deterministic lifecycle, race, descriptor-leak, malformed-artifact,
+  hard-link and resume-watermark tests.
+- Verified the production path at a 383.164 tokens/s median across four
+  byte-identical RTX 5090 runs after enabling the lifecycle implementation.
+- Preserved the public boundary: the serving daemon, internal endpoints,
+  deployment configuration and model artifacts remain private.
+
 ## v0.2.0-public — 2026-08-22
 
 - Added the production-verified exact Qwen3.8 speculative graph

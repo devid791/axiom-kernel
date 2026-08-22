@@ -1,9 +1,9 @@
 # Public release scope
 
-This repository is a fresh public source snapshot. Its Qwen3.8 performance
-update is derived from the reviewed kernel commit
-`41403d5fed91f3481d92ae111e83fa75f544dcbb`; the initial public snapshot was
-derived from `7945f8bf595039c5e3be50896b16bdf86ca3fa1c`. Internal history,
+This repository is a sanitized public source snapshot. Its persistent-session
+lifecycle update is derived from reviewed kernel commit
+`3ae57422ff8fcb7ebcf8f12074a2c16d921eed53`; the preceding performance update
+was derived from `41403d5fed91f3481d92ae111e83fa75f544dcbb`. Internal history,
 production branch names and private deployment artifacts are not copied into
 the public Git history.
 
@@ -13,6 +13,7 @@ Included:
 - native Qwen3.8 decoder, NVFP4/FP8/BF16 primitives, DSpark/M8 execution,
   vision, optional media decoding and paged/persistent KV components;
 - generic engine contracts, reasoning profiles and swarm scheduler;
+- crash-safe TTL/LRU persistent-session cleanup and stateful-resume helpers;
 - public tests, probes, FlashInfer source and its license/notice;
 - build and reproducibility documentation.
 

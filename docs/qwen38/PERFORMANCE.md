@@ -89,3 +89,23 @@ report repeated runs, output identity and acceptance counters.
 The verified result does **not** claim more than 400 tokens/s and does not prove
 performance on a different GPU, model artifact, context length or serving
 adapter.
+
+## Persistent-session lifecycle confirmation — 2026-08-22
+
+After adding bounded session GC and lossless stateful resume, the same private
+production fixture completed four more byte-identical HTTP runs:
+
+| Run | Decode tokens/s | Visible tokens/s |
+| ---: | ---: | ---: |
+| 1 | 383.6865 | 385.191 |
+| 2 | 383.1897 | 384.692 |
+| 3 | 382.5082 | 384.008 |
+| 4 | 383.1387 | 384.641 |
+| **Median** | **383.1642** | **384.6665** |
+
+The output SHA-256 remained
+`b0d7b6f4bad084c8bdba57559fccbbb3b4acef5d085274123c829aa0eb793b5b`.
+The 0.26% difference from the preceding 384.1583 tokens/s median is within
+normal run variation and does not indicate a material decode regression. The
+lifecycle work runs outside graph replay and persistence quiescence is checked
+separately from decode throughput.

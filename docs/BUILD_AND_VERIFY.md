@@ -14,6 +14,20 @@ network identities, credential-shaped strings, activation-steering symbols or
 DFlash2 symbols. Documentation may describe excluded features so that the
 release boundary is explicit.
 
+The host session-store test exercises manifest durability, generation cleanup,
+stateful resume, TTL/LRU selection, protected namespaces, atomic tombstones,
+crash recovery, malformed artifacts, symlink/hard-link rejection, scan budgets
+and file-descriptor stability. For sanitizer verification run the same source
+with AddressSanitizer and UndefinedBehaviorSanitizer enabled:
+
+```sh
+c++ -O1 -g -Wall -Wextra -Werror -std=c++17 \
+  -fsanitize=address,undefined -Iinclude \
+  tests/axiom_qwen38_session_store_test.cpp \
+  src/axiom_qwen38_session_store.cpp -o /tmp/axiom-session-store-asan
+/tmp/axiom-session-store-asan
+```
+
 ## CUDA build
 
 The full library requires a CUDA toolkit and a C++17 compiler:

@@ -54,6 +54,54 @@ struct qwen38_session_manifest {
     std::vector<uint8_t> recurrent_state;
 };
 
+/* Build the exact prompt used to continue a durable native assistant state
+ * when a client can only resend normalized/visible history.  `usable=false`
+ * is a safe cache miss (for example an EOS cursor or insufficient budget),
+ * while a non-OK return denotes a malformed contract or allocation failure. */
+int qwen38_build_stateful_resume_prompt(
+        const qwen38_session_manifest &manifest,
+        const std::vector<uint32_t> &session_suffix_ids,
+        uint32_t im_end_token_id,
+        uint32_t endoftext_token_id,
+        uint32_t vocab_size,
+        uint32_t prompt_limit,
+        std::vector<uint32_t> *out,
+        bool *usable);
+
+/* Whole-session retention is deliberately separate from generation GC.  The
+ * caller serializes this operation with native generation/persistence and
+ * supplies every namespace that is still live.  A zero TTL disables the age
+ * rule; a zero max_sessions disables the LRU-capacity rule. */
+struct qwen38_session_gc_policy {
+    using pre_unlink_hook = void (*)(
+            const std::string &tombstone_directory,
+            const std::vector<std::string> &validated_files,
+            void *context);
+
+    uint64_t now_unix_seconds = 0u;
+    uint64_t ttl_seconds = 0u;
+    uint32_t max_sessions = 0u;
+    /* Defensive scan ceilings. They are part of the internal policy so tests
+     * can exercise fail-closed budget handling without creating huge trees. */
+    uint64_t scan_namespace_budget = 65536u;
+    uint64_t scan_artifact_budget = 262144u;
+    std::vector<std::string> protected_namespace_ids;
+    /* Deterministic fault-injection seam for filesystem race tests. Production
+     * callers leave this null. Safety is still revalidated after the hook. */
+    pre_unlink_hook before_unlink = nullptr;
+    void *before_unlink_context = nullptr;
+};
+
+struct qwen38_session_gc_result {
+    uint64_t scanned_sessions = 0u;
+    uint64_t retained_sessions = 0u;
+    uint64_t protected_sessions = 0u;
+    uint64_t unsafe_namespaces = 0u;
+    uint64_t removed_sessions = 0u;
+    uint64_t removed_files = 0u;
+    uint64_t reclaimed_bytes = 0u;
+};
+
 class qwen38_persistent_session_store {
 public:
     qwen38_persistent_session_store() = default;
@@ -103,6 +151,16 @@ public:
             const qwen38_session_key &key,
             const qwen38_session_paths &committed_paths,
             uint64_t *removed_files,
+            std::string *error) const;
+
+    /* Apply TTL and LRU retention to complete session namespaces.  Selected
+     * namespaces are first atomically renamed to a private GC tombstone and
+     * only then unlinked with openat/unlinkat and no symlink traversal.  A
+     * crash can therefore leave a tombstone, never a half-visible session;
+     * later calls finish tombstone cleanup idempotently. */
+    int prune_stale_sessions(
+            const qwen38_session_gc_policy &policy,
+            qwen38_session_gc_result *result,
             std::string *error) const;
 
     qwen38_session_paths paths_for(
