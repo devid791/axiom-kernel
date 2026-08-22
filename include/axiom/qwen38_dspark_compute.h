@@ -317,6 +317,13 @@ int axiom_qwen38_dspark_compute_device_session_abort(
 int axiom_qwen38_dspark_compute_device_graph_replay(
         axiom_qwen38_dspark_compute *compute,
         const axiom_qwen38_dspark_compute_device_session_request *request);
+/* Set the maximum authoritative input prefix for the next and subsequent
+ * graph replays. `max_commit_tokens` includes the anchor and is in [1,8].
+ * The graph clamps natural acceptance to this device-resident boundary. */
+int axiom_qwen38_dspark_compute_device_commit_limit_set(
+        axiom_qwen38_dspark_compute *compute,
+        uint32_t max_commit_tokens,
+        void *stream);
 /* Eager enqueue primitives used only while preparing a larger fixed-cycle
  * graph. They read the resident anchor/position controls and have no graph,
  * host copy, allocation, or synchronization of their own. */

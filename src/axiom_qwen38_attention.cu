@@ -46,6 +46,10 @@ constexpr uint32_t kDefaultStreamHotPages = 256u;
 constexpr uint32_t kTemporalHotPages = 8u;
 constexpr uint32_t kTemporalHotTokens =
         kTemporalHotPages * AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+constexpr uint32_t kFlashInferWorkspaceChunks = kTemporalHotPages;
+constexpr uint64_t kFlashInferWorkspaceBytes =
+        static_cast<uint64_t>(kFlashInferWorkspaceChunks) * kBatch * kHeads *
+                (kHeadDim * sizeof(uint16_t) + sizeof(float));
 constexpr uint32_t kMaxStreamHotPages = 256u;
 constexpr uint32_t kKvParityMaxContext = 64u;
 constexpr float kEps = 1.0e-6f;
@@ -1200,6 +1204,13 @@ struct axiom_qwen38_attention_layer {
     uint32_t cache_columns = kBatch;
     bool yarn_enabled = true;
     bool kv_fp8_parity_enabled = false;
+    bool shared_projection_input = true;
+    bool parallel_projection_streams = true;
+    cudaStream_t k_projection_stream = nullptr;
+    cudaStream_t v_projection_stream = nullptr;
+    cudaEvent_t projection_input_ready = nullptr;
+    cudaEvent_t k_projection_done = nullptr;
+    cudaEvent_t v_projection_done = nullptr;
     bool streaming_kv = false;
     /* Short-context DSpark/M8 uses the same target weights and a compact
      * contiguous hot cache. Long-context requests stay on the durable page
@@ -1215,6 +1226,7 @@ struct axiom_qwen38_attention_layer {
     /* Set only after a non-capturing warm launch of the fixed FlashInfer
      * BF16-Q/E4M3-KV/BF16-O D256 specialization. */
     bool flashinfer_ready = false;
+    bool flashinfer_split_kv = false;
 
     axiom_qwen38_fp8_linear *q_proj = nullptr;
     axiom_qwen38_fp8_linear *k_proj = nullptr;
@@ -1238,6 +1250,7 @@ struct axiom_qwen38_attention_layer {
     axiom_device_buffer *flashinfer_q_bf16 = nullptr;
     axiom_device_buffer *flashinfer_attention_bf16 = nullptr;
     axiom_device_buffer *flashinfer_kv_length_device = nullptr;
+    axiom_device_buffer *flashinfer_split_kv_workspace = nullptr;
     axiom_device_buffer *attention_reference = nullptr;
     axiom_device_buffer *k_cache = nullptr;
     axiom_device_buffer *v_cache = nullptr;
@@ -1254,8 +1267,93 @@ struct axiom_qwen38_attention_layer {
     axiom_device_buffer *stream_values = nullptr;
 };
 
+namespace {
+
+int qwen38_attention_project_qkv(
+        axiom_qwen38_attention_layer *layer,
+        const float *input,
+        float *q_gate,
+        float *k,
+        float *v,
+        void *stream) {
+    if (!layer || !input || !q_gate || !k || !v) return AXIOM_ERR_INVALID_ARGUMENT;
+    int rc = AXIOM_OK;
+    if (layer->parallel_projection_streams) {
+        const cudaStream_t main_stream = static_cast<cudaStream_t>(stream);
+        if (layer->shared_projection_input) {
+            rc = axiom_qwen38_fp8_linear_prepare_input_f32_device(
+                    layer->q_proj, input, stream);
+        }
+        if (rc == AXIOM_OK) {
+            rc = cuda_status(cudaEventRecord(layer->projection_input_ready, main_stream));
+        }
+        if (rc == AXIOM_OK) rc = cuda_status(cudaStreamWaitEvent(
+                layer->k_projection_stream, layer->projection_input_ready, 0u));
+        if (rc == AXIOM_OK) rc = cuda_status(cudaStreamWaitEvent(
+                layer->v_projection_stream, layer->projection_input_ready, 0u));
+        if (rc != AXIOM_OK) return rc;
+
+        if (layer->shared_projection_input) {
+            rc = axiom_qwen38_fp8_linear_forward_prepared_f32_device(
+                    layer->q_proj, layer->q_proj, q_gate, stream);
+            if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_prepared_f32_device(
+                    layer->k_proj, layer->q_proj, k,
+                    reinterpret_cast<void *>(layer->k_projection_stream));
+            if (rc == AXIOM_OK) rc = cuda_status(cudaEventRecord(
+                    layer->k_projection_done, layer->k_projection_stream));
+            if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_prepared_f32_device(
+                    layer->v_proj, layer->q_proj, v,
+                    reinterpret_cast<void *>(layer->v_projection_stream));
+        } else {
+            rc = axiom_qwen38_fp8_linear_forward_f32_device(
+                    layer->q_proj, input, q_gate, stream);
+            if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_f32_device(
+                    layer->k_proj, input, k,
+                    reinterpret_cast<void *>(layer->k_projection_stream));
+            if (rc == AXIOM_OK) rc = cuda_status(cudaEventRecord(
+                    layer->k_projection_done, layer->k_projection_stream));
+            if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_f32_device(
+                    layer->v_proj, input, v,
+                    reinterpret_cast<void *>(layer->v_projection_stream));
+        }
+        if (rc == AXIOM_OK) rc = cuda_status(cudaEventRecord(
+                layer->v_projection_done, layer->v_projection_stream));
+        if (rc == AXIOM_OK) rc = cuda_status(cudaStreamWaitEvent(
+                main_stream, layer->k_projection_done, 0u));
+        if (rc == AXIOM_OK) rc = cuda_status(cudaStreamWaitEvent(
+                main_stream, layer->v_projection_done, 0u));
+        return rc;
+    }
+    if (layer->shared_projection_input) {
+        rc = axiom_qwen38_fp8_linear_prepare_input_f32_device(
+                layer->q_proj, input, stream);
+        if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_prepared_f32_device(
+                layer->q_proj, layer->q_proj, q_gate, stream);
+        if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_prepared_f32_device(
+                layer->k_proj, layer->q_proj, k, stream);
+        if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_prepared_f32_device(
+                layer->v_proj, layer->q_proj, v, stream);
+        return rc;
+    }
+    rc = axiom_qwen38_fp8_linear_forward_f32_device(
+            layer->q_proj, input, q_gate, stream);
+    if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_f32_device(
+            layer->k_proj, input, k, stream);
+    if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_f32_device(
+            layer->v_proj, input, v, stream);
+    return rc;
+}
+
+}  // namespace
+
 extern "C" void axiom_qwen38_attention_layer_destroy(axiom_qwen38_attention_layer *layer) {
     if (!layer) return;
+    if (layer->device >= 0) (void)cudaSetDevice(layer->device);
+    if (layer->v_projection_stream) (void)cudaStreamDestroy(layer->v_projection_stream);
+    if (layer->k_projection_stream) (void)cudaStreamDestroy(layer->k_projection_stream);
+    if (layer->v_projection_done) (void)cudaEventDestroy(layer->v_projection_done);
+    if (layer->k_projection_done) (void)cudaEventDestroy(layer->k_projection_done);
+    if (layer->projection_input_ready) (void)cudaEventDestroy(layer->projection_input_ready);
     axiom_qwen38_fp8_linear_destroy(layer->o_proj);
     axiom_qwen38_fp8_linear_destroy(layer->v_proj);
     axiom_qwen38_fp8_linear_destroy(layer->k_proj);
@@ -1283,6 +1381,7 @@ extern "C" void axiom_qwen38_attention_layer_destroy(axiom_qwen38_attention_laye
     axiom_device_buffer_destroy(layer->v_cache);
     axiom_device_buffer_destroy(layer->k_cache);
     axiom_device_buffer_destroy(layer->attention_reference);
+    axiom_device_buffer_destroy(layer->flashinfer_split_kv_workspace);
     axiom_device_buffer_destroy(layer->flashinfer_kv_length_device);
     axiom_device_buffer_destroy(layer->flashinfer_attention_bf16);
     axiom_device_buffer_destroy(layer->flashinfer_q_bf16);
@@ -1324,6 +1423,27 @@ extern "C" int axiom_qwen38_attention_layer_load(
     layer->streaming_kv = env_enabled("AXIOM_QWEN38_KV_STREAMING");
     layer->streaming_temporal_hot = layer->streaming_kv &&
             env_enabled("AXIOM_QWEN38_KV_TEMPORAL8");
+    layer->shared_projection_input =
+            !env_disabled("AXIOM_QWEN38_ATTENTION_SHARED_FP8_INPUT");
+    layer->parallel_projection_streams =
+            !env_disabled("AXIOM_QWEN38_PARALLEL_PROJECTIONS");
+    if (layer->parallel_projection_streams) {
+        cudaError_t status = cudaStreamCreateWithFlags(
+                &layer->k_projection_stream, cudaStreamNonBlocking);
+        if (status == cudaSuccess) status = cudaStreamCreateWithFlags(
+                &layer->v_projection_stream, cudaStreamNonBlocking);
+        if (status == cudaSuccess) status = cudaEventCreateWithFlags(
+                &layer->projection_input_ready, cudaEventDisableTiming);
+        if (status == cudaSuccess) status = cudaEventCreateWithFlags(
+                &layer->k_projection_done, cudaEventDisableTiming);
+        if (status == cudaSuccess) status = cudaEventCreateWithFlags(
+                &layer->v_projection_done, cudaEventDisableTiming);
+        if (status != cudaSuccess) {
+            const int create_rc = cuda_status(status);
+            axiom_qwen38_attention_layer_destroy(layer);
+            return create_rc;
+        }
+    }
     if (layer->streaming_kv) {
         layer->stream_hot_pages = stream_hot_pages_from_env();
         layer->stream_hot_page_device =
@@ -1444,6 +1564,17 @@ extern "C" int axiom_qwen38_attention_layer_load(
                 return rc;
             }
         }
+        if (resident_cache_context != 0u && resident_cache_context <= kTemporalHotTokens &&
+            !env_disabled("AXIOM_QWEN38_FLASHINFER_SPLIT_KV")) {
+            rc = axiom_device_buffer_create(
+                    runtime, &layer->flashinfer_split_kv_workspace,
+                    kFlashInferWorkspaceBytes);
+            if (rc != AXIOM_OK) {
+                axiom_qwen38_attention_layer_destroy(layer);
+                return rc;
+            }
+            layer->flashinfer_split_kv = true;
+        }
     }
     if (layer->streaming_kv) {
         for (uint32_t slot = 0u; slot < layer->stream_hot_pages && rc == AXIOM_OK; ++slot) {
@@ -1509,6 +1640,7 @@ extern "C" int axiom_qwen38_attention_layer_load(
         max_context >= kBatch && !env_disabled("AXIOM_QWEN38_FLASHINFER")) {
         void *flashinfer_q_bf16 = nullptr;
         void *flashinfer_attention_bf16 = nullptr;
+        void *flashinfer_split_kv_workspace = nullptr;
         void *k_cache = nullptr;
         void *v_cache = nullptr;
         int warm_rc = buffer_pointer(layer->flashinfer_q_bf16, &flashinfer_q_bf16);
@@ -1517,6 +1649,11 @@ extern "C" int axiom_qwen38_attention_layer_load(
         }
         if (warm_rc == AXIOM_OK) warm_rc = buffer_pointer(layer->k_cache, &k_cache);
         if (warm_rc == AXIOM_OK) warm_rc = buffer_pointer(layer->v_cache, &v_cache);
+        if (warm_rc == AXIOM_OK && layer->flashinfer_split_kv) {
+            warm_rc = buffer_pointer(
+                    layer->flashinfer_split_kv_workspace,
+                    &flashinfer_split_kv_workspace);
+        }
         if (warm_rc == AXIOM_OK) {
             const uint32_t warm_context = layer->streaming_temporal_hot
                     ? kTemporalHotTokens : max_context;
@@ -1526,7 +1663,8 @@ extern "C" int axiom_qwen38_attention_layer_load(
                     static_cast<const uint8_t *>(k_cache),
                     static_cast<const uint8_t *>(v_cache),
                     static_cast<uint16_t *>(flashinfer_attention_bf16),
-                    warm_kv_len, nullptr, nullptr);
+                    warm_kv_len, nullptr,
+                    static_cast<uint16_t *>(flashinfer_split_kv_workspace), nullptr);
         }
         if (warm_rc == AXIOM_OK && cudaStreamSynchronize(nullptr) == cudaSuccess) {
             layer->flashinfer_ready = true;
@@ -1548,6 +1686,7 @@ extern "C" int axiom_qwen38_attention_layer_load(
         (!layer->streaming_kv && !layer->streaming_temporal_hot) ? 0u : q_batch_bf16,
         (!layer->streaming_kv && !layer->streaming_temporal_hot) ? 0u : q_batch_bf16,
         (!layer->streaming_kv && !layer->streaming_temporal_hot) ? 0u : sizeof(uint32_t),
+        layer->flashinfer_split_kv ? kFlashInferWorkspaceBytes : 0u,
         resident_cache_context == 0u ? 0u : cache_fp8_bytes,
         resident_cache_context == 0u ? 0u : cache_fp8_bytes,
     };
@@ -1891,15 +2030,9 @@ int forward_streaming_kv(
             static_cast<const float *>(input_norm_weight), input,
             static_cast<float *>(norm));
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-    rc = axiom_qwen38_fp8_linear_forward_f32_device(
-            layer->q_proj, static_cast<const float *>(norm),
-            static_cast<float *>(q_gate), nullptr);
-    if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_f32_device(
-            layer->k_proj, static_cast<const float *>(norm),
-            static_cast<float *>(k), nullptr);
-    if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_f32_device(
-            layer->v_proj, static_cast<const float *>(norm),
-            static_cast<float *>(v), nullptr);
+    rc = qwen38_attention_project_qkv(
+            layer, static_cast<const float *>(norm), static_cast<float *>(q_gate),
+            static_cast<float *>(k), static_cast<float *>(v), nullptr);
     if (rc != AXIOM_OK) return rc;
     rc = split_q_gate_round_k8(
             static_cast<const float *>(q_gate), static_cast<float *>(q),
@@ -2089,6 +2222,69 @@ extern "C" int axiom_qwen38_attention_layer_restore_position(
     return AXIOM_OK;
 }
 
+extern "C" int axiom_qwen38_attention_layer_materialize_device_position(
+        axiom_qwen38_attention_layer *layer,
+        const uint32_t position) {
+    if (!layer || position > layer->max_context || layer->spec_active ||
+        (layer->streaming_kv && !layer->streaming_temporal_hot) ||
+        (layer->streaming_temporal_hot && position > kTemporalHotTokens)) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    if (!layer->streaming_kv) {
+        layer->position = position;
+        layer->spec_base_position = position;
+        return AXIOM_OK;
+    }
+    if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
+    void *hot_k_cache = nullptr;
+    void *hot_v_cache = nullptr;
+    int rc = buffer_pointer(layer->k_cache, &hot_k_cache);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->v_cache, &hot_v_cache);
+    if (rc != AXIOM_OK) return rc;
+
+    const uint32_t current_page = position == 0u
+            ? 0u : (position - 1u) / AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+    const uint32_t page_count = position == 0u ? 1u : current_page + 1u;
+    for (uint32_t logical_page = 0u; logical_page < page_count; ++logical_page) {
+        const uint32_t slot = logical_page % layer->stream_hot_pages;
+        void *page = nullptr;
+        rc = buffer_pointer(layer->stream_hot_page_device[slot], &page);
+        if (rc != AXIOM_OK) return rc;
+        cudaError_t status = cudaMemset(
+                page, 0, AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES);
+        const uint32_t page_start =
+                logical_page * AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+        const uint32_t valid_tokens = position > page_start
+                ? std::min<uint32_t>(
+                        AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS,
+                        position - page_start)
+                : 0u;
+        const size_t valid_bytes = static_cast<size_t>(valid_tokens) * kKvDim;
+        const size_t source_offset = static_cast<size_t>(page_start) * kKvDim;
+        if (status == cudaSuccess && valid_bytes != 0u) {
+            status = cudaMemcpy(
+                    page, static_cast<const uint8_t *>(hot_k_cache) + source_offset,
+                    valid_bytes, cudaMemcpyDeviceToDevice);
+        }
+        if (status == cudaSuccess && valid_bytes != 0u) {
+            status = cudaMemcpy(
+                    static_cast<uint8_t *>(page) +
+                            AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES / 2u,
+                    static_cast<const uint8_t *>(hot_v_cache) + source_offset,
+                    valid_bytes, cudaMemcpyDeviceToDevice);
+        }
+        if (status != cudaSuccess) return cuda_status(status);
+        layer->stream_hot_page_ids[slot] = logical_page;
+    }
+    const uint32_t current_slot = current_page % layer->stream_hot_pages;
+    layer->stream_current_page = current_page;
+    layer->stream_current_page_device = layer->stream_hot_page_device[current_slot];
+    layer->stream_page_dirty = position != 0u;
+    layer->position = position;
+    layer->spec_base_position = position;
+    return AXIOM_OK;
+}
+
 namespace {
 
 int attention_kv_page_args(
@@ -2114,16 +2310,33 @@ extern "C" int axiom_qwen38_attention_layer_kv_page_export(
     int rc = attention_kv_page_args(layer, logical_page, host_page, host_page_bytes);
     if (rc != AXIOM_OK) return rc;
     if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
+    const uint64_t page_start = static_cast<uint64_t>(logical_page) *
+            AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+    if (layer->streaming_kv &&
+        (!layer->streaming_temporal_hot || page_start >= kTemporalHotTokens)) {
+        const uint32_t slot = logical_page % layer->stream_hot_pages;
+        if (layer->stream_hot_page_ids[slot] != logical_page) {
+            return AXIOM_ERR_INVALID_ARGUMENT;
+        }
+        void *page = nullptr;
+        rc = buffer_pointer(layer->stream_hot_page_device[slot], &page);
+        if (rc != AXIOM_OK) return rc;
+        return cuda_status(cudaMemcpy(
+                host_page, page, AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES,
+                cudaMemcpyDeviceToHost));
+    }
     void *k_cache = nullptr;
     void *v_cache = nullptr;
     rc = buffer_pointer(layer->k_cache, &k_cache);
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->v_cache, &v_cache);
     if (rc != AXIOM_OK) return rc;
     std::memset(host_page, 0, static_cast<size_t>(host_page_bytes));
-    const uint64_t page_start = static_cast<uint64_t>(logical_page) *
-            AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+    const uint64_t resident_limit = layer->streaming_temporal_hot
+            ? std::min<uint64_t>(layer->max_context, kTemporalHotTokens)
+            : layer->max_context;
     const uint64_t valid_tokens = std::min<uint64_t>(
-            AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS, layer->max_context - page_start);
+            AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS,
+            resident_limit - page_start);
     const size_t valid_bytes = static_cast<size_t>(valid_tokens * kKvDim * sizeof(uint8_t));
     const uint64_t device_offset = page_start * kKvDim * sizeof(uint8_t);
     cudaError_t status = cudaMemcpy(
@@ -2153,10 +2366,35 @@ extern "C" int axiom_qwen38_attention_layer_kv_page_import(
         void *hot_page = nullptr;
         rc = buffer_pointer(layer->stream_hot_page_device[slot], &hot_page);
         if (rc != AXIOM_OK) return rc;
-        const cudaError_t status = cudaMemcpy(
+        cudaError_t status = cudaMemcpy(
                 hot_page, host_page, AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES,
                 cudaMemcpyHostToDevice);
         if (status != cudaSuccess) return cuda_status(status);
+        const uint64_t page_start = static_cast<uint64_t>(logical_page) *
+                AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+        if (layer->streaming_temporal_hot && page_start < kTemporalHotTokens) {
+            void *hot_k_cache = nullptr;
+            void *hot_v_cache = nullptr;
+            rc = buffer_pointer(layer->k_cache, &hot_k_cache);
+            if (rc == AXIOM_OK) rc = buffer_pointer(layer->v_cache, &hot_v_cache);
+            if (rc != AXIOM_OK) return rc;
+            const uint64_t valid_tokens = std::min<uint64_t>(
+                    AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS,
+                    kTemporalHotTokens - page_start);
+            const size_t valid_bytes = static_cast<size_t>(valid_tokens) * kKvDim;
+            const size_t destination_offset = static_cast<size_t>(page_start) * kKvDim;
+            status = cudaMemcpy(
+                    static_cast<uint8_t *>(hot_k_cache) + destination_offset,
+                    host_page, valid_bytes, cudaMemcpyHostToDevice);
+            if (status == cudaSuccess) {
+                status = cudaMemcpy(
+                        static_cast<uint8_t *>(hot_v_cache) + destination_offset,
+                        static_cast<const uint8_t *>(host_page) +
+                                AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES / 2u,
+                        valid_bytes, cudaMemcpyHostToDevice);
+            }
+            if (status != cudaSuccess) return cuda_status(status);
+        }
         layer->stream_hot_page_ids[slot] = logical_page;
         if (logical_page == layer->stream_current_page) {
             layer->stream_current_page_device = layer->stream_hot_page_device[slot];
@@ -2364,12 +2602,9 @@ extern "C" int axiom_qwen38_attention_layer_forward_f32_device(
     qwen38_attention_rmsnorm8_kernel<<<kBatch, kThreads>>>(
             static_cast<const float *>(input_norm_weight), input, static_cast<float *>(norm));
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-    rc = axiom_qwen38_fp8_linear_forward_f32_device(
-            layer->q_proj, static_cast<const float *>(norm), static_cast<float *>(q_gate), nullptr);
-    if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_f32_device(
-            layer->k_proj, static_cast<const float *>(norm), static_cast<float *>(k), nullptr);
-    if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_f32_device(
-            layer->v_proj, static_cast<const float *>(norm), static_cast<float *>(v), nullptr);
+    rc = qwen38_attention_project_qkv(
+            layer, static_cast<const float *>(norm), static_cast<float *>(q_gate),
+            static_cast<float *>(k), static_cast<float *>(v), nullptr);
     if (rc != AXIOM_OK) return rc;
     const bool use_batched = !layer->scalar_f32_cache_mode;
     if (use_batched) {
@@ -2574,6 +2809,7 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device(
     void *attention_reference = nullptr;
     void *flashinfer_q_bf16 = nullptr;
     void *flashinfer_attention_bf16 = nullptr;
+    void *flashinfer_split_kv_workspace = nullptr;
     int rc = buffer_pointer(layer->input_norm_weight, &input_norm_weight);
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->q_norm_weight, &q_norm_weight);
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->k_norm_weight, &k_norm_weight);
@@ -2607,18 +2843,20 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device(
         if (rc == AXIOM_OK) {
             rc = buffer_pointer(layer->flashinfer_attention_bf16, &flashinfer_attention_bf16);
         }
+        if (rc == AXIOM_OK && layer->flashinfer_split_kv) {
+            rc = buffer_pointer(
+                    layer->flashinfer_split_kv_workspace,
+                    &flashinfer_split_kv_workspace);
+        }
     }
     if (rc != AXIOM_OK) return rc;
 
     qwen38_attention_rmsnorm8_kernel<<<kBatch, kThreads, 0, cuda_stream>>>(
             static_cast<const float *>(input_norm_weight), input, static_cast<float *>(norm));
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-    rc = axiom_qwen38_fp8_linear_forward_f32_device(
-            layer->q_proj, static_cast<const float *>(norm), static_cast<float *>(q_gate), stream);
-    if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_f32_device(
-            layer->k_proj, static_cast<const float *>(norm), static_cast<float *>(k), stream);
-    if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_f32_device(
-            layer->v_proj, static_cast<const float *>(norm), static_cast<float *>(v), stream);
+    rc = qwen38_attention_project_qkv(
+            layer, static_cast<const float *>(norm), static_cast<float *>(q_gate),
+            static_cast<float *>(k), static_cast<float *>(v), stream);
     if (rc != AXIOM_OK) return rc;
     rc = split_q_gate_round_k8(
             static_cast<const float *>(q_gate), static_cast<float *>(q),
@@ -2646,7 +2884,8 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device(
                     static_cast<const uint16_t *>(flashinfer_q_bf16),
                     static_cast<const uint8_t *>(k_cache), static_cast<const uint8_t *>(v_cache),
                     static_cast<uint16_t *>(flashinfer_attention_bf16),
-                    layer->spec_base_position + kBatch, nullptr, stream);
+                    layer->spec_base_position + kBatch, nullptr,
+                    static_cast<uint16_t *>(flashinfer_split_kv_workspace), stream);
         }
         if (rc == AXIOM_OK) {
             rc = flashinfer_convert_out_to_f32(
@@ -2747,6 +2986,7 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device_positio
     void *flashinfer_q_bf16 = nullptr;
     void *flashinfer_attention_bf16 = nullptr;
     void *flashinfer_kv_length_device = nullptr;
+    void *flashinfer_split_kv_workspace = nullptr;
     int rc = buffer_pointer(layer->input_norm_weight, &input_norm_weight);
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->q_norm_weight, &q_norm_weight);
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->k_norm_weight, &k_norm_weight);
@@ -2783,18 +3023,20 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device_positio
         if (rc == AXIOM_OK) {
             rc = buffer_pointer(layer->flashinfer_kv_length_device, &flashinfer_kv_length_device);
         }
+        if (rc == AXIOM_OK && layer->flashinfer_split_kv) {
+            rc = buffer_pointer(
+                    layer->flashinfer_split_kv_workspace,
+                    &flashinfer_split_kv_workspace);
+        }
     }
     if (rc != AXIOM_OK) return rc;
 
     qwen38_attention_rmsnorm8_kernel<<<kBatch, kThreads, 0, cuda_stream>>>(
             static_cast<const float *>(input_norm_weight), input, static_cast<float *>(norm));
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-    rc = axiom_qwen38_fp8_linear_forward_f32_device(
-            layer->q_proj, static_cast<const float *>(norm), static_cast<float *>(q_gate), stream);
-    if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_f32_device(
-            layer->k_proj, static_cast<const float *>(norm), static_cast<float *>(k), stream);
-    if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_linear_forward_f32_device(
-            layer->v_proj, static_cast<const float *>(norm), static_cast<float *>(v), stream);
+    rc = qwen38_attention_project_qkv(
+            layer, static_cast<const float *>(norm), static_cast<float *>(q_gate),
+            static_cast<float *>(k), static_cast<float *>(v), stream);
     if (rc != AXIOM_OK) return rc;
     rc = split_q_gate_round_k8(
             static_cast<const float *>(q_gate), static_cast<float *>(q),
@@ -2821,7 +3063,8 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device_positio
                     static_cast<const uint16_t *>(flashinfer_q_bf16),
                     static_cast<const uint8_t *>(k_cache), static_cast<const uint8_t *>(v_cache),
                     static_cast<uint16_t *>(flashinfer_attention_bf16), cache_context,
-                    static_cast<const uint32_t *>(flashinfer_kv_length_device), stream);
+                    static_cast<const uint32_t *>(flashinfer_kv_length_device),
+                    static_cast<uint16_t *>(flashinfer_split_kv_workspace), stream);
         }
         if (rc == AXIOM_OK) {
             rc = flashinfer_convert_out_to_f32(

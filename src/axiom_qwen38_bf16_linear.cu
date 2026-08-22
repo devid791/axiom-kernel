@@ -57,6 +57,49 @@ __global__ void bf16_linear_batch8_reference_kernel(
     }
 }
 
+__global__ void bf16_linear_pair_batch8_reference_kernel(
+        const uint16_t *__restrict__ first_weight,
+        const uint16_t *__restrict__ second_weight,
+        const float *__restrict__ input,
+        float *__restrict__ first_out,
+        float *__restrict__ second_out,
+        uint32_t rows,
+        uint32_t cols) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t column = blockIdx.y;
+    const uint32_t thread = threadIdx.x;
+    if (row >= rows || column >= AXIOM_QWEN38_BF16_LINEAR_BATCH) return;
+
+    const uint16_t *first = first_weight + static_cast<uint64_t>(row) * cols;
+    const uint16_t *second = second_weight + static_cast<uint64_t>(row) * cols;
+    const float *x = input + static_cast<uint64_t>(column) * cols;
+    float first_partial = 0.0f;
+    float second_partial = 0.0f;
+    for (uint32_t c = thread; c < cols; c += blockDim.x) {
+        const float value = x[c];
+        first_partial += decode_bf16(first[c]) * value;
+        second_partial += decode_bf16(second[c]) * value;
+    }
+
+    __shared__ float first_reduction[kThreads];
+    __shared__ float second_reduction[kThreads];
+    first_reduction[thread] = first_partial;
+    second_reduction[thread] = second_partial;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride != 0u; stride >>= 1u) {
+        if (thread < stride) {
+            first_reduction[thread] += first_reduction[thread + stride];
+            second_reduction[thread] += second_reduction[thread + stride];
+        }
+        __syncthreads();
+    }
+    if (thread == 0u) {
+        const uint64_t index = static_cast<uint64_t>(column) * rows + row;
+        first_out[index] = first_reduction[0];
+        second_out[index] = second_reduction[0];
+    }
+}
+
 __global__ void f32_to_bf16_columns_kernel(
         const float *__restrict__ input,
         uint16_t *__restrict__ output,
@@ -408,6 +451,30 @@ extern "C" int axiom_qwen38_bf16_linear_forward_f32_device(
             dim3(linear->rows, AXIOM_QWEN38_BF16_LINEAR_BATCH),
             kThreads, 0, cuda_stream>>>(
             linear->weight, input, out, linear->rows, linear->cols);
+    return cudaGetLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
+}
+
+extern "C" int axiom_qwen38_bf16_linear_pair_forward_f32_device(
+        axiom_qwen38_bf16_linear *first,
+        axiom_qwen38_bf16_linear *second,
+        const float *input,
+        float *first_out,
+        float *second_out,
+        void *stream) {
+    if (!first || !second || !input || !first_out || !second_out ||
+        !first->weight || !second->weight || first->nvfp4_dequantized ||
+        second->nvfp4_dequantized || first->device != second->device ||
+        first->rows == 0u || first->cols == 0u ||
+        first->rows != second->rows || first->cols != second->cols) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    if (cudaSetDevice(first->device) != cudaSuccess) return AXIOM_ERR_CUDA;
+    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    bf16_linear_pair_batch8_reference_kernel<<<
+            dim3(first->rows, AXIOM_QWEN38_BF16_LINEAR_BATCH),
+            kThreads, 0, cuda_stream>>>(
+            first->weight, second->weight, input, first_out, second_out,
+            first->rows, first->cols);
     return cudaGetLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
 }
 

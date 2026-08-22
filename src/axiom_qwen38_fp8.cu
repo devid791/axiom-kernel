@@ -15,10 +15,14 @@
 #include <cuda_fp8.h>
 #include <cublasLt.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <new>
 #include <string>
 #include <vector>
@@ -371,6 +375,319 @@ struct axiom_qwen38_fp8_projection_group {
 
 namespace {
 
+__global__ void fp8_exact_output_compare_kernel(
+        const float *__restrict__ reference,
+        const float *__restrict__ candidate,
+        uint64_t count,
+        uint32_t *__restrict__ mismatch) {
+    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count && __float_as_uint(reference[index]) != __float_as_uint(candidate[index])) {
+        atomicExch(mismatch, 1u);
+    }
+}
+
+__global__ void fp8_autotune_input_pattern_kernel(
+        uint8_t *__restrict__ values,
+        uint64_t count,
+        uint32_t seed) {
+    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    uint32_t mixed = static_cast<uint32_t>(index) * 747796405u + seed * 2891336453u;
+    mixed = ((mixed >> ((mixed >> 28u) + 4u)) ^ mixed) * 277803737u;
+    mixed = (mixed >> 22u) ^ mixed;
+    const uint8_t magnitude = static_cast<uint8_t>(0x18u + mixed % 0x40u);
+    values[index] = static_cast<uint8_t>(magnitude | ((mixed >> 8u) & 0x80u));
+}
+
+bool fp8_autotune_enabled() {
+    const char *value = std::getenv("AXIOM_QWEN38_FP8_AUTOTUNE");
+    if (!value || value[0] == '\0') {
+        value = std::getenv("AXIOM_QWEN38_MATMUL_AUTOTUNE");
+    }
+    return value && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+            std::strcmp(value, "false") != 0 && std::strcmp(value, "False") != 0;
+}
+
+struct Fp8AlgoKey {
+    uint32_t rows = 0u;
+    uint32_t cols = 0u;
+
+    bool operator<(const Fp8AlgoKey &other) const {
+        return rows != other.rows ? rows < other.rows : cols < other.cols;
+    }
+};
+
+struct Fp8AlgoValue {
+    cublasLtMatmulHeuristicResult_t heuristic{};
+    uint32_t candidate_index = 0u;
+    uint32_t candidate_count = 0u;
+    float milliseconds = 0.0f;
+};
+
+std::atomic_flag g_fp8_algo_lock = ATOMIC_FLAG_INIT;
+std::map<Fp8AlgoKey, Fp8AlgoValue> g_fp8_algo_cache;
+
+struct Fp8AlgoGuard {
+    Fp8AlgoGuard() {
+        while (g_fp8_algo_lock.test_and_set(std::memory_order_acquire)) {}
+    }
+    ~Fp8AlgoGuard() {
+        g_fp8_algo_lock.clear(std::memory_order_release);
+    }
+};
+
+bool fp8_candidate_is_exact(
+        cublasLtHandle_t handle,
+        cublasLtMatmulDesc_t desc,
+        cublasLtMatrixLayout_t a_layout,
+        cublasLtMatrixLayout_t b_layout,
+        cublasLtMatrixLayout_t c_layout,
+        cublasLtMatrixLayout_t d_layout,
+        const uint8_t *weight,
+        uint8_t *input,
+        float *reference,
+        float *candidate_output,
+        uint32_t *mismatch_device,
+        void *workspace,
+        size_t input_bytes,
+        uint64_t output_elements,
+        const cublasLtMatmulHeuristicResult_t &reference_candidate,
+        const cublasLtMatmulHeuristicResult_t &candidate,
+        cudaStream_t stream) {
+    if (!handle || !desc || !a_layout || !b_layout || !c_layout || !d_layout ||
+        !weight || !input || !reference || !candidate_output || !mismatch_device ||
+        !workspace || !stream || input_bytes == 0u || output_elements == 0u) {
+        return false;
+    }
+    constexpr uint32_t kValidationPatterns = 3u;
+    constexpr uint32_t kPatternSeeds[kValidationPatterns] = {
+            0x243f6a88u, 0x9e3779b9u, 0xb7e15162u};
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const uint64_t input_grid = (input_bytes + kThreads - 1u) / kThreads;
+    const uint64_t output_grid = (output_elements + kThreads - 1u) / kThreads;
+    if (input_grid > std::numeric_limits<uint32_t>::max() ||
+        output_grid > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    for (uint32_t pattern = 0u; pattern < kValidationPatterns; ++pattern) {
+        fp8_autotune_input_pattern_kernel<<<
+                static_cast<uint32_t>(input_grid), kThreads, 0, stream>>>(
+                input, input_bytes, kPatternSeeds[pattern]);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        cublasStatus_t status = cublasLtMatmul(
+                handle, desc, &alpha, weight, a_layout, input, b_layout,
+                &beta, reference, c_layout, reference, d_layout,
+                &reference_candidate.algo, workspace,
+                reference_candidate.workspaceSize, stream);
+        if (status != CUBLAS_STATUS_SUCCESS) return false;
+        status = cublasLtMatmul(
+                handle, desc, &alpha, weight, a_layout, input, b_layout,
+                &beta, candidate_output, c_layout, candidate_output, d_layout,
+                &candidate.algo, workspace, candidate.workspaceSize, stream);
+        if (status != CUBLAS_STATUS_SUCCESS) return false;
+        uint32_t mismatch = 1u;
+        cudaError_t compare_status = cudaMemsetAsync(
+                mismatch_device, 0, sizeof(uint32_t), stream);
+        if (compare_status == cudaSuccess) {
+            fp8_exact_output_compare_kernel<<<
+                    static_cast<uint32_t>(output_grid), kThreads, 0, stream>>>(
+                    reference, candidate_output, output_elements, mismatch_device);
+            compare_status = cudaGetLastError();
+        }
+        if (compare_status == cudaSuccess) compare_status = cudaMemcpyAsync(
+                &mismatch, mismatch_device, sizeof(uint32_t),
+                cudaMemcpyDeviceToHost, stream);
+        if (compare_status == cudaSuccess) compare_status = cudaStreamSynchronize(stream);
+        if (compare_status != cudaSuccess || mismatch != 0u) return false;
+    }
+    return true;
+}
+
+cublasStatus_t select_fp8_algorithm(
+        cublasLtHandle_t handle,
+        cublasLtMatmulDesc_t desc,
+        cublasLtMatrixLayout_t a_layout,
+        cublasLtMatrixLayout_t b_layout,
+        cublasLtMatrixLayout_t c_layout,
+        cublasLtMatrixLayout_t d_layout,
+        cublasLtMatmulPreference_t preference,
+        const uint8_t *weight,
+        uint8_t *input,
+        void *workspace,
+        uint32_t rows,
+        uint32_t cols,
+        cublasLtMatmulHeuristicResult_t *out) {
+    if (!handle || !desc || !a_layout || !b_layout || !c_layout || !d_layout ||
+        !preference || !weight || !input || !workspace || !out || rows == 0u || cols == 0u) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    const bool tune = fp8_autotune_enabled();
+    const Fp8AlgoKey key{rows, cols};
+    if (tune) {
+        Fp8AlgoGuard guard;
+        const auto cached = g_fp8_algo_cache.find(key);
+        if (cached != g_fp8_algo_cache.end()) {
+            *out = cached->second.heuristic;
+            return CUBLAS_STATUS_SUCCESS;
+        }
+    }
+
+    constexpr int kMaxCandidates = 32;
+    cublasLtMatmulHeuristicResult_t candidates[kMaxCandidates]{};
+    int returned = 0;
+    cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
+            handle, desc, a_layout, b_layout, c_layout, d_layout,
+            preference, tune ? kMaxCandidates : 1, candidates, &returned);
+    if (status != CUBLAS_STATUS_SUCCESS || returned < 1) {
+        return status == CUBLAS_STATUS_SUCCESS
+                ? CUBLAS_STATUS_NOT_SUPPORTED : status;
+    }
+    *out = candidates[0];
+    if (!tune || returned == 1) {
+        if (tune) {
+            {
+                Fp8AlgoGuard guard;
+                g_fp8_algo_cache.emplace(
+                        key, Fp8AlgoValue{candidates[0], 0u,
+                                          static_cast<uint32_t>(returned), 0.0f});
+            }
+            std::fprintf(stderr,
+                         "axiom-qwen38-fp8: autotune rows=%u cols=%u candidates=%d "
+                         "selected=0 measured_ms=0\n",
+                         rows, cols, returned);
+        }
+        return CUBLAS_STATUS_SUCCESS;
+    }
+
+    float *scratch = nullptr;
+    float *reference = nullptr;
+    uint32_t *mismatch_device = nullptr;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t begin = nullptr;
+    cudaEvent_t end = nullptr;
+    const size_t input_bytes = static_cast<size_t>(cols) * AXIOM_QWEN38_FP8_BATCH;
+    const size_t output_bytes = static_cast<size_t>(rows) *
+            AXIOM_QWEN38_FP8_BATCH * sizeof(float);
+    const uint64_t output_elements =
+            static_cast<uint64_t>(rows) * AXIOM_QWEN38_FP8_BATCH;
+    cudaError_t cuda_status = cudaMalloc(&scratch, output_bytes);
+    if (cuda_status == cudaSuccess) cuda_status = cudaMalloc(&reference, output_bytes);
+    if (cuda_status == cudaSuccess) cuda_status = cudaMalloc(&mismatch_device, sizeof(uint32_t));
+    if (cuda_status == cudaSuccess) cuda_status = cudaStreamCreateWithFlags(
+            &stream, cudaStreamNonBlocking);
+    if (cuda_status == cudaSuccess) cuda_status = cudaEventCreate(&begin);
+    if (cuda_status == cudaSuccess) cuda_status = cudaEventCreate(&end);
+    constexpr uint32_t kWarmupRuns = 2u;
+    constexpr uint32_t kMeasuredRuns = 20u;
+    constexpr float kMinimumSpeedup = 1.03f;
+    constexpr float kCandidateReplacementSpeedup = 1.03f;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    uint32_t best_index = 0u;
+    uint32_t exact_candidates = 0u;
+    float best_ms = std::numeric_limits<float>::infinity();
+    float baseline_ms = std::numeric_limits<float>::infinity();
+    if (cuda_status == cudaSuccess) {
+        for (int candidate = 0; candidate < returned; ++candidate) {
+            if (candidates[candidate].state != CUBLAS_STATUS_SUCCESS ||
+                candidates[candidate].workspaceSize > kWorkspaceBytes) {
+                continue;
+            }
+            const bool exact = candidate == 0 || fp8_candidate_is_exact(
+                    handle, desc, a_layout, b_layout, c_layout, d_layout,
+                    weight, input, reference, scratch, mismatch_device, workspace,
+                    input_bytes, output_elements, candidates[0], candidates[candidate], stream);
+            if (!exact) {
+                (void)cudaGetLastError();
+                continue;
+            }
+            ++exact_candidates;
+            const uint64_t input_grid = (input_bytes + kThreads - 1u) / kThreads;
+            fp8_autotune_input_pattern_kernel<<<
+                    static_cast<uint32_t>(input_grid), kThreads, 0, stream>>>(
+                    input, input_bytes, 0xd1b54a35u);
+            if (cudaGetLastError() != cudaSuccess) continue;
+            cublasStatus_t run_status = CUBLAS_STATUS_SUCCESS;
+            for (uint32_t run = 0u; run < kWarmupRuns &&
+                 run_status == CUBLAS_STATUS_SUCCESS; ++run) {
+                run_status = cublasLtMatmul(
+                        handle, desc, &alpha, weight, a_layout, input, b_layout,
+                        &beta, scratch, c_layout, scratch, d_layout,
+                        &candidates[candidate].algo, workspace,
+                        candidates[candidate].workspaceSize, stream);
+            }
+            if (run_status != CUBLAS_STATUS_SUCCESS ||
+                cudaStreamSynchronize(stream) != cudaSuccess ||
+                cudaEventRecord(begin, stream) != cudaSuccess) {
+                (void)cudaGetLastError();
+                continue;
+            }
+            for (uint32_t run = 0u; run < kMeasuredRuns &&
+                 run_status == CUBLAS_STATUS_SUCCESS; ++run) {
+                run_status = cublasLtMatmul(
+                        handle, desc, &alpha, weight, a_layout, input, b_layout,
+                        &beta, scratch, c_layout, scratch, d_layout,
+                        &candidates[candidate].algo, workspace,
+                        candidates[candidate].workspaceSize, stream);
+            }
+            float elapsed_ms = 0.0f;
+            if (run_status != CUBLAS_STATUS_SUCCESS ||
+                cudaEventRecord(end, stream) != cudaSuccess ||
+                cudaEventSynchronize(end) != cudaSuccess ||
+                cudaEventElapsedTime(&elapsed_ms, begin, end) != cudaSuccess) {
+                (void)cudaGetLastError();
+                continue;
+            }
+            const float per_call_ms = elapsed_ms / kMeasuredRuns;
+            if (candidate == 0) baseline_ms = per_call_ms;
+            if (!std::isfinite(best_ms) ||
+                per_call_ms * kCandidateReplacementSpeedup < best_ms) {
+                best_ms = per_call_ms;
+                best_index = static_cast<uint32_t>(candidate);
+            }
+        }
+    }
+    if (end) (void)cudaEventDestroy(end);
+    if (begin) (void)cudaEventDestroy(begin);
+    if (stream) (void)cudaStreamDestroy(stream);
+    if (mismatch_device) (void)cudaFree(mismatch_device);
+    if (reference) (void)cudaFree(reference);
+    if (scratch) (void)cudaFree(scratch);
+    if (!std::isfinite(best_ms)) {
+        best_index = 0u;
+        best_ms = 0.0f;
+    } else if (best_index != 0u &&
+               (!std::isfinite(baseline_ms) || best_ms * kMinimumSpeedup >= baseline_ms)) {
+        best_index = 0u;
+        best_ms = baseline_ms;
+    }
+    *out = candidates[best_index];
+    {
+        Fp8AlgoGuard guard;
+        g_fp8_algo_cache.emplace(
+                key, Fp8AlgoValue{candidates[best_index], best_index,
+                                   static_cast<uint32_t>(returned), best_ms});
+    }
+    int algo_id = -1;
+    int split_k = 0;
+    size_t written = 0u;
+    (void)cublasLtMatmulAlgoConfigGetAttribute(
+            &candidates[best_index].algo, CUBLASLT_ALGO_CONFIG_ID,
+            &algo_id, sizeof(algo_id), &written);
+    (void)cublasLtMatmulAlgoConfigGetAttribute(
+            &candidates[best_index].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+            &split_k, sizeof(split_k), &written);
+    std::fprintf(stderr,
+                 "axiom-qwen38-fp8: autotune rows=%u cols=%u candidates=%d "
+                 "exact=%u selected=%u algo=%d split_k=%d baseline_ms=%.6f measured_ms=%.6f "
+                 "workspace=%zu\n",
+                 rows, cols, returned, exact_candidates, best_index, algo_id, split_k,
+                 static_cast<double>(baseline_ms), static_cast<double>(best_ms),
+                 candidates[best_index].workspaceSize);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
 void destroy_lt(axiom_qwen38_fp8_linear *linear) {
     if (!linear) return;
     if (linear->d_layout) (void)cublasLtMatrixLayoutDestroy(linear->d_layout);
@@ -434,13 +751,13 @@ bool configure_tensor_core(axiom_qwen38_fp8_linear *linear) {
     if (status == CUBLAS_STATUS_SUCCESS) status = cublasLtMatmulPreferenceSetAttribute(
             preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
             &kWorkspaceBytes, sizeof(kWorkspaceBytes));
-    int returned = 0;
-    if (status == CUBLAS_STATUS_SUCCESS) status = cublasLtMatmulAlgoGetHeuristic(
+    if (status == CUBLAS_STATUS_SUCCESS) status = select_fp8_algorithm(
             linear->lt, linear->desc,
             linear->a_layout, linear->b_layout, linear->c_layout, linear->d_layout,
-            preference, 1, &linear->heuristic, &returned);
+            preference, linear->weight, linear->input_quantized, linear->workspace,
+            linear->rows, linear->cols, &linear->heuristic);
     if (preference) (void)cublasLtMatmulPreferenceDestroy(preference);
-    if (status != CUBLAS_STATUS_SUCCESS || returned != 1) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
         destroy_lt(linear);
         return false;
     }
@@ -486,6 +803,20 @@ int launch_reference(
     return cudaPeekAtLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
 }
 
+int launch_reference_prepared(
+        axiom_qwen38_fp8_linear *linear,
+        const uint8_t *input_quantized,
+        float *out,
+        cudaStream_t stream) {
+    if (!linear->modelopt_scalar) return AXIOM_ERR_INVALID_ARGUMENT;
+    fp8_scalar_scaled_reference_kernel<<<
+            dim3(linear->rows, AXIOM_QWEN38_FP8_BATCH), kThreads, 0, stream>>>(
+            linear->weight, input_quantized,
+            linear->modelopt_weight_scale_host, linear->modelopt_input_scale_host,
+            out, linear->rows, linear->cols);
+    return cudaPeekAtLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
+}
+
 int launch_tensor_core(
         axiom_qwen38_fp8_linear *linear,
         float *out,
@@ -507,6 +838,26 @@ int launch_tensor_core(
                 static_cast<uint32_t>((count + kThreads - 1u) / kThreads), kThreads, 0, stream>>>(
                 out, linear->weight_scale, linear->input_scale, linear->rows);
     }
+    return cudaPeekAtLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
+}
+
+int launch_tensor_core_prepared(
+        axiom_qwen38_fp8_linear *linear,
+        const uint8_t *input_quantized,
+        float *out,
+        cudaStream_t stream) {
+    if (!linear->modelopt_scalar) return AXIOM_ERR_INVALID_ARGUMENT;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t status = cublasLtMatmul(
+            linear->lt, linear->desc, &alpha,
+            linear->weight, linear->a_layout,
+            input_quantized, linear->b_layout,
+            &beta, out, linear->c_layout,
+            out, linear->d_layout,
+            &linear->heuristic.algo, linear->workspace,
+            linear->heuristic.workspaceSize, stream);
+    if (status != CUBLAS_STATUS_SUCCESS) return AXIOM_ERR_RUNTIME;
     return cudaPeekAtLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
 }
 
@@ -573,13 +924,13 @@ bool configure_group_tensor_core(axiom_qwen38_fp8_projection_group *group) {
     if (status == CUBLAS_STATUS_SUCCESS) status = cublasLtMatmulPreferenceSetAttribute(
             preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
             &kWorkspaceBytes, sizeof(kWorkspaceBytes));
-    int returned = 0;
-    if (status == CUBLAS_STATUS_SUCCESS) status = cublasLtMatmulAlgoGetHeuristic(
+    if (status == CUBLAS_STATUS_SUCCESS) status = select_fp8_algorithm(
             group->lt, group->desc,
             group->a_layout, group->b_layout, group->c_layout, group->d_layout,
-            preference, 1, &group->heuristic, &returned);
+            preference, group->weight, group->input_quantized, group->workspace,
+            group->rows, group->cols, &group->heuristic);
     if (preference) (void)cublasLtMatmulPreferenceDestroy(preference);
-    if (status != CUBLAS_STATUS_SUCCESS || returned != 1) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
         destroy_group_lt(group);
         return false;
     }
@@ -937,6 +1288,44 @@ extern "C" int axiom_qwen38_fp8_linear_forward_f32_device(
     if (rc != AXIOM_OK) return rc;
     if (linear->tensor_core) return launch_tensor_core(linear, out, cuda_stream);
     return launch_reference(linear, out, cuda_stream);
+}
+
+extern "C" int axiom_qwen38_fp8_linear_prepare_input_f32_device(
+        axiom_qwen38_fp8_linear *prepared,
+        const float *input,
+        void *stream) {
+    if (!prepared || !input || !prepared->modelopt_scalar ||
+        !prepared->input_quantized || !prepared->input_scale ||
+        prepared->cols == 0u) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    if (cudaSetDevice(prepared->device) != cudaSuccess) return AXIOM_ERR_CUDA;
+    return quantize_input(prepared, input, static_cast<cudaStream_t>(stream));
+}
+
+extern "C" int axiom_qwen38_fp8_linear_forward_prepared_f32_device(
+        axiom_qwen38_fp8_linear *linear,
+        const axiom_qwen38_fp8_linear *prepared,
+        float *out,
+        void *stream) {
+    if (!linear || !prepared || !out || !linear->modelopt_scalar ||
+        !prepared->modelopt_scalar || !linear->weight || !prepared->input_quantized ||
+        !linear->input_scale || !prepared->input_scale ||
+        linear->device != prepared->device || linear->cols == 0u ||
+        linear->cols != prepared->cols ||
+        std::memcmp(&linear->modelopt_input_scale_host,
+                    &prepared->modelopt_input_scale_host,
+                    sizeof(linear->modelopt_input_scale_host)) != 0) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    if (cudaSetDevice(linear->device) != cudaSuccess) return AXIOM_ERR_CUDA;
+    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    if (linear->tensor_core) {
+        return launch_tensor_core_prepared(
+                linear, prepared->input_quantized, out, cuda_stream);
+    }
+    return launch_reference_prepared(
+            linear, prepared->input_quantized, out, cuda_stream);
 }
 
 extern "C" int axiom_qwen38_fp8_projection_group_create(

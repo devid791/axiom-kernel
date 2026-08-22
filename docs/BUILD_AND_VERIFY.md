@@ -51,3 +51,39 @@ For a model-backed verification run, record all of the following together:
 7. output parity, acceptance statistics, TTFT and decode throughput.
 
 No performance or long-context statement is portable without this fixture.
+
+## Exact speculative-path verification
+
+The optimized path is enabled by default except for load-time matrix
+autotuning. For a performance candidate, enable autotuning before model
+creation:
+
+```sh
+export AXIOM_QWEN38_MATMUL_AUTOTUNE=1
+```
+
+Use `tools/axiom_qwen38_temporal_gate.cpp` to compare temporal M8 output with
+the scalar causal path, then use
+`tools/axiom_qwen38_speculative_graph_gate.cpp` for repeated device-graph
+decode. Build the three relevant gates with:
+
+```sh
+make CUDA_ARCH=sm_120 qwen38-temporal-gate
+make CUDA_ARCH=sm_120 qwen38-speculative-graph-gate
+make CUDA_ARCH=sm_120 qwen38-paged-runtime-gate
+```
+
+The binaries require compatible model artifacts supplied outside this
+repository. A release result is valid only if:
+
+- temporal token IDs, logits and all five target taps pass parity;
+- repeated graph runs produce identical token IDs;
+- speculative acceptance counters remain stable;
+- a paged-runtime run crosses at least one page boundary without token or
+  logit mismatch;
+- the output digest and artifact hashes are recorded with throughput.
+
+The optimization controls and their rollback values are listed in
+`docs/qwen38/PERFORMANCE.md`. Change one control at a time when diagnosing a
+regression. Load-time autotuning must complete before graph capture; timing or
+algorithm selection inside replay is a release failure.

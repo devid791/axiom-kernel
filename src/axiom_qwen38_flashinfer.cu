@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 
 #include "axiom/qwen38_flashinfer.h"
@@ -82,6 +83,21 @@ int from_cuda(cudaError_t status) {
     return status == cudaErrorMemoryAllocation ? AXIOM_ERR_BUDGET : AXIOM_ERR_CUDA;
 }
 
+uint32_t graph_planning_kv_len(
+        uint32_t kv_len_host,
+        const uint32_t *kv_len_device) {
+    if (!kv_len_device) return kv_len_host;
+    const char *value = std::getenv("AXIOM_QWEN38_FLASHINFER_PLAN_KV");
+    if (!value || value[0] == '\0') return kv_len_host;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (!end || end == value || end[0] != '\0' ||
+        (parsed != 256ul && parsed != 512ul && parsed != 1024ul && parsed != 2048ul)) {
+        return kv_len_host;
+    }
+    return static_cast<uint32_t>(parsed);
+}
+
 }  // namespace
 
 extern "C" int axiom_qwen38_flashinfer_temporal8_bf16_e4m3_device(
@@ -91,6 +107,7 @@ extern "C" int axiom_qwen38_flashinfer_temporal8_bf16_e4m3_device(
         uint16_t *out_bf16,
         uint32_t kv_len_host,
         const uint32_t *kv_len_device,
+        uint16_t *split_kv_tmp_bf16,
         void *stream) {
     if (!q_bf16 || !k_e4m3 || !v_e4m3 || !out_bf16 ||
         kv_len_host < kQwen38TemporalWidth) {
@@ -103,7 +120,7 @@ extern "C" int axiom_qwen38_flashinfer_temporal8_bf16_e4m3_device(
     params.v = reinterpret_cast<__nv_fp8_e4m3 *>(const_cast<uint8_t *>(v_e4m3));
     params.o = reinterpret_cast<nv_bfloat16 *>(out_bf16);
     params.group_size = flashinfer::uint_fastdiv(kQwen38Heads / kQwen38KvHeads);
-    params.kv_len = kv_len_host;
+    params.kv_len = graph_planning_kv_len(kv_len_host, kv_len_device);
     params.kv_len_device = kv_len_device;
 
     try {
@@ -111,7 +128,8 @@ extern "C" int axiom_qwen38_flashinfer_temporal8_bf16_e4m3_device(
                 kQwen38HeadDim, kQwen38HeadDim, flashinfer::PosEncodingMode::kNone,
                 /* use_fp16_qk_reduction = */ false, flashinfer::MaskMode::kCausal,
                 flashinfer::DefaultAttention<false, false, false, false>>(
-                params, nullptr, static_cast<cudaStream_t>(stream));
+                params, reinterpret_cast<nv_bfloat16 *>(split_kv_tmp_bf16),
+                static_cast<cudaStream_t>(stream));
         return from_cuda(status);
     } catch (const std::exception &) {
         return AXIOM_ERR_CUDA;

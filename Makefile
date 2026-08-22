@@ -65,7 +65,7 @@ CORE_OBJECTS := $(CORE_CPP_OBJECTS) $(CORE_CU_OBJECTS)
 
 COMMON_LINK_LIBS := $(CUDA_LDFLAGS) $(CUDA_LIBS) $(VISION_LINK_LIBS) $(MEDIA_LINK_LIBS)
 
-.PHONY: all clean check public-scan host-tests smoke qwen38-generate install cuda-check
+.PHONY: all clean check public-scan host-tests smoke qwen38-generate qwen38-temporal-gate qwen38-speculative-graph-gate qwen38-paged-runtime-gate install cuda-check
 
 all: cuda-check $(LIB_DIR)/libaxiom.so $(BIN_DIR)/axiom-qwen38-generate host-tests
 
@@ -91,6 +91,30 @@ $(BIN_DIR)/axiom-qwen38-generate: $(BUILD_DIR)/axiom_qwen38_generate.o $(LIB_DIR
 	$(CXX) -o $@ $< -L$(LIB_DIR) -laxiom $(COMMON_LINK_LIBS) -Wl,-rpath,'$$ORIGIN/../lib'
 
 qwen38-generate: $(BIN_DIR)/axiom-qwen38-generate
+
+$(BUILD_DIR)/axiom_qwen38_temporal_gate.o: tools/axiom_qwen38_temporal_gate.cpp | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+$(BIN_DIR)/axiom-qwen38-temporal-gate: $(BUILD_DIR)/axiom_qwen38_temporal_gate.o $(LIB_DIR)/libaxiom.so | $(BIN_DIR)
+	$(CXX) -o $@ $< -L$(LIB_DIR) -laxiom $(COMMON_LINK_LIBS) -Wl,-rpath,'$$ORIGIN/../lib'
+
+qwen38-temporal-gate: $(BIN_DIR)/axiom-qwen38-temporal-gate
+
+$(BUILD_DIR)/axiom_qwen38_speculative_graph_gate.o: tools/axiom_qwen38_speculative_graph_gate.cpp | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+$(BIN_DIR)/axiom-qwen38-speculative-graph-gate: $(BUILD_DIR)/axiom_qwen38_speculative_graph_gate.o $(LIB_DIR)/libaxiom.so | $(BIN_DIR)
+	$(CXX) -o $@ $< -L$(LIB_DIR) -laxiom $(COMMON_LINK_LIBS) -Wl,-rpath,'$$ORIGIN/../lib'
+
+qwen38-speculative-graph-gate: $(BIN_DIR)/axiom-qwen38-speculative-graph-gate
+
+$(BUILD_DIR)/axiom_qwen38_paged_runtime_gate.o: tools/axiom_qwen38_paged_runtime_gate.cpp | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+$(BIN_DIR)/axiom-qwen38-paged-runtime-gate: $(BUILD_DIR)/axiom_qwen38_paged_runtime_gate.o $(LIB_DIR)/libaxiom.so | $(BIN_DIR)
+	$(CXX) -o $@ $< -L$(LIB_DIR) -laxiom $(COMMON_LINK_LIBS) -Wl,-rpath,'$$ORIGIN/../lib'
+
+qwen38-paged-runtime-gate: $(BIN_DIR)/axiom-qwen38-paged-runtime-gate
 
 $(BUILD_DIR)/axiom_qwen38_session_store_test.o: tests/axiom_qwen38_session_store_test.cpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@

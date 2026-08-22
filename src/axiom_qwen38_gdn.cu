@@ -30,11 +30,12 @@ constexpr uint32_t kKeyDim = kKeyHeads * kHeadDim;
 constexpr uint32_t kValueDim = kValueHeads * kHeadDim;
 constexpr uint32_t kProjectionDim = kConvDim + kValueDim;
 constexpr uint32_t kThreads = 256u;
-constexpr uint32_t kTemporalValueTile = 8u;
+constexpr uint32_t kDefaultTemporalValueTile = 8u;
 constexpr float kEps = 1.0e-6f;
 
 static_assert(kConvDim == kKeyDim + kKeyDim + kValueDim, "Qwen3.8 QKV layout changed");
-static_assert(kHeadDim % kTemporalValueTile == 0u, "Temporal GDN tile must divide V");
+static_assert(kHeadDim % kDefaultTemporalValueTile == 0u,
+              "Temporal GDN tile must divide V");
 
 int cuda_status(cudaError_t status) {
     if (status == cudaSuccess) return AXIOM_OK;
@@ -66,6 +67,23 @@ int buffer_pointer(const axiom_device_buffer *buffer, void **out) {
 bool env_disabled(const char *name) {
     const char *value = std::getenv(name);
     return value && (value[0] == '0' || value[0] == 'f' || value[0] == 'F');
+}
+
+uint32_t temporal_value_tile_from_env() {
+    const char *value = std::getenv("AXIOM_QWEN38_GDN_TEMPORAL_VALUE_TILE");
+    if (!value || !value[0]) return kDefaultTemporalValueTile;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || *end != '\0') return kDefaultTemporalValueTile;
+    switch (parsed) {
+        case 8u:
+        case 16u:
+        case 32u:
+        case 64u:
+            return static_cast<uint32_t>(parsed);
+        default:
+            return kDefaultTemporalValueTile;
+    }
 }
 
 int tensor_element_count(
@@ -398,7 +416,8 @@ __global__ void qwen38_gdn_gated_norm8_kernel(
 __global__ void qwen38_gdn_conv1d_silu_temporal8_kernel(
         const float *__restrict__ grouped_projection,
         const float *__restrict__ weight,
-        float *__restrict__ ring,
+        const float *__restrict__ ring,
+        float *__restrict__ final_ring,
         float *__restrict__ out) {
     const uint32_t channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= kConvDim) return;
@@ -419,12 +438,10 @@ __global__ void qwen38_gdn_conv1d_silu_temporal8_kernel(
         ring0 = ring1;
         ring1 = ring2;
         ring2 = value;
-        const uint64_t snapshot =
-                (static_cast<uint64_t>(token) * kConvDim + channel) * 3u;
-        ring[snapshot] = ring0;
-        ring[snapshot + 1u] = ring1;
-        ring[snapshot + 2u] = ring2;
     }
+    final_ring[static_cast<uint64_t>(channel) * 3u] = ring0;
+    final_ring[static_cast<uint64_t>(channel) * 3u + 1u] = ring1;
+    final_ring[static_cast<uint64_t>(channel) * 3u + 2u] = ring2;
 }
 
 __global__ void qwen38_gdn_normalize_qk_temporal8_kernel(
@@ -462,25 +479,29 @@ __global__ void qwen38_gdn_normalize_qk_temporal8_kernel(
  * every temporal row.  This native variant uses shared memory for the tile so
  * each output column can retain Axiom's original row-ordered FP32 reductions.
  * It reads the initial state once and writes each committable prefix once. */
+template <uint32_t ValueTile>
 __global__ void qwen38_gdn_recurrence_temporal8_kernel(
         const float *__restrict__ normalized_qkv,
         const float *__restrict__ g,
         const float *__restrict__ beta,
-        float *__restrict__ state,
-        float *__restrict__ out) {
+        const float *__restrict__ state,
+        float *__restrict__ final_state,
+        float *__restrict__ out,
+        float *__restrict__ delta_history,
+        float *__restrict__ decay_history) {
+    static_assert(ValueTile != 0u && kHeadDim % ValueTile == 0u,
+                  "Temporal GDN value tile must divide the head dimension");
     const uint32_t value_tile = blockIdx.x;
     const uint32_t head = blockIdx.y;
     const uint32_t row = threadIdx.x;
-    if (value_tile >= kHeadDim / kTemporalValueTile ||
+    if (value_tile >= kHeadDim / ValueTile ||
         head >= kValueHeads || row >= kHeadDim) {
         return;
     }
-    const uint32_t value_start = value_tile * kTemporalValueTile;
+    const uint32_t value_start = value_tile * ValueTile;
     const uint32_t key_head = head / (kValueHeads / kKeyHeads);
-    const uint64_t state_lane_stride =
-            static_cast<uint64_t>(kValueHeads) * kHeadDim * kHeadDim;
     extern __shared__ float scratch[];
-    constexpr uint32_t kStateTileElements = kHeadDim * kTemporalValueTile;
+    constexpr uint32_t kStateTileElements = kHeadDim * ValueTile;
     float *state_tile = scratch;
     float *qq = state_tile + kStateTileElements;
     float *kk = qq + kHeadDim;
@@ -488,8 +509,8 @@ __global__ void qwen38_gdn_recurrence_temporal8_kernel(
 
 #pragma unroll
     for (uint32_t flat = row; flat < kStateTileElements; flat += kHeadDim) {
-        const uint32_t state_row = flat / kTemporalValueTile;
-        const uint32_t local_value = flat % kTemporalValueTile;
+        const uint32_t state_row = flat / ValueTile;
+        const uint32_t local_value = flat % ValueTile;
         state_tile[flat] = state[
                 (static_cast<uint64_t>(head) * kHeadDim + state_row) * kHeadDim +
                 value_start + local_value];
@@ -504,8 +525,6 @@ __global__ void qwen38_gdn_recurrence_temporal8_kernel(
                 static_cast<uint64_t>(key_head) * kHeadDim;
         const float *v = normalized_qkv + qkv_base + 2u * kKeyDim +
                 static_cast<uint64_t>(head) * kHeadDim + value_start;
-        float *destination = state + static_cast<uint64_t>(token) * state_lane_stride +
-                static_cast<uint64_t>(head) * kHeadDim * kHeadDim;
         qq[row] = q[row];
         kk[row] = k[row];
         __syncthreads();
@@ -513,6 +532,9 @@ __global__ void qwen38_gdn_recurrence_temporal8_kernel(
         const uint64_t gate_index = static_cast<uint64_t>(token) * kValueHeads + head;
         const float decay = __expf(g[gate_index]);
         const float update = beta[gate_index];
+        if (value_tile == 0u && row == 0u) {
+            decay_history[gate_index] = decay;
+        }
 
 #pragma unroll
         for (uint32_t flat = row; flat < kStateTileElements; flat += kHeadDim) {
@@ -520,35 +542,35 @@ __global__ void qwen38_gdn_recurrence_temporal8_kernel(
         }
         __syncthreads();
 
-        if (row < kTemporalValueTile) {
+        if (row < ValueTile) {
             float projected = 0.0f;
 #pragma unroll 8
             for (uint32_t state_row = 0u; state_row < kHeadDim; ++state_row) {
                 projected = fmaf(
-                        state_tile[state_row * kTemporalValueTile + row],
+                        state_tile[state_row * ValueTile + row],
                         kk[state_row], projected);
             }
             delta[row] = (v[row] - projected) * update;
+            delta_history[(static_cast<uint64_t>(token) * kValueHeads + head) *
+                    kHeadDim + value_start + row] = delta[row];
         }
         __syncthreads();
 
 #pragma unroll
         for (uint32_t flat = row; flat < kStateTileElements; flat += kHeadDim) {
-            const uint32_t state_row = flat / kTemporalValueTile;
-            const uint32_t local_value = flat % kTemporalValueTile;
+            const uint32_t state_row = flat / ValueTile;
+            const uint32_t local_value = flat % ValueTile;
             const float updated = fmaf(kk[state_row], delta[local_value], state_tile[flat]);
             state_tile[flat] = updated;
-            destination[static_cast<uint64_t>(state_row) * kHeadDim +
-                    value_start + local_value] = updated;
         }
         __syncthreads();
 
-        if (row < kTemporalValueTile) {
+        if (row < ValueTile) {
             float value = 0.0f;
 #pragma unroll 8
             for (uint32_t state_row = 0u; state_row < kHeadDim; ++state_row) {
                 value = fmaf(
-                        state_tile[state_row * kTemporalValueTile + row],
+                        state_tile[state_row * ValueTile + row],
                         qq[state_row], value);
             }
             const uint32_t value_dim = value_start + row;
@@ -557,54 +579,130 @@ __global__ void qwen38_gdn_recurrence_temporal8_kernel(
         }
         __syncthreads();
     }
-}
 
-/* Device-side counterpart of the host prefix install.  The temporal forward
- * already retained one recurrent/conv snapshot per row; select its lane on
- * the caller stream so DSpark acceptance never needs a D2H prefix read. */
-__global__ void qwen38_gdn_commit_prefix_device_kernel(
-        float *__restrict__ ring,
-        float *__restrict__ state,
-        const uint32_t *__restrict__ consumed_tokens) {
-    const uint32_t consumed = consumed_tokens[0];
-    if (consumed == 0u || consumed > kBatch) return;
-    const uint64_t ring_count = static_cast<uint64_t>(kConvDim) * 3u;
-    const uint64_t state_count =
-            static_cast<uint64_t>(kValueHeads) * kHeadDim * kHeadDim;
-    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const uint64_t lane = static_cast<uint64_t>(consumed - 1u);
-    if (index < ring_count) {
-        ring[index] = ring[lane * ring_count + index];
-    } else if (index < ring_count + state_count) {
-        const uint64_t state_index = index - ring_count;
-        state[state_index] = state[lane * state_count + state_index];
+#pragma unroll
+    for (uint32_t flat = row; flat < kStateTileElements; flat += kHeadDim) {
+        const uint32_t state_row = flat / ValueTile;
+        const uint32_t local_value = flat % ValueTile;
+        final_state[(static_cast<uint64_t>(head) * kHeadDim + state_row) * kHeadDim +
+                value_start + local_value] = state_tile[flat];
     }
 }
 
-/* One graph node handles both paths.  A failing downstream node cannot make
- * the host choose commit versus abort during CUDA-graph replay, so consume
- * the controller's persistent async status directly on device. */
-__global__ void qwen38_gdn_finalize_device_kernel(
+template <uint32_t ValueTile>
+int launch_gdn_recurrence_temporal8(
+        const float *normalized_qkv,
+        const float *g,
+        const float *beta,
+        const float *state,
+        float *final_state,
+        float *out,
+        float *delta_history,
+        float *decay_history,
+        cudaStream_t stream) {
+    constexpr size_t kSharedFloats =
+            static_cast<size_t>(kHeadDim) * ValueTile + 2u * kHeadDim + ValueTile;
+    qwen38_gdn_recurrence_temporal8_kernel<ValueTile><<<
+            dim3(kHeadDim / ValueTile, kValueHeads), kHeadDim,
+            kSharedFloats * sizeof(float), stream>>>(
+            normalized_qkv, g, beta, state, final_state, out,
+            delta_history, decay_history);
+    return cudaGetLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
+}
+
+__device__ __forceinline__ void qwen38_gdn_materialize_prefix_index(
+        const uint64_t index,
         float *__restrict__ ring,
         float *__restrict__ state,
-        const float *__restrict__ ring_backup,
-        const float *__restrict__ state_backup,
+        const float *__restrict__ grouped_projection,
+        const float *__restrict__ normalized_qkv,
+        const float *__restrict__ delta_history,
+        const float *__restrict__ decay_history,
+        const uint32_t consumed) {
+    if (index < kConvDim) {
+        if (consumed == kBatch) {
+            const uint64_t final_base =
+                    static_cast<uint64_t>(kBatch - 1u) * kConvDim * 3u + index * 3u;
+            ring[index * 3u] = ring[final_base];
+            ring[index * 3u + 1u] = ring[final_base + 1u];
+            ring[index * 3u + 2u] = ring[final_base + 2u];
+        } else {
+        float ring0 = ring[index * 3u];
+        float ring1 = ring[index * 3u + 1u];
+        float ring2 = ring[index * 3u + 2u];
+        for (uint32_t token = 0u; token < consumed; ++token) {
+            ring0 = ring1;
+            ring1 = ring2;
+            ring2 = grouped_projection[
+                    static_cast<uint64_t>(token) * kProjectionDim + index];
+        }
+        ring[index * 3u] = ring0;
+        ring[index * 3u + 1u] = ring1;
+        ring[index * 3u + 2u] = ring2;
+        }
+    }
+    const uint64_t state_count =
+            static_cast<uint64_t>(kValueHeads) * kHeadDim * kHeadDim;
+    if (index < state_count) {
+        if (consumed == kBatch) {
+            state[index] = state[static_cast<uint64_t>(kBatch - 1u) * state_count + index];
+            return;
+        }
+        const uint32_t head = static_cast<uint32_t>(
+                index / (static_cast<uint64_t>(kHeadDim) * kHeadDim));
+        const uint32_t state_row = static_cast<uint32_t>(
+                (index / kHeadDim) % kHeadDim);
+        const uint32_t value_dim = static_cast<uint32_t>(index % kHeadDim);
+        const uint32_t key_head = head / (kValueHeads / kKeyHeads);
+        float value = state[index];
+        for (uint32_t token = 0u; token < consumed; ++token) {
+            const float key = normalized_qkv[
+                    static_cast<uint64_t>(token) * kConvDim + kKeyDim +
+                    static_cast<uint64_t>(key_head) * kHeadDim + state_row];
+            const float delta = delta_history[
+                    (static_cast<uint64_t>(token) * kValueHeads + head) *
+                    kHeadDim + value_dim];
+            const float decay = decay_history[
+                    static_cast<uint64_t>(token) * kValueHeads + head];
+            value *= decay;
+            value = fmaf(key, delta, value);
+        }
+        state[index] = value;
+    }
+}
+
+__global__ void qwen38_gdn_materialize_prefix_kernel(
+        float *__restrict__ ring,
+        float *__restrict__ state,
+        const float *__restrict__ grouped_projection,
+        const float *__restrict__ normalized_qkv,
+        const float *__restrict__ delta_history,
+        const float *__restrict__ decay_history,
+        const uint32_t consumed) {
+    if (consumed == 0u || consumed > kBatch) return;
+    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    qwen38_gdn_materialize_prefix_index(
+            index, ring, state, grouped_projection, normalized_qkv,
+            delta_history, decay_history, consumed);
+}
+
+/* One graph node handles commit and fail-closed abort.  The temporal forward
+ * leaves durable state untouched, so an invalid async status needs no copy. */
+__global__ void qwen38_gdn_materialize_prefix_device_kernel(
+        float *__restrict__ ring,
+        float *__restrict__ state,
+        const float *__restrict__ grouped_projection,
+        const float *__restrict__ normalized_qkv,
+        const float *__restrict__ delta_history,
+        const float *__restrict__ decay_history,
         const uint32_t *__restrict__ consumed_tokens,
         const uint32_t *__restrict__ async_status) {
     const uint32_t consumed = consumed_tokens[0];
-    const bool commit = async_status[0] == 0u && consumed >= 1u && consumed <= kBatch;
-    const uint64_t ring_count = static_cast<uint64_t>(kConvDim) * 3u;
-    const uint64_t state_count =
-            static_cast<uint64_t>(kValueHeads) * kHeadDim * kHeadDim;
+    if ((async_status && async_status[0] != 0u) || consumed == 0u || consumed > kBatch) return;
     const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const uint64_t lane = commit ? static_cast<uint64_t>(consumed - 1u) : 0u;
-    if (index < ring_count) {
-        ring[index] = commit ? ring[lane * ring_count + index] : ring_backup[index];
-    } else if (index < ring_count + state_count) {
-        const uint64_t state_index = index - ring_count;
-        state[state_index] = commit ? state[lane * state_count + state_index]
-                              : state_backup[state_index];
-    }
+    qwen38_gdn_materialize_prefix_index(
+            index, ring, state, grouped_projection, normalized_qkv,
+            delta_history, decay_history, consumed);
 }
 
 }  // namespace
@@ -613,6 +711,12 @@ struct axiom_qwen38_gdn_layer {
     axiom_runtime *runtime = nullptr;
     int device = -1;
     uint32_t layer = 0u;
+    uint32_t temporal_value_tile = kDefaultTemporalValueTile;
+    bool bf16_pair = true;
+    bool parallel_projection_streams = true;
+    cudaStream_t ab_projection_stream = nullptr;
+    cudaEvent_t projection_input_ready = nullptr;
+    cudaEvent_t ab_projection_done = nullptr;
     uint64_t device_bytes = 0u;
 
     axiom_qwen38_fp8_projection_group *qkv_z = nullptr;
@@ -628,8 +732,11 @@ struct axiom_qwen38_gdn_layer {
 
     axiom_device_buffer *ring = nullptr;
     axiom_device_buffer *state = nullptr;
-    axiom_device_buffer *spec_ring_backup = nullptr;
-    axiom_device_buffer *spec_state_backup = nullptr;
+    /* Compact transactional journal: one delta vector and decay scalar per
+     * temporal token/head. Durable ring/state remain untouched until the
+     * accepted prefix is known. */
+    axiom_device_buffer *spec_delta = nullptr;
+    axiom_device_buffer *spec_decay = nullptr;
     axiom_device_buffer *norm = nullptr;
     axiom_device_buffer *projection_out = nullptr;
     /* Used only by AXIOM_QWEN38_GDN_BATCHED=0 compatibility execution. */
@@ -647,8 +754,61 @@ struct axiom_qwen38_gdn_layer {
     cudaStream_t spec_stream = nullptr;
 };
 
+namespace {
+
+int qwen38_gdn_project_inputs(
+        axiom_qwen38_gdn_layer *layer,
+        const float *input,
+        float *projection,
+        float *a,
+        float *b,
+        void *stream) {
+    if (!layer || !input || !projection || !a || !b) return AXIOM_ERR_INVALID_ARGUMENT;
+    const cudaStream_t main_stream = static_cast<cudaStream_t>(stream);
+    int rc = AXIOM_OK;
+    if (layer->parallel_projection_streams) {
+        rc = cuda_status(cudaEventRecord(layer->projection_input_ready, main_stream));
+        if (rc == AXIOM_OK) rc = cuda_status(cudaStreamWaitEvent(
+                layer->ab_projection_stream, layer->projection_input_ready, 0u));
+        if (rc == AXIOM_OK) rc = axiom_qwen38_fp8_projection_group_forward_f32_device(
+                layer->qkv_z, input, projection, stream);
+        void *ab_stream = reinterpret_cast<void *>(layer->ab_projection_stream);
+        if (rc == AXIOM_OK && layer->bf16_pair) {
+            rc = axiom_qwen38_bf16_linear_pair_forward_f32_device(
+                    layer->a, layer->b, input, a, b, ab_stream);
+        } else if (rc == AXIOM_OK) {
+            rc = axiom_qwen38_bf16_linear_forward_f32_device(
+                    layer->a, input, a, ab_stream);
+            if (rc == AXIOM_OK) rc = axiom_qwen38_bf16_linear_forward_f32_device(
+                    layer->b, input, b, ab_stream);
+        }
+        if (rc == AXIOM_OK) rc = cuda_status(cudaEventRecord(
+                layer->ab_projection_done, layer->ab_projection_stream));
+        if (rc == AXIOM_OK) rc = cuda_status(cudaStreamWaitEvent(
+                main_stream, layer->ab_projection_done, 0u));
+        return rc;
+    }
+    rc = axiom_qwen38_fp8_projection_group_forward_f32_device(
+            layer->qkv_z, input, projection, stream);
+    if (rc == AXIOM_OK && layer->bf16_pair) {
+        rc = axiom_qwen38_bf16_linear_pair_forward_f32_device(
+                layer->a, layer->b, input, a, b, stream);
+    } else if (rc == AXIOM_OK) {
+        rc = axiom_qwen38_bf16_linear_forward_f32_device(layer->a, input, a, stream);
+        if (rc == AXIOM_OK) rc = axiom_qwen38_bf16_linear_forward_f32_device(
+                layer->b, input, b, stream);
+    }
+    return rc;
+}
+
+}  // namespace
+
 extern "C" void axiom_qwen38_gdn_layer_destroy(axiom_qwen38_gdn_layer *layer) {
     if (!layer) return;
+    if (layer->device >= 0) (void)cudaSetDevice(layer->device);
+    if (layer->ab_projection_stream) (void)cudaStreamDestroy(layer->ab_projection_stream);
+    if (layer->ab_projection_done) (void)cudaEventDestroy(layer->ab_projection_done);
+    if (layer->projection_input_ready) (void)cudaEventDestroy(layer->projection_input_ready);
     axiom_qwen38_fp8_linear_destroy(layer->out_proj);
     axiom_qwen38_fp8_projection_group_destroy(layer->qkv_z);
     axiom_qwen38_bf16_linear_destroy(layer->b);
@@ -664,8 +824,8 @@ extern "C" void axiom_qwen38_gdn_layer_destroy(axiom_qwen38_gdn_layer *layer) {
     axiom_device_buffer_destroy(layer->qkv_out);
     axiom_device_buffer_destroy(layer->projection_out);
     axiom_device_buffer_destroy(layer->norm);
-    axiom_device_buffer_destroy(layer->spec_state_backup);
-    axiom_device_buffer_destroy(layer->spec_ring_backup);
+    axiom_device_buffer_destroy(layer->spec_decay);
+    axiom_device_buffer_destroy(layer->spec_delta);
     axiom_device_buffer_destroy(layer->state);
     axiom_device_buffer_destroy(layer->ring);
     axiom_device_buffer_destroy(layer->ssm_norm_weight);
@@ -693,6 +853,23 @@ extern "C" int axiom_qwen38_gdn_layer_load(
     layer->runtime = runtime;
     layer->device = device;
     layer->layer = layer_index;
+    layer->temporal_value_tile = temporal_value_tile_from_env();
+    layer->bf16_pair = !env_disabled("AXIOM_QWEN38_GDN_BF16_PAIR");
+    layer->parallel_projection_streams =
+            !env_disabled("AXIOM_QWEN38_PARALLEL_PROJECTIONS");
+    if (layer->parallel_projection_streams) {
+        cudaError_t status = cudaStreamCreateWithFlags(
+                &layer->ab_projection_stream, cudaStreamNonBlocking);
+        if (status == cudaSuccess) status = cudaEventCreateWithFlags(
+                &layer->projection_input_ready, cudaEventDisableTiming);
+        if (status == cudaSuccess) status = cudaEventCreateWithFlags(
+                &layer->ab_projection_done, cudaEventDisableTiming);
+        if (status != cudaSuccess) {
+            const int create_rc = cuda_status(status);
+            axiom_qwen38_gdn_layer_destroy(layer);
+            return create_rc;
+        }
+    }
 
     char prefix[128]{};
     const int prefix_len = std::snprintf(
@@ -799,10 +976,14 @@ extern "C" int axiom_qwen38_gdn_layer_load(
     const uint64_t gates_batch = static_cast<uint64_t>(kValueHeads) * kBatch * sizeof(float);
     const uint64_t ring_bytes = static_cast<uint64_t>(kConvDim) * 3u * kBatch * sizeof(float);
     const uint64_t state_bytes = static_cast<uint64_t>(kValueHeads) * kHeadDim * kHeadDim * kBatch * sizeof(float);
+    const uint64_t spec_delta_bytes =
+            static_cast<uint64_t>(kBatch) * kValueHeads * kHeadDim * sizeof(float);
+    const uint64_t spec_decay_bytes =
+            static_cast<uint64_t>(kBatch) * kValueHeads * sizeof(float);
     const std::pair<uint64_t, axiom_device_buffer **> allocations[] = {
         {ring_bytes, &layer->ring}, {state_bytes, &layer->state},
-        {ring_bytes / kBatch, &layer->spec_ring_backup},
-        {state_bytes / kBatch, &layer->spec_state_backup},
+        {spec_delta_bytes, &layer->spec_delta},
+        {spec_decay_bytes, &layer->spec_decay},
         {hidden_batch, &layer->norm}, {projection_batch, &layer->projection_out},
         {conv_batch, &layer->qkv_out},
         {value_batch, &layer->z_out}, {gates_batch, &layer->a_out},
@@ -833,7 +1014,7 @@ extern "C" int axiom_qwen38_gdn_layer_load(
         static_cast<uint64_t>(kConvDim) * 4u * sizeof(float),
         static_cast<uint64_t>(kValueHeads) * 2u * sizeof(float),
         static_cast<uint64_t>(kHeadDim) * sizeof(float),
-        ring_bytes, state_bytes, ring_bytes / kBatch, state_bytes / kBatch,
+        ring_bytes, state_bytes, spec_delta_bytes, spec_decay_bytes,
         hidden_batch, projection_batch, conv_batch, value_batch,
         gates_batch, gates_batch, gates_batch, gates_batch, conv_batch,
         value_batch, value_batch,
@@ -987,13 +1168,9 @@ extern "C" int axiom_qwen38_gdn_layer_forward_f32_device(
     qwen38_rmsnorm8_kernel<<<kBatch, kThreads>>>(
             static_cast<const float *>(norm_weight), input, static_cast<float *>(norm));
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-    rc = axiom_qwen38_fp8_projection_group_forward_f32_device(
-            layer->qkv_z, static_cast<const float *>(norm),
-            static_cast<float *>(projection), nullptr);
-    if (rc == AXIOM_OK) rc = axiom_qwen38_bf16_linear_forward_f32_device(
-            layer->a, static_cast<const float *>(norm), static_cast<float *>(a), nullptr);
-    if (rc == AXIOM_OK) rc = axiom_qwen38_bf16_linear_forward_f32_device(
-            layer->b, static_cast<const float *>(norm), static_cast<float *>(b), nullptr);
+    rc = qwen38_gdn_project_inputs(
+            layer, static_cast<const float *>(norm), static_cast<float *>(projection),
+            static_cast<float *>(a), static_cast<float *>(b), nullptr);
     if (rc != AXIOM_OK) return rc;
     rc = round_ab8(static_cast<float *>(a), static_cast<float *>(b), nullptr);
     if (rc != AXIOM_OK) return rc;
@@ -1085,31 +1262,11 @@ extern "C" int axiom_qwen38_gdn_layer_spec_begin(
         axiom_qwen38_gdn_layer *layer,
         void *stream) {
     if (!layer || layer->spec_active || !layer->ring || !layer->state ||
-        !layer->spec_ring_backup || !layer->spec_state_backup) {
+        !layer->spec_delta || !layer->spec_decay) {
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
     if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
-    void *ring = nullptr;
-    void *state = nullptr;
-    void *ring_backup = nullptr;
-    void *state_backup = nullptr;
-    int rc = buffer_pointer(layer->ring, &ring);
-    if (rc == AXIOM_OK) rc = buffer_pointer(layer->state, &state);
-    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_ring_backup, &ring_backup);
-    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_state_backup, &state_backup);
-    if (rc != AXIOM_OK) return rc;
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-    const size_t ring_bytes =
-            static_cast<size_t>(kConvDim) * 3u * sizeof(float);
-    const size_t state_bytes =
-            static_cast<size_t>(kValueHeads) * kHeadDim * kHeadDim * sizeof(float);
-    cudaError_t status = cudaMemcpyAsync(
-            ring_backup, ring, ring_bytes, cudaMemcpyDeviceToDevice, cuda_stream);
-    if (status == cudaSuccess) {
-        status = cudaMemcpyAsync(
-                state_backup, state, state_bytes, cudaMemcpyDeviceToDevice, cuda_stream);
-    }
-    if (status != cudaSuccess) return cuda_status(status);
     layer->spec_active = true;
     layer->spec_forwarded = false;
     layer->spec_stream = cuda_stream;
@@ -1126,7 +1283,8 @@ extern "C" int axiom_qwen38_gdn_layer_forward_temporal8_f32_device(
         layer->spec_stream != static_cast<cudaStream_t>(stream) ||
         !layer->runtime || !layer->qkv_z || !layer->input_norm_weight || !layer->norm ||
         !layer->projection_out || !layer->a_out || !layer->b_out || !layer->g || !layer->beta ||
-        !layer->conv || !layer->recurrent || !layer->gated) {
+        !layer->conv || !layer->recurrent || !layer->gated ||
+        !layer->spec_delta || !layer->spec_decay) {
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
     if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
@@ -1147,6 +1305,8 @@ extern "C" int axiom_qwen38_gdn_layer_forward_temporal8_f32_device(
     void *conv = nullptr;
     void *recurrent = nullptr;
     void *gated = nullptr;
+    void *spec_delta = nullptr;
+    void *spec_decay = nullptr;
     int rc = buffer_pointer(layer->input_norm_weight, &norm_weight);
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->norm, &norm);
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->projection_out, &projection);
@@ -1163,22 +1323,21 @@ extern "C" int axiom_qwen38_gdn_layer_forward_temporal8_f32_device(
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->conv, &conv);
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->recurrent, &recurrent);
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->gated, &gated);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_delta, &spec_delta);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_decay, &spec_decay);
     if (rc != AXIOM_OK) return rc;
 
     qwen38_rmsnorm8_kernel<<<kBatch, kThreads, 0, cuda_stream>>>(
             static_cast<const float *>(norm_weight), input, static_cast<float *>(norm));
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-    rc = axiom_qwen38_fp8_projection_group_forward_f32_device(
-            layer->qkv_z, static_cast<const float *>(norm),
-            static_cast<float *>(projection), stream);
-    if (rc == AXIOM_OK) rc = axiom_qwen38_bf16_linear_forward_f32_device(
-            layer->a, static_cast<const float *>(norm), static_cast<float *>(a), stream);
-    if (rc == AXIOM_OK) rc = axiom_qwen38_bf16_linear_forward_f32_device(
-            layer->b, static_cast<const float *>(norm), static_cast<float *>(b), stream);
+    rc = qwen38_gdn_project_inputs(
+            layer, static_cast<const float *>(norm), static_cast<float *>(projection),
+            static_cast<float *>(a), static_cast<float *>(b), stream);
     if (rc != AXIOM_OK) return rc;
     rc = round_ab8(static_cast<float *>(a), static_cast<float *>(b), cuda_stream);
     if (rc != AXIOM_OK) return rc;
-    qwen38_gdn_gates_kernel<<<dim3((kValueHeads + 127u) / 128u, kBatch), 128u, 0, cuda_stream>>>(
+    qwen38_gdn_gates_kernel<<<
+            dim3((kValueHeads + 127u) / 128u, kBatch), 128u, 0, cuda_stream>>>(
             static_cast<const float *>(a), static_cast<const float *>(b),
             static_cast<const float *>(a_log), static_cast<const float *>(dt_bias),
             static_cast<float *>(g), static_cast<float *>(beta));
@@ -1186,23 +1345,53 @@ extern "C" int axiom_qwen38_gdn_layer_forward_temporal8_f32_device(
     qwen38_gdn_conv1d_silu_temporal8_kernel<<<
             (kConvDim + kThreads - 1u) / kThreads, kThreads, 0, cuda_stream>>>(
             static_cast<const float *>(projection), static_cast<const float *>(conv_weight),
-            static_cast<float *>(ring), static_cast<float *>(conv));
+            static_cast<const float *>(ring),
+            static_cast<float *>(ring) +
+                    static_cast<uint64_t>(kBatch - 1u) * kConvDim * 3u,
+            static_cast<float *>(conv));
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
     qwen38_gdn_normalize_qk_temporal8_kernel<<<
             dim3(kBatch, kKeyHeads), kHeadDim,
             static_cast<size_t>(2u * kHeadDim) * sizeof(float), cuda_stream>>>(
             static_cast<float *>(conv));
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-    constexpr size_t kTemporalRecurrenceSharedFloats =
-            static_cast<size_t>(kHeadDim) * kTemporalValueTile + 2u * kHeadDim +
-            kTemporalValueTile;
-    qwen38_gdn_recurrence_temporal8_kernel<<<
-            dim3(kHeadDim / kTemporalValueTile, kValueHeads), kHeadDim,
-            kTemporalRecurrenceSharedFloats * sizeof(float), cuda_stream>>>(
-            static_cast<const float *>(conv), static_cast<const float *>(g),
-            static_cast<const float *>(beta), static_cast<float *>(state),
-            static_cast<float *>(recurrent));
-    if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+    float *final_state = static_cast<float *>(state) +
+            static_cast<uint64_t>(kBatch - 1u) * kValueHeads * kHeadDim * kHeadDim;
+    switch (layer->temporal_value_tile) {
+        case 16u:
+            rc = launch_gdn_recurrence_temporal8<16u>(
+                    static_cast<const float *>(conv), static_cast<const float *>(g),
+                    static_cast<const float *>(beta), static_cast<const float *>(state),
+                    final_state, static_cast<float *>(recurrent),
+                    static_cast<float *>(spec_delta), static_cast<float *>(spec_decay),
+                    cuda_stream);
+            break;
+        case 32u:
+            rc = launch_gdn_recurrence_temporal8<32u>(
+                    static_cast<const float *>(conv), static_cast<const float *>(g),
+                    static_cast<const float *>(beta), static_cast<const float *>(state),
+                    final_state, static_cast<float *>(recurrent),
+                    static_cast<float *>(spec_delta), static_cast<float *>(spec_decay),
+                    cuda_stream);
+            break;
+        case 64u:
+            rc = launch_gdn_recurrence_temporal8<64u>(
+                    static_cast<const float *>(conv), static_cast<const float *>(g),
+                    static_cast<const float *>(beta), static_cast<const float *>(state),
+                    final_state, static_cast<float *>(recurrent),
+                    static_cast<float *>(spec_delta), static_cast<float *>(spec_decay),
+                    cuda_stream);
+            break;
+        default:
+            rc = launch_gdn_recurrence_temporal8<8u>(
+                    static_cast<const float *>(conv), static_cast<const float *>(g),
+                    static_cast<const float *>(beta), static_cast<const float *>(state),
+                    final_state, static_cast<float *>(recurrent),
+                    static_cast<float *>(spec_delta), static_cast<float *>(spec_decay),
+                    cuda_stream);
+            break;
+    }
+    if (rc != AXIOM_OK) return rc;
     qwen38_gdn_gated_norm8_kernel<<<
             dim3(kValueHeads, kBatch), kHeadDim,
             static_cast<size_t>(kHeadDim) * sizeof(float), cuda_stream>>>(
@@ -1227,27 +1416,32 @@ extern "C" int axiom_qwen38_gdn_layer_spec_commit_prefix(
     }
     if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-    if (consumed_tokens > 1u) {
-        void *ring = nullptr;
-        void *state = nullptr;
-        int rc = buffer_pointer(layer->ring, &ring);
-        if (rc == AXIOM_OK) rc = buffer_pointer(layer->state, &state);
-        if (rc != AXIOM_OK) return rc;
-        const size_t ring_bytes =
-                static_cast<size_t>(kConvDim) * 3u * sizeof(float);
-        const size_t state_bytes =
-                static_cast<size_t>(kValueHeads) * kHeadDim * kHeadDim * sizeof(float);
-        const uint64_t lane = consumed_tokens - 1u;
-        cudaError_t status = cudaMemcpyAsync(
-                ring, static_cast<const uint8_t *>(ring) + lane * ring_bytes,
-                ring_bytes, cudaMemcpyDeviceToDevice, cuda_stream);
-        if (status == cudaSuccess) {
-            status = cudaMemcpyAsync(
-                    state, static_cast<const uint8_t *>(state) + lane * state_bytes,
-                    state_bytes, cudaMemcpyDeviceToDevice, cuda_stream);
-        }
-        if (status != cudaSuccess) return cuda_status(status);
-    }
+    void *ring = nullptr;
+    void *state = nullptr;
+    void *projection = nullptr;
+    void *conv = nullptr;
+    void *spec_delta = nullptr;
+    void *spec_decay = nullptr;
+    int rc = buffer_pointer(layer->ring, &ring);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->state, &state);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->projection_out, &projection);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->conv, &conv);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_delta, &spec_delta);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_decay, &spec_decay);
+    if (rc != AXIOM_OK) return rc;
+    constexpr uint64_t kStateCount =
+            static_cast<uint64_t>(kValueHeads) * kHeadDim * kHeadDim;
+    constexpr uint64_t kMaterializeCount =
+            kStateCount > kConvDim ? kStateCount : kConvDim;
+    constexpr uint64_t kGrid = (kMaterializeCount + kThreads - 1u) / kThreads;
+    static_assert(kGrid <= std::numeric_limits<uint32_t>::max(), "GDN commit grid overflow");
+    qwen38_gdn_materialize_prefix_kernel<<<
+            static_cast<uint32_t>(kGrid), kThreads, 0, cuda_stream>>>(
+            static_cast<float *>(ring), static_cast<float *>(state),
+            static_cast<const float *>(projection), static_cast<const float *>(conv),
+            static_cast<const float *>(spec_delta), static_cast<const float *>(spec_decay),
+            consumed_tokens);
+    if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
     layer->spec_active = false;
     layer->spec_forwarded = false;
     layer->spec_stream = nullptr;
@@ -1265,16 +1459,29 @@ extern "C" int axiom_qwen38_gdn_layer_spec_commit_prefix_device(
     if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
     void *ring = nullptr;
     void *state = nullptr;
+    void *projection = nullptr;
+    void *conv = nullptr;
+    void *spec_delta = nullptr;
+    void *spec_decay = nullptr;
     int rc = buffer_pointer(layer->ring, &ring);
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->state, &state);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->projection_out, &projection);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->conv, &conv);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_delta, &spec_delta);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_decay, &spec_decay);
     if (rc != AXIOM_OK) return rc;
-    const uint64_t count = static_cast<uint64_t>(kConvDim) * 3u +
+    constexpr uint64_t kStateCount =
             static_cast<uint64_t>(kValueHeads) * kHeadDim * kHeadDim;
-    const uint64_t grid = (count + kThreads - 1u) / kThreads;
-    if (grid > std::numeric_limits<uint32_t>::max()) return AXIOM_ERR_BUDGET;
-    qwen38_gdn_commit_prefix_device_kernel<<<
-            static_cast<uint32_t>(grid), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-            static_cast<float *>(ring), static_cast<float *>(state), consumed_tokens_device);
+    constexpr uint64_t kMaterializeCount =
+            kStateCount > kConvDim ? kStateCount : kConvDim;
+    constexpr uint64_t kGrid = (kMaterializeCount + kThreads - 1u) / kThreads;
+    static_assert(kGrid <= std::numeric_limits<uint32_t>::max(), "GDN commit grid overflow");
+    qwen38_gdn_materialize_prefix_device_kernel<<<
+            static_cast<uint32_t>(kGrid), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<float *>(ring), static_cast<float *>(state),
+            static_cast<const float *>(projection), static_cast<const float *>(conv),
+            static_cast<const float *>(spec_delta), static_cast<const float *>(spec_decay),
+            consumed_tokens_device, nullptr);
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
     layer->spec_active = false;
     layer->spec_forwarded = false;
@@ -1294,21 +1501,28 @@ extern "C" int axiom_qwen38_gdn_layer_spec_finalize_device(
     if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
     void *ring = nullptr;
     void *state = nullptr;
-    void *ring_backup = nullptr;
-    void *state_backup = nullptr;
+    void *projection = nullptr;
+    void *conv = nullptr;
+    void *spec_delta = nullptr;
+    void *spec_decay = nullptr;
     int rc = buffer_pointer(layer->ring, &ring);
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->state, &state);
-    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_ring_backup, &ring_backup);
-    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_state_backup, &state_backup);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->projection_out, &projection);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->conv, &conv);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_delta, &spec_delta);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_decay, &spec_decay);
     if (rc != AXIOM_OK) return rc;
-    const uint64_t count = static_cast<uint64_t>(kConvDim) * 3u +
+    constexpr uint64_t kStateCount =
             static_cast<uint64_t>(kValueHeads) * kHeadDim * kHeadDim;
-    const uint64_t grid = (count + kThreads - 1u) / kThreads;
-    if (grid > std::numeric_limits<uint32_t>::max()) return AXIOM_ERR_BUDGET;
-    qwen38_gdn_finalize_device_kernel<<<
-            static_cast<uint32_t>(grid), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    constexpr uint64_t kMaterializeCount =
+            kStateCount > kConvDim ? kStateCount : kConvDim;
+    constexpr uint64_t kGrid = (kMaterializeCount + kThreads - 1u) / kThreads;
+    static_assert(kGrid <= std::numeric_limits<uint32_t>::max(), "GDN commit grid overflow");
+    qwen38_gdn_materialize_prefix_device_kernel<<<
+            static_cast<uint32_t>(kGrid), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             static_cast<float *>(ring), static_cast<float *>(state),
-            static_cast<const float *>(ring_backup), static_cast<const float *>(state_backup),
+            static_cast<const float *>(projection), static_cast<const float *>(conv),
+            static_cast<const float *>(spec_delta), static_cast<const float *>(spec_decay),
             consumed_tokens_device, async_status_device);
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
     layer->spec_active = false;
@@ -1325,27 +1539,8 @@ extern "C" int axiom_qwen38_gdn_layer_spec_abort(
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
     if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
-    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-    void *ring = nullptr;
-    void *state = nullptr;
-    void *ring_backup = nullptr;
-    void *state_backup = nullptr;
-    int rc = buffer_pointer(layer->ring, &ring);
-    if (rc == AXIOM_OK) rc = buffer_pointer(layer->state, &state);
-    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_ring_backup, &ring_backup);
-    if (rc == AXIOM_OK) rc = buffer_pointer(layer->spec_state_backup, &state_backup);
-    if (rc != AXIOM_OK) return rc;
-    const size_t ring_bytes =
-            static_cast<size_t>(kConvDim) * 3u * sizeof(float);
-    const size_t state_bytes =
-            static_cast<size_t>(kValueHeads) * kHeadDim * kHeadDim * sizeof(float);
-    cudaError_t status = cudaMemcpyAsync(
-            ring, ring_backup, ring_bytes, cudaMemcpyDeviceToDevice, cuda_stream);
-    if (status == cudaSuccess) {
-        status = cudaMemcpyAsync(
-                state, state_backup, state_bytes, cudaMemcpyDeviceToDevice, cuda_stream);
-    }
-    if (status != cudaSuccess) return cuda_status(status);
+    /* Temporal forward journals candidate deltas without mutating durable
+     * ring/state, so abort is intentionally allocation- and copy-free. */
     layer->spec_active = false;
     layer->spec_forwarded = false;
     layer->spec_stream = nullptr;

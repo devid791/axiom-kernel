@@ -70,12 +70,20 @@ use `make MEDIA=1` only on a machine where the decoder toolchain is verified.
 
 ## Performance record
 
-A separate private production fixture on an RTX 5090 recorded approximately
-298 visible decoded tokens/s (about 304 internal decode tokens/s) for a 1,002-
-token prompt, 256 generated tokens and 33 speculative cycles. That is a
-fixture-specific observation, not a universal guarantee of this source tree or
-of another GPU. Reproduce performance only with the same weights, toolchain,
-CUDA architecture, sampling policy and benchmark protocol.
+The 2026-08-22 kernel update sustained a median **384.158 decoded tokens/s**
+across four consecutive requests to a separate private production fixture on
+one RTX 5090. The fixed test used a 1,002-token prompt, generated 256 tokens
+through 33 speculative cycles and produced the same output SHA-256 on every
+run. Individual decode rates were 382.972, 384.249, 384.256 and 384.067
+tokens/s; visible transport rates were 384.474, 385.756, 385.763 and 385.574
+tokens/s.
+
+This is a measured result for one exact fixture, not a universal guarantee for
+this source tree, another GPU or another checkpoint. The private HTTP daemon,
+weights and production configuration are not published here. See
+[the complete methodology](docs/qwen38/PERFORMANCE.md) and reproduce the result
+with recorded artifact hashes, toolchain, CUDA architecture, sampling policy
+and benchmark protocol.
 
 ## Community
 

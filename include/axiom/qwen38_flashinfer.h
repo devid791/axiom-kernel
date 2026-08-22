@@ -20,11 +20,13 @@
 extern "C" {
 #endif
 
-#define AXIOM_QWEN38_FLASHINFER_TEMPORAL8_ABI_VERSION 1u
+#define AXIOM_QWEN38_FLASHINFER_TEMPORAL8_ABI_VERSION 2u
 
 /* `kv_len_host` configures the generated launch. It must be >= 8. When
  * `kv_len_device` is non-NULL, the kernel reads its U32 value for its actual
- * causal boundary; the caller must ensure it is in [8, kv_len_host]. */
+ * causal boundary; the caller must ensure it is in [8, kv_len_host].
+ * `split_kv_tmp_bf16` optionally points to FlashInfer workspace sized by the
+ * caller for the dispatcher's chunk count; NULL preserves the unsplit path. */
 int axiom_qwen38_flashinfer_temporal8_bf16_e4m3_device(
         const uint16_t *q_bf16,
         const uint8_t *k_e4m3,
@@ -32,6 +34,7 @@ int axiom_qwen38_flashinfer_temporal8_bf16_e4m3_device(
         uint16_t *out_bf16,
         uint32_t kv_len_host,
         const uint32_t *kv_len_device,
+        uint16_t *split_kv_tmp_bf16,
         void *stream);
 
 #ifdef __cplusplus

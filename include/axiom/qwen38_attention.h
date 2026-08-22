@@ -63,6 +63,12 @@ uint64_t axiom_qwen38_attention_layer_device_bytes(const axiom_qwen38_attention_
 int axiom_qwen38_attention_layer_restore_position(
         axiom_qwen38_attention_layer *layer,
         uint32_t position);
+/* Materialize a device-authoritative temporal-hot prefix into the paged HBM
+ * view and install its host position. CUDA graph decode writes the compact
+ * contiguous cache; canonical decode and NVMe persistence consume pages. */
+int axiom_qwen38_attention_layer_materialize_device_position(
+        axiom_qwen38_attention_layer *layer,
+        uint32_t position);
 
 /* Export/import one logical temporal page from lane zero. The host layout is
  * E4M3 K[256,4,256] followed by E4M3 V[256,4,256], exactly one tier record.

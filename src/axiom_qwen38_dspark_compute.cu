@@ -35,6 +35,7 @@ constexpr uint32_t kBlock = AXIOM_QWEN38_DSPARK_BLOCK_SIZE;
 constexpr uint32_t kVerifyWidth = AXIOM_QWEN38_DSPARK_VERIFY_WIDTH;
 constexpr uint32_t kRank = AXIOM_QWEN38_DSPARK_MARKOV_RANK;
 constexpr uint32_t kThreads = 256u;
+constexpr uint32_t kGreedyBlocks = 256u;
 constexpr uint32_t kHeadThreads = 128u;
 constexpr uint32_t kKvPageTokens = 256u;
 constexpr uint64_t kKvPageBytes = 524288u;
@@ -48,6 +49,9 @@ constexpr uint32_t kGqaHeadGroups =
         (kGqaRatio + kGqaHeadsPerBlock - 1u) / kGqaHeadsPerBlock;
 constexpr uint32_t kGqaBlockThreads = kGqaHeadsPerBlock * kHeadDim;
 constexpr uint32_t kAttentionTileKeys = 4u;
+constexpr uint32_t kAttentionWarps = kGqaBlockThreads / 32u;
+constexpr uint32_t kDefaultAttentionTileKeys = 32u;
+constexpr uint32_t kAttentionMaxSplitK = 4u;
 constexpr uint64_t kCublasWorkspaceBytes = 32ull * 1024ull * 1024ull;
 constexpr float kRmsEps = 1.0e-6f;
 constexpr float kRopeTheta = 10000000.0f;
@@ -511,6 +515,233 @@ __global__ void noncausal_gqa_attention_bf16_kernel(
     }
 }
 
+/* Wider key tiles keep the exact per-head arithmetic order of the reference
+ * tile-4 kernel while halving (or better) the number of block barriers.  Each
+ * of the eight warps owns one or more key slots and computes both query heads
+ * which share a GQA K/V head.  K/V are still loaded once per pair of heads.
+ * Tile width is selected before graph capture, so replay has no host branch. */
+template <uint32_t TileKeys, uint32_t SplitK = 1u>
+__global__ void noncausal_gqa_attention_bf16_wide_kernel(
+        const float *__restrict__ q,
+        const float *__restrict__ local_k,
+        const float *__restrict__ local_v,
+        const uint16_t *__restrict__ k_cache,
+        const uint16_t *__restrict__ v_cache,
+        float *__restrict__ out,
+        float *__restrict__ split_values,
+        float *__restrict__ split_maxima,
+        float *__restrict__ split_denominators,
+        const uint32_t cache_tokens,
+        const uint32_t columns,
+        const uint32_t *__restrict__ cache_tokens_device) {
+    static_assert(TileKeys >= kAttentionWarps && TileKeys % kAttentionWarps == 0u,
+                  "wide attention tile must map evenly across warps");
+    static_assert(SplitK == 1u || SplitK == 2u || SplitK == 4u,
+                  "unsupported DSpark attention split count");
+    const uint32_t packed = blockIdx.x;
+    const uint32_t groups_per_column = kKvHeads * kGqaHeadGroups;
+    const uint32_t column = packed / groups_per_column;
+    const uint32_t within_column = packed - column * groups_per_column;
+    const uint32_t kv_head = within_column / kGqaHeadGroups;
+    const uint32_t head_group = within_column - kv_head * kGqaHeadGroups;
+    const uint32_t tid = threadIdx.x;
+    if (column >= columns || tid >= kGqaBlockThreads) return;
+    const uint32_t first_head_in_group = head_group * kGqaHeadsPerBlock;
+    const uint32_t valid_heads = first_head_in_group < kGqaRatio
+            ? ((kGqaRatio - first_head_in_group) < kGqaHeadsPerBlock
+                       ? (kGqaRatio - first_head_in_group)
+                       : kGqaHeadsPerBlock)
+            : 0u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t value_head = tid / kHeadDim;
+    const uint32_t value_dim = tid - value_head * kHeadDim;
+    const uint32_t head_base = kv_head * kGqaRatio + first_head_in_group;
+    float accumulator = 0.0f;
+    __shared__ float shared_k[TileKeys][kHeadDim];
+    __shared__ float shared_v[TileKeys][kHeadDim];
+    __shared__ float scores[kGqaHeadsPerBlock][TileKeys];
+    __shared__ float rescales[kGqaHeadsPerBlock][TileKeys];
+    __shared__ float probabilities[kGqaHeadsPerBlock][TileKeys];
+    __shared__ float running_maximum[kGqaHeadsPerBlock];
+    __shared__ float running_normalizer[kGqaHeadsPerBlock];
+    const uint32_t effective_cache_tokens = cache_tokens_device ? cache_tokens_device[0] : cache_tokens;
+    const uint32_t total_keys = effective_cache_tokens + columns;
+    const uint32_t split = SplitK == 1u ? 0u : blockIdx.y;
+    const uint32_t split_span = (total_keys + SplitK - 1u) / SplitK;
+    const uint32_t key_start = split * split_span;
+    const uint32_t key_end = min(key_start + split_span, total_keys);
+    if (tid < valid_heads) {
+        running_maximum[tid] = -CUDART_INF_F;
+        running_normalizer[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    for (uint32_t key_base = key_start; key_base < key_end; key_base += TileKeys) {
+        #pragma unroll
+        for (uint32_t load = tid; load < TileKeys * kHeadDim;
+             load += kGqaBlockThreads) {
+            const uint32_t key_slot = load / kHeadDim;
+            const uint32_t dim = load - key_slot * kHeadDim;
+            const uint32_t key = key_base + key_slot;
+            float key_value = 0.0f;
+            float value = 0.0f;
+            if (key < key_end) {
+                if (key < effective_cache_tokens) {
+                    const uint64_t offset = static_cast<uint64_t>(key) * kKvDim +
+                            kv_head * kHeadDim + dim;
+                    key_value = bf16_to_float(k_cache[offset]);
+                    value = bf16_to_float(v_cache[offset]);
+                } else {
+                    const uint32_t local_column = key - effective_cache_tokens;
+                    const uint64_t offset = static_cast<uint64_t>(local_column) * kKvDim +
+                            kv_head * kHeadDim + dim;
+                    key_value = local_k[offset];
+                    value = local_v[offset];
+                }
+            }
+            shared_k[key_slot][dim] = key_value;
+            shared_v[key_slot][dim] = value;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (uint32_t warp_key = 0u; warp_key < TileKeys / kAttentionWarps; ++warp_key) {
+            const uint32_t key_slot = warp + warp_key * kAttentionWarps;
+            const uint32_t key = key_base + key_slot;
+            float dot0 = -CUDART_INF_F;
+            float dot1 = -CUDART_INF_F;
+            if (key < key_end && valid_heads != 0u) {
+                const uint64_t q_offset0 = static_cast<uint64_t>(column) * kHidden +
+                        static_cast<uint64_t>(head_base) * kHeadDim;
+                dot0 = 0.0f;
+                #pragma unroll
+                for (uint32_t part = 0u; part < 4u; ++part) {
+                    const uint32_t dim = lane + part * 32u;
+                    dot0 = fmaf(q[q_offset0 + dim], shared_k[key_slot][dim], dot0);
+                }
+                if (valid_heads > 1u) {
+                    const uint64_t q_offset1 = q_offset0 + kHeadDim;
+                    dot1 = 0.0f;
+                    #pragma unroll
+                    for (uint32_t part = 0u; part < 4u; ++part) {
+                        const uint32_t dim = lane + part * 32u;
+                        dot1 = fmaf(q[q_offset1 + dim], shared_k[key_slot][dim], dot1);
+                    }
+                }
+                for (uint32_t offset = 16u; offset != 0u; offset >>= 1u) {
+                    dot0 += __shfl_down_sync(0xffffffffu, dot0, static_cast<int>(offset));
+                    dot1 += __shfl_down_sync(0xffffffffu, dot1, static_cast<int>(offset));
+                }
+            }
+            if (lane == 0u) {
+                if (valid_heads != 0u) scores[0][key_slot] = dot0 * kAttentionScale;
+                if (valid_heads > 1u) scores[1][key_slot] = dot1 * kAttentionScale;
+            }
+        }
+        __syncthreads();
+
+        if (tid < valid_heads) {
+            float maximum = running_maximum[tid];
+            float normalizer = running_normalizer[tid];
+            #pragma unroll
+            for (uint32_t group = 0u; group < TileKeys; ++group) {
+                if (key_base + group >= key_end) {
+                    rescales[tid][group] = 1.0f;
+                    probabilities[tid][group] = 0.0f;
+                    continue;
+                }
+                const float next_maximum = fmaxf(maximum, scores[tid][group]);
+                const float rescale = maximum == -CUDART_INF_F ? 0.0f : expf(maximum - next_maximum);
+                const float probability = expf(scores[tid][group] - next_maximum);
+                normalizer = normalizer * rescale + probability;
+                maximum = next_maximum;
+                rescales[tid][group] = rescale;
+                probabilities[tid][group] = probability;
+            }
+            running_maximum[tid] = maximum;
+            running_normalizer[tid] = normalizer;
+        }
+        __syncthreads();
+
+        if (value_head < valid_heads) {
+            #pragma unroll
+            for (uint32_t group = 0u; group < TileKeys; ++group) {
+                const uint32_t group_key = key_base + group;
+                if (group_key >= key_end) continue;
+                accumulator = accumulator * rescales[value_head][group] +
+                        probabilities[value_head][group] * shared_v[group][value_dim];
+            }
+        }
+        __syncthreads();
+    }
+    if (value_head < valid_heads) {
+        const uint64_t q_offset = static_cast<uint64_t>(column) * kHidden +
+                static_cast<uint64_t>(head_base + value_head) * kHeadDim;
+        if constexpr (SplitK == 1u) {
+            out[q_offset + value_dim] = accumulator / running_normalizer[value_head];
+        } else {
+            const uint64_t stat_index =
+                    (static_cast<uint64_t>(column) * kHeads + head_base + value_head) *
+                            kAttentionMaxSplitK + split;
+            split_values[stat_index * kHeadDim + value_dim] = accumulator;
+        }
+    }
+    if constexpr (SplitK > 1u) {
+        if (tid < valid_heads) {
+            const uint64_t stat_index =
+                    (static_cast<uint64_t>(column) * kHeads + head_base + tid) *
+                            kAttentionMaxSplitK + split;
+            split_maxima[stat_index] = running_maximum[tid];
+            split_denominators[stat_index] = running_normalizer[tid];
+        }
+    }
+}
+
+template <uint32_t SplitK>
+__global__ void merge_noncausal_gqa_attention_split_kernel(
+        const float *__restrict__ split_values,
+        const float *__restrict__ split_maxima,
+        const float *__restrict__ split_denominators,
+        float *__restrict__ out,
+        uint32_t columns) {
+    static_assert(SplitK == 2u || SplitK == 4u,
+                  "unsupported DSpark attention merge split count");
+    const uint32_t packed = blockIdx.x;
+    const uint32_t column = packed / kHeads;
+    const uint32_t head = packed - column * kHeads;
+    const uint32_t dim = threadIdx.x;
+    if (column >= columns || dim >= kHeadDim) return;
+    const uint64_t stat_base =
+            (static_cast<uint64_t>(column) * kHeads + head) * kAttentionMaxSplitK;
+    __shared__ float rescale[SplitK];
+    __shared__ float denominator;
+    if (dim == 0u) {
+        float maximum = -CUDART_INF_F;
+        #pragma unroll
+        for (uint32_t split = 0u; split < SplitK; ++split) {
+            maximum = fmaxf(maximum, split_maxima[stat_base + split]);
+        }
+        float normalizer = 0.0f;
+        #pragma unroll
+        for (uint32_t split = 0u; split < SplitK; ++split) {
+            const float scale = expf(split_maxima[stat_base + split] - maximum);
+            rescale[split] = scale;
+            normalizer += split_denominators[stat_base + split] * scale;
+        }
+        denominator = normalizer;
+    }
+    __syncthreads();
+    float accumulator = 0.0f;
+    #pragma unroll
+    for (uint32_t split = 0u; split < SplitK; ++split) {
+        accumulator += split_values[(stat_base + split) * kHeadDim + dim] * rescale[split];
+    }
+    const uint64_t out_index = static_cast<uint64_t>(column) * kHidden +
+            static_cast<uint64_t>(head) * kHeadDim + dim;
+    out[out_index] = accumulator / denominator;
+}
+
 __global__ void gather_markov_rank_kernel(
         const uint16_t *__restrict__ w1,
         const uint32_t *__restrict__ previous_token,
@@ -556,6 +787,95 @@ __global__ void greedy_top1_kernel(
     if (tid == 0u) out_token[0] = ids[0];
 }
 
+__device__ __forceinline__ void top1_select(
+        const float candidate_value,
+        const uint32_t candidate_id,
+        float *best_value,
+        uint32_t *best_id) {
+    if (candidate_value > *best_value ||
+        (candidate_value == *best_value && candidate_id < *best_id)) {
+        *best_value = candidate_value;
+        *best_id = candidate_id;
+    }
+}
+
+__device__ __forceinline__ void top1_warp_reduce(
+        float *best_value,
+        uint32_t *best_id) {
+    constexpr uint32_t mask = 0xffffffffu;
+    for (uint32_t offset = 16u; offset != 0u; offset >>= 1u) {
+        const float candidate_value = __shfl_down_sync(mask, *best_value, offset);
+        const uint32_t candidate_id = __shfl_down_sync(mask, *best_id, offset);
+        top1_select(candidate_value, candidate_id, best_value, best_id);
+    }
+}
+
+/* The Markov epilogue already touches every vocabulary row.  Fuse its exact
+ * BF16 public-boundary round with a hierarchical top-1 reduction instead of
+ * rescanning 248,320 logits on one CUDA block. */
+__global__ void add_bf16_rounded_top1_stage1_kernel(
+        float *__restrict__ base_logits,
+        const float *__restrict__ markov_bias,
+        float *__restrict__ block_values,
+        uint32_t *__restrict__ block_ids) {
+    const uint32_t tid = threadIdx.x;
+    float best_value = -CUDART_INF_F;
+    uint32_t best_id = UINT32_MAX;
+    for (uint32_t token = blockIdx.x * blockDim.x + tid;
+         token < kVocab;
+         token += gridDim.x * blockDim.x) {
+        const float base = bf16_to_float(float_to_bf16(base_logits[token]));
+        const float bias = bf16_to_float(float_to_bf16(markov_bias[token]));
+        const float value = bf16_to_float(float_to_bf16(base + bias));
+        base_logits[token] = value;
+        if (isfinite(value)) top1_select(value, token, &best_value, &best_id);
+    }
+    top1_warp_reduce(&best_value, &best_id);
+    __shared__ float warp_values[kThreads / 32u];
+    __shared__ uint32_t warp_ids[kThreads / 32u];
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (lane == 0u) {
+        warp_values[warp] = best_value;
+        warp_ids[warp] = best_id;
+    }
+    __syncthreads();
+    if (warp == 0u) {
+        best_value = lane < kThreads / 32u ? warp_values[lane] : -CUDART_INF_F;
+        best_id = lane < kThreads / 32u ? warp_ids[lane] : UINT32_MAX;
+        top1_warp_reduce(&best_value, &best_id);
+        if (lane == 0u) {
+            block_values[blockIdx.x] = best_value;
+            block_ids[blockIdx.x] = best_id;
+        }
+    }
+}
+
+__global__ void top1_stage2_kernel(
+        const float *__restrict__ block_values,
+        const uint32_t *__restrict__ block_ids,
+        uint32_t *__restrict__ out_token) {
+    const uint32_t tid = threadIdx.x;
+    float best_value = tid < kGreedyBlocks ? block_values[tid] : -CUDART_INF_F;
+    uint32_t best_id = tid < kGreedyBlocks ? block_ids[tid] : UINT32_MAX;
+    top1_warp_reduce(&best_value, &best_id);
+    __shared__ float warp_values[kThreads / 32u];
+    __shared__ uint32_t warp_ids[kThreads / 32u];
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (lane == 0u) {
+        warp_values[warp] = best_value;
+        warp_ids[warp] = best_id;
+    }
+    __syncthreads();
+    if (warp == 0u) {
+        best_value = lane < kThreads / 32u ? warp_values[lane] : -CUDART_INF_F;
+        best_id = lane < kThreads / 32u ? warp_ids[lane] : UINT32_MAX;
+        top1_warp_reduce(&best_value, &best_id);
+        if (lane == 0u) out_token[0] = best_id;
+    }
+}
+
 /* All control-plane kernels are intentionally one tiny launch each.  They
  * replace the former D2H proposal copy + host longest-prefix loop and are
  * consumed by a target M8 verifier on the same CUDA stream. */
@@ -572,6 +892,7 @@ __global__ void accept_greedy_kernel(
         const uint32_t *__restrict__ proposal,
         const uint32_t *__restrict__ target_tokens,
         const float *__restrict__ target_logits,
+        const uint32_t *__restrict__ commit_limit,
         uint32_t *__restrict__ accepted_prefix,
         uint32_t *__restrict__ target_commit_prefix,
         uint32_t *__restrict__ continuation_token,
@@ -579,8 +900,13 @@ __global__ void accept_greedy_kernel(
         uint32_t *__restrict__ async_status) {
     if (threadIdx.x != 0u || blockIdx.x != 0u) return;
     uint32_t prefix = 0u;
-    if (!proposal || !target_tokens || !target_logits || !accepted_prefix || !target_commit_prefix ||
-        !continuation_token || !continuation_logit || !async_status) {
+    if (!proposal || !target_tokens || !target_logits || !commit_limit || !accepted_prefix ||
+        !target_commit_prefix || !continuation_token || !continuation_logit || !async_status) {
+        return;
+    }
+    const uint32_t limit = commit_limit[0];
+    if (limit == 0u || limit > kVerifyWidth) {
+        *async_status = static_cast<uint32_t>(AXIOM_ERR_INVALID_ARGUMENT);
         return;
     }
     for (uint32_t index = 0u; index < kVerifyWidth; ++index) {
@@ -598,6 +924,7 @@ __global__ void accept_greedy_kernel(
         }
         if (draft != target) break;
     }
+    prefix = min(prefix, limit - 1u);
     const uint32_t continuation = target_tokens[prefix];
     *accepted_prefix = prefix;
     *target_commit_prefix = prefix + 1u;
@@ -694,6 +1021,32 @@ int launch_qk_norm_rope(
     qk_rmsnorm_rope_bf16_kernel<<<heads * columns, kHeadThreads, 0, stream>>>(
             weight, x, heads, columns, first_position, first_position_device);
     return cudaGetLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
+}
+
+bool fused_top1_enabled() {
+    const char *value = std::getenv("AXIOM_QWEN38_DSPARK_FUSED_TOP1");
+    return !(value && value[0] == '0' && value[1] == '\0');
+}
+
+uint32_t dspark_attention_tile_keys() {
+    const char *value = std::getenv("AXIOM_QWEN38_DSPARK_ATTENTION_TILE");
+    if (!value || value[0] == '\0') return kDefaultAttentionTileKeys;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (!end || end == value || end[0] != '\0') return kDefaultAttentionTileKeys;
+    return parsed == 4ul || parsed == 8ul || parsed == 16ul || parsed == 32ul
+            ? static_cast<uint32_t>(parsed)
+            : kDefaultAttentionTileKeys;
+}
+
+uint32_t dspark_attention_split_k() {
+    const char *value = std::getenv("AXIOM_QWEN38_DSPARK_ATTENTION_SPLIT_K");
+    if (!value || value[0] == '\0') return 4u;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (!end || end == value || end[0] != '\0') return 4u;
+    return parsed == 1ul || parsed == 2ul || parsed == 4ul
+            ? static_cast<uint32_t>(parsed) : 4u;
 }
 
 int gemm_bf16_weight_bf16_f32(
@@ -820,18 +1173,24 @@ struct axiom_qwen38_dspark_compute {
     axiom_device_buffer *k_buffer = nullptr;
     axiom_device_buffer *v_buffer = nullptr;
     axiom_device_buffer *attention_buffer = nullptr;
+    axiom_device_buffer *attention_split_values_buffer = nullptr;
+    axiom_device_buffer *attention_split_maxima_buffer = nullptr;
+    axiom_device_buffer *attention_split_denominators_buffer = nullptr;
     axiom_device_buffer *linear_buffer = nullptr;
     axiom_device_buffer *gate_buffer = nullptr;
     axiom_device_buffer *up_buffer = nullptr;
     axiom_device_buffer *logits_buffer = nullptr;
     axiom_device_buffer *markov_bias_buffer = nullptr;
     axiom_device_buffer *rank_buffer = nullptr;
+    axiom_device_buffer *greedy_block_values_buffer = nullptr;
+    axiom_device_buffer *greedy_block_ids_buffer = nullptr;
     axiom_device_buffer *device_anchor_token_buffer = nullptr;
     axiom_device_buffer *device_anchor_position_buffer = nullptr;
     axiom_device_buffer *device_proposal_tokens_buffer = nullptr;
     axiom_device_buffer *device_verify_tokens_buffer = nullptr;
     axiom_device_buffer *device_accepted_prefix_buffer = nullptr;
     axiom_device_buffer *device_target_commit_prefix_buffer = nullptr;
+    axiom_device_buffer *device_commit_limit_buffer = nullptr;
     axiom_device_buffer *device_continuation_token_buffer = nullptr;
     axiom_device_buffer *device_continuation_logit_buffer = nullptr;
     axiom_device_buffer *device_async_status_buffer = nullptr;
@@ -852,18 +1211,24 @@ struct axiom_qwen38_dspark_compute {
     float *k = nullptr;
     float *v = nullptr;
     float *attention = nullptr;
+    float *attention_split_values = nullptr;
+    float *attention_split_maxima = nullptr;
+    float *attention_split_denominators = nullptr;
     float *linear = nullptr;
     float *gate = nullptr;
     float *up = nullptr;
     float *logits = nullptr;
     float *markov_bias = nullptr;
     float *rank = nullptr;
+    float *greedy_block_values = nullptr;
+    uint32_t *greedy_block_ids = nullptr;
     uint32_t *device_anchor_token = nullptr;
     uint32_t *device_anchor_position = nullptr;
     uint32_t *device_proposal_tokens = nullptr;
     uint32_t *device_verify_tokens = nullptr;
     uint32_t *device_accepted_prefix = nullptr;
     uint32_t *device_target_commit_prefix = nullptr;
+    uint32_t *device_commit_limit = nullptr;
     uint32_t *device_continuation_token = nullptr;
     float *device_continuation_logit = nullptr;
     uint32_t *device_async_status = nullptr;
@@ -886,12 +1251,15 @@ void destroy_workspace(axiom_qwen38_dspark_compute *compute) {
         compute->v_cache_buffer[layer] = nullptr;
         compute->k_cache_buffer[layer] = nullptr;
     }
+    axiom_device_buffer_destroy(compute->greedy_block_ids_buffer);
+    axiom_device_buffer_destroy(compute->greedy_block_values_buffer);
     axiom_device_buffer_destroy(compute->rank_buffer);
     axiom_device_buffer_destroy(compute->device_async_status_buffer);
     axiom_device_buffer_destroy(compute->device_history_buffer);
     axiom_device_buffer_destroy(compute->device_continuation_logit_buffer);
     axiom_device_buffer_destroy(compute->device_continuation_token_buffer);
     axiom_device_buffer_destroy(compute->device_target_commit_prefix_buffer);
+    axiom_device_buffer_destroy(compute->device_commit_limit_buffer);
     axiom_device_buffer_destroy(compute->device_accepted_prefix_buffer);
     axiom_device_buffer_destroy(compute->device_verify_tokens_buffer);
     axiom_device_buffer_destroy(compute->device_proposal_tokens_buffer);
@@ -902,6 +1270,9 @@ void destroy_workspace(axiom_qwen38_dspark_compute *compute) {
     axiom_device_buffer_destroy(compute->up_buffer);
     axiom_device_buffer_destroy(compute->gate_buffer);
     axiom_device_buffer_destroy(compute->linear_buffer);
+    axiom_device_buffer_destroy(compute->attention_split_denominators_buffer);
+    axiom_device_buffer_destroy(compute->attention_split_maxima_buffer);
+    axiom_device_buffer_destroy(compute->attention_split_values_buffer);
     axiom_device_buffer_destroy(compute->attention_buffer);
     axiom_device_buffer_destroy(compute->v_buffer);
     axiom_device_buffer_destroy(compute->k_buffer);
@@ -914,12 +1285,15 @@ void destroy_workspace(axiom_qwen38_dspark_compute *compute) {
     axiom_device_buffer_destroy(compute->fusion_input_buffer);
     axiom_device_buffer_destroy(compute->activation_stage_buffer);
     axiom_device_buffer_destroy(compute->cublas_workspace_buffer);
+    compute->greedy_block_ids_buffer = nullptr;
+    compute->greedy_block_values_buffer = nullptr;
     compute->rank_buffer = nullptr;
     compute->device_async_status_buffer = nullptr;
     compute->device_history_buffer = nullptr;
     compute->device_continuation_logit_buffer = nullptr;
     compute->device_continuation_token_buffer = nullptr;
     compute->device_target_commit_prefix_buffer = nullptr;
+    compute->device_commit_limit_buffer = nullptr;
     compute->device_accepted_prefix_buffer = nullptr;
     compute->device_verify_tokens_buffer = nullptr;
     compute->device_proposal_tokens_buffer = nullptr;
@@ -930,6 +1304,9 @@ void destroy_workspace(axiom_qwen38_dspark_compute *compute) {
     compute->up_buffer = nullptr;
     compute->gate_buffer = nullptr;
     compute->linear_buffer = nullptr;
+    compute->attention_split_denominators_buffer = nullptr;
+    compute->attention_split_maxima_buffer = nullptr;
+    compute->attention_split_values_buffer = nullptr;
     compute->attention_buffer = nullptr;
     compute->v_buffer = nullptr;
     compute->k_buffer = nullptr;
@@ -942,12 +1319,15 @@ void destroy_workspace(axiom_qwen38_dspark_compute *compute) {
     compute->fusion_input_buffer = nullptr;
     compute->activation_stage_buffer = nullptr;
     compute->cublas_workspace_buffer = nullptr;
+    compute->greedy_block_values = nullptr;
+    compute->greedy_block_ids = nullptr;
     compute->device_anchor_token = nullptr;
     compute->device_anchor_position = nullptr;
     compute->device_proposal_tokens = nullptr;
     compute->device_verify_tokens = nullptr;
     compute->device_accepted_prefix = nullptr;
     compute->device_target_commit_prefix = nullptr;
+    compute->device_commit_limit = nullptr;
     compute->device_continuation_token = nullptr;
     compute->device_continuation_logit = nullptr;
     compute->device_async_status = nullptr;
@@ -985,11 +1365,17 @@ int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
     uint64_t kv_inject_block = 0u;
     uint64_t logits_block = 0u;
     uint64_t cache_block = 0u;
+    uint64_t attention_split_values_block = 0u;
+    uint64_t attention_split_stats_block = 0u;
     if (!checked_mul(static_cast<uint64_t>(kHidden) * kBlock, sizeof(float), &hidden_block) ||
         !checked_mul(static_cast<uint64_t>(kIntermediate) * kBlock, sizeof(float), &intermediate_block) ||
         !checked_mul(static_cast<uint64_t>(kFusionInput) * kVerifyWidth, sizeof(float), &fusion_block) ||
         !checked_mul(static_cast<uint64_t>(kKvDim) * kVerifyWidth, sizeof(float), &kv_inject_block) ||
         !checked_mul(static_cast<uint64_t>(kVocab) * kBlock, sizeof(float), &logits_block) ||
+        !checked_mul(static_cast<uint64_t>(kBlock) * kHeads * kAttentionMaxSplitK,
+                     kHeadDim * sizeof(float), &attention_split_values_block) ||
+        !checked_mul(static_cast<uint64_t>(kBlock) * kHeads * kAttentionMaxSplitK,
+                     sizeof(float), &attention_split_stats_block) ||
         !checked_mul(static_cast<uint64_t>(compute->max_context) * kKvDim, sizeof(uint16_t), &cache_block)) {
         return AXIOM_ERR_BUDGET;
     }
@@ -1039,6 +1425,18 @@ int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
     if (rc == AXIOM_OK) rc = allocate_buffer(compute, &compute->attention_buffer,
                                               reinterpret_cast<void **>(&compute->attention), hidden_block,
                                               &compute->workspace_bytes);
+    if (rc == AXIOM_OK) rc = allocate_buffer(
+            compute, &compute->attention_split_values_buffer,
+            reinterpret_cast<void **>(&compute->attention_split_values),
+            attention_split_values_block, &compute->workspace_bytes);
+    if (rc == AXIOM_OK) rc = allocate_buffer(
+            compute, &compute->attention_split_maxima_buffer,
+            reinterpret_cast<void **>(&compute->attention_split_maxima),
+            attention_split_stats_block, &compute->workspace_bytes);
+    if (rc == AXIOM_OK) rc = allocate_buffer(
+            compute, &compute->attention_split_denominators_buffer,
+            reinterpret_cast<void **>(&compute->attention_split_denominators),
+            attention_split_stats_block, &compute->workspace_bytes);
     if (rc == AXIOM_OK) rc = allocate_buffer(compute, &compute->linear_buffer,
                                               reinterpret_cast<void **>(&compute->linear), hidden_block,
                                               &compute->workspace_bytes);
@@ -1059,6 +1457,16 @@ int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
                                               reinterpret_cast<void **>(&compute->rank),
                                               static_cast<uint64_t>(kRank) * sizeof(float),
                                               &compute->workspace_bytes);
+    if (rc == AXIOM_OK) rc = allocate_buffer(
+            compute, &compute->greedy_block_values_buffer,
+            reinterpret_cast<void **>(&compute->greedy_block_values),
+            static_cast<uint64_t>(kGreedyBlocks) * sizeof(float),
+            &compute->workspace_bytes);
+    if (rc == AXIOM_OK) rc = allocate_buffer(
+            compute, &compute->greedy_block_ids_buffer,
+            reinterpret_cast<void **>(&compute->greedy_block_ids),
+            static_cast<uint64_t>(kGreedyBlocks) * sizeof(uint32_t),
+            &compute->workspace_bytes);
     if (rc == AXIOM_OK) rc = allocate_device_control(
             &compute->device_anchor_token_buffer,
             reinterpret_cast<void **>(&compute->device_anchor_token), sizeof(uint32_t));
@@ -1079,6 +1487,9 @@ int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
     if (rc == AXIOM_OK) rc = allocate_device_control(
             &compute->device_target_commit_prefix_buffer,
             reinterpret_cast<void **>(&compute->device_target_commit_prefix), sizeof(uint32_t));
+    if (rc == AXIOM_OK) rc = allocate_device_control(
+            &compute->device_commit_limit_buffer,
+            reinterpret_cast<void **>(&compute->device_commit_limit), sizeof(uint32_t));
     if (rc == AXIOM_OK) rc = allocate_device_control(
             &compute->device_continuation_token_buffer,
             reinterpret_cast<void **>(&compute->device_continuation_token), sizeof(uint32_t));
@@ -1101,6 +1512,13 @@ int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
                                  reinterpret_cast<void **>(&compute->v_cache[layer]), cache_block,
                                  &compute->kv_cache_bytes);
         }
+    }
+    if (rc == AXIOM_OK) {
+        const uint32_t default_commit_limit = kVerifyWidth;
+        const cudaError_t status = cudaMemcpy(
+                compute->device_commit_limit, &default_commit_limit,
+                sizeof(default_commit_limit), cudaMemcpyHostToDevice);
+        if (status != cudaSuccess) rc = cuda_status(status);
     }
     if (rc == AXIOM_OK && !checked_add(compute->workspace_bytes, compute->kv_cache_bytes,
                                        &compute->device_bytes)) {
@@ -1195,6 +1613,8 @@ int enqueue_proposal(
         float *out_confidence,
         const cudaStream_t stream) {
     if (!compute || !out_tokens || columns == 0u || columns > kBlock) return AXIOM_ERR_INVALID_ARGUMENT;
+    const uint32_t attention_tile = dspark_attention_tile_keys();
+    const uint32_t attention_split_k = dspark_attention_split_k();
     fill_noise_block_kernel<<<(columns + 31u) / 32u, 32u, 0, stream>>>(
             compute->tokens, anchor_token, columns, anchor_token_device);
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
@@ -1225,11 +1645,68 @@ int enqueue_proposal(
         if (rc == AXIOM_OK) rc = launch_round_bf16(compute->q, static_cast<uint64_t>(kHidden) * columns, stream);
         if (rc == AXIOM_OK) rc = launch_round_bf16(compute->k, static_cast<uint64_t>(kKvDim) * columns, stream);
         if (rc == AXIOM_OK) {
-            noncausal_gqa_attention_bf16_kernel<<<
-                    kKvHeads * kGqaHeadGroups * columns, kGqaBlockThreads, 0, stream>>>(
-                    compute->q, compute->k, compute->v, compute->k_cache[layer], compute->v_cache[layer],
-                    compute->attention, anchor_position, columns, anchor_position_device);
-            if (cudaGetLastError() != cudaSuccess) rc = AXIOM_ERR_CUDA;
+            const uint32_t blocks = kKvHeads * kGqaHeadGroups * columns;
+            if (attention_split_k == 2u) {
+                noncausal_gqa_attention_bf16_wide_kernel<32u, 2u><<<
+                        dim3(blocks, 2u), kGqaBlockThreads, 0, stream>>>(
+                        compute->q, compute->k, compute->v, compute->k_cache[layer],
+                        compute->v_cache[layer], compute->attention,
+                        compute->attention_split_values, compute->attention_split_maxima,
+                        compute->attention_split_denominators, anchor_position,
+                        columns, anchor_position_device);
+                if (cudaGetLastError() == cudaSuccess) {
+                    merge_noncausal_gqa_attention_split_kernel<2u><<<
+                            columns * kHeads, kHeadDim, 0, stream>>>(
+                            compute->attention_split_values, compute->attention_split_maxima,
+                            compute->attention_split_denominators, compute->attention, columns);
+                } else {
+                    rc = AXIOM_ERR_CUDA;
+                }
+            } else if (attention_split_k == 4u) {
+                noncausal_gqa_attention_bf16_wide_kernel<32u, 4u><<<
+                        dim3(blocks, 4u), kGqaBlockThreads, 0, stream>>>(
+                        compute->q, compute->k, compute->v, compute->k_cache[layer],
+                        compute->v_cache[layer], compute->attention,
+                        compute->attention_split_values, compute->attention_split_maxima,
+                        compute->attention_split_denominators, anchor_position,
+                        columns, anchor_position_device);
+                if (cudaGetLastError() == cudaSuccess) {
+                    merge_noncausal_gqa_attention_split_kernel<4u><<<
+                            columns * kHeads, kHeadDim, 0, stream>>>(
+                            compute->attention_split_values, compute->attention_split_maxima,
+                            compute->attention_split_denominators, compute->attention, columns);
+                } else {
+                    rc = AXIOM_ERR_CUDA;
+                }
+            } else if (attention_tile == 8u) {
+                noncausal_gqa_attention_bf16_wide_kernel<8u><<<
+                        blocks, kGqaBlockThreads, 0, stream>>>(
+                        compute->q, compute->k, compute->v, compute->k_cache[layer],
+                        compute->v_cache[layer], compute->attention, nullptr, nullptr, nullptr,
+                        anchor_position,
+                        columns, anchor_position_device);
+            } else if (attention_tile == 16u) {
+                noncausal_gqa_attention_bf16_wide_kernel<16u><<<
+                        blocks, kGqaBlockThreads, 0, stream>>>(
+                        compute->q, compute->k, compute->v, compute->k_cache[layer],
+                        compute->v_cache[layer], compute->attention, nullptr, nullptr, nullptr,
+                        anchor_position,
+                        columns, anchor_position_device);
+            } else if (attention_tile == 32u) {
+                noncausal_gqa_attention_bf16_wide_kernel<32u><<<
+                        blocks, kGqaBlockThreads, 0, stream>>>(
+                        compute->q, compute->k, compute->v, compute->k_cache[layer],
+                        compute->v_cache[layer], compute->attention, nullptr, nullptr, nullptr,
+                        anchor_position,
+                        columns, anchor_position_device);
+            } else {
+                noncausal_gqa_attention_bf16_kernel<<<
+                        blocks, kGqaBlockThreads, 0, stream>>>(
+                        compute->q, compute->k, compute->v, compute->k_cache[layer],
+                        compute->v_cache[layer], compute->attention, anchor_position,
+                        columns, anchor_position_device);
+            }
+            if (rc == AXIOM_OK && cudaGetLastError() != cudaSuccess) rc = AXIOM_ERR_CUDA;
         }
         if (rc == AXIOM_OK) rc = gemm_bf16_weight_bf16_f32(
                 compute->cublas, weights.o_proj, kHidden, kHidden, compute->attention, compute->linear,
@@ -1276,6 +1753,7 @@ int enqueue_proposal(
     if (rc == AXIOM_OK) rc = compute->target.lm_head_f32_device(
             compute->target.user_data, compute->residual, compute->logits, columns,
             reinterpret_cast<void *>(stream));
+    const bool fused_top1 = fused_top1_enabled();
     for (uint32_t column = 0u; column < columns && rc == AXIOM_OK; ++column) {
         const uint32_t *previous = column == 0u ? compute->tokens : out_tokens + column - 1u;
         gather_markov_rank_kernel<<<(kRank + 127u) / 128u, 128u, 0, stream>>>(
@@ -1290,13 +1768,27 @@ int enqueue_proposal(
                 compute->markov_bias, 1u, 0.0f,
                 compute->activation_stage, compute->activation_stage_capacity, stream);
         if (rc != AXIOM_OK) break;
-        add_bf16_rounded_kernel<<<(kVocab + kThreads - 1u) / kThreads, kThreads, 0, stream>>>(
-                logits, compute->markov_bias, kVocab);
-        if (cudaGetLastError() != cudaSuccess) {
-            rc = AXIOM_ERR_CUDA;
-            break;
+        if (fused_top1) {
+            add_bf16_rounded_top1_stage1_kernel<<<kGreedyBlocks, kThreads, 0, stream>>>(
+                    logits, compute->markov_bias,
+                    compute->greedy_block_values, compute->greedy_block_ids);
+            if (cudaGetLastError() != cudaSuccess) {
+                rc = AXIOM_ERR_CUDA;
+                break;
+            }
+            top1_stage2_kernel<<<1u, kThreads, 0, stream>>>(
+                    compute->greedy_block_values, compute->greedy_block_ids,
+                    out_tokens + column);
+        } else {
+            add_bf16_rounded_kernel<<<(kVocab + kThreads - 1u) / kThreads, kThreads, 0, stream>>>(
+                    logits, compute->markov_bias, kVocab);
+            if (cudaGetLastError() != cudaSuccess) {
+                rc = AXIOM_ERR_CUDA;
+                break;
+            }
+            greedy_top1_kernel<<<1u, kThreads, 0, stream>>>(
+                    logits, out_tokens + column);
         }
-        greedy_top1_kernel<<<1u, kThreads, 0, stream>>>(logits, out_tokens + column);
         if (cudaGetLastError() != cudaSuccess) {
             rc = AXIOM_ERR_CUDA;
             break;
@@ -1665,6 +2157,7 @@ bool device_controls_ready(const axiom_qwen38_dspark_compute *compute) {
     return compute && compute->device_anchor_token && compute->device_anchor_position &&
             compute->device_proposal_tokens && compute->device_verify_tokens &&
             compute->device_accepted_prefix && compute->device_target_commit_prefix &&
+            compute->device_commit_limit &&
             compute->device_continuation_token &&
             compute->device_continuation_logit && compute->device_async_status &&
             compute->device_history;
@@ -1891,6 +2384,21 @@ extern "C" int axiom_qwen38_dspark_compute_device_graph_replay(
     return cuda_status(status);
 }
 
+extern "C" int axiom_qwen38_dspark_compute_device_commit_limit_set(
+        axiom_qwen38_dspark_compute *compute,
+        const uint32_t max_commit_tokens,
+        void *stream) {
+    if (!compute || !stream || !device_controls_ready(compute) ||
+        max_commit_tokens == 0u || max_commit_tokens > kVerifyWidth) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    if (cudaSetDevice(compute->device) != cudaSuccess) return AXIOM_ERR_CUDA;
+    const cudaError_t status = cudaMemcpyAsync(
+            compute->device_commit_limit, &max_commit_tokens, sizeof(max_commit_tokens),
+            cudaMemcpyHostToDevice, static_cast<cudaStream_t>(stream));
+    return cuda_status(status);
+}
+
 extern "C" int axiom_qwen38_dspark_compute_device_cycle_begin_enqueue(
         axiom_qwen38_dspark_compute *compute,
         void *stream) {
@@ -1936,6 +2444,7 @@ extern "C" int axiom_qwen38_dspark_compute_device_accept_greedy(
     if (cudaSetDevice(compute->device) != cudaSuccess) return AXIOM_ERR_CUDA;
     accept_greedy_kernel<<<1u, 1u, 0, static_cast<cudaStream_t>(target->stream)>>>(
             compute->device_proposal_tokens, target->target_token_ids_device, target->target_logits_device,
+            compute->device_commit_limit,
             compute->device_accepted_prefix, compute->device_target_commit_prefix,
             compute->device_continuation_token,
             compute->device_continuation_logit, compute->device_async_status);

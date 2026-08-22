@@ -355,12 +355,13 @@ void record_prefill_failure(
         axiom_qwen38_speculative *speculative,
         int status,
         bool poison,
+        uint64_t failed_tokens,
         uint64_t target_ns,
         uint64_t commit_ns,
         uint64_t inject_ns,
         uint64_t total_ns) {
     speculative->counters.last_status = static_cast<uint32_t>(status);
-    add_saturated(&speculative->counters.prefill_failed_tokens, 1u);
+    add_saturated(&speculative->counters.prefill_failed_tokens, failed_tokens);
     add_saturated(&speculative->counters.prefill_target_ns, target_ns);
     add_saturated(&speculative->counters.prefill_commit_ns, commit_ns);
     add_saturated(&speculative->counters.prefill_inject_ns, inject_ns);
@@ -524,7 +525,7 @@ extern "C" int axiom_qwen38_speculative_prefill_token(
     if (speculative->poisoned) {
         const uint64_t total = elapsed_ns(total_begin, steady_clock::now());
         record_prefill_failure(
-                speculative, AXIOM_ERR_RUNTIME, true, 0u, 0u, 0u, total);
+                speculative, AXIOM_ERR_RUNTIME, true, 1u, 0u, 0u, 0u, total);
         return AXIOM_ERR_RUNTIME;
     }
 
@@ -545,7 +546,7 @@ extern "C" int axiom_qwen38_speculative_prefill_token(
                 : (!valid_target_capabilities(capabilities)
                            ? AXIOM_ERR_NOT_IMPLEMENTED : AXIOM_ERR_RUNTIME);
         const uint64_t total = elapsed_ns(total_begin, steady_clock::now());
-        record_prefill_failure(speculative, status, false, 0u, 0u, 0u, total);
+        record_prefill_failure(speculative, status, false, 1u, 0u, 0u, 0u, total);
         return status;
     }
 
@@ -584,7 +585,7 @@ extern "C" int axiom_qwen38_speculative_prefill_token(
         }
         const uint64_t total = elapsed_ns(total_begin, steady_clock::now());
         record_prefill_failure(
-                speculative, rc, abort_rc != AXIOM_OK, target_ns, 0u, 0u, total);
+                speculative, rc, abort_rc != AXIOM_OK, 1u, target_ns, 0u, 0u, total);
         return rc;
     }
 
@@ -618,7 +619,7 @@ extern "C" int axiom_qwen38_speculative_prefill_token(
         }
         const uint64_t total = elapsed_ns(total_begin, steady_clock::now());
         record_prefill_failure(
-                speculative, rc, compute_advanced || abort_rc != AXIOM_OK,
+                speculative, rc, compute_advanced || abort_rc != AXIOM_OK, 1u,
                 target_ns, 0u, inject_ns, total);
         return rc;
     }
@@ -637,7 +638,7 @@ extern "C" int axiom_qwen38_speculative_prefill_token(
         /* DSpark already advanced; a failed authoritative commit cannot be
          * reconciled without resetting both objects. */
         record_prefill_failure(
-                speculative, rc, true, target_ns, commit_ns, inject_ns, total_ns);
+                speculative, rc, true, 1u, target_ns, commit_ns, inject_ns, total_ns);
         return rc;
     }
 
@@ -652,6 +653,177 @@ extern "C" int axiom_qwen38_speculative_prefill_token(
     result.inject_ns = inject_ns;
     result.total_ns = total_ns;
     add_saturated(&speculative->counters.prefill_committed_tokens, 1u);
+    add_saturated(&speculative->counters.prefill_target_ns, target_ns);
+    add_saturated(&speculative->counters.prefill_commit_ns, commit_ns);
+    add_saturated(&speculative->counters.prefill_inject_ns, inject_ns);
+    add_saturated(&speculative->counters.prefill_total_ns, total_ns);
+    speculative->counters.last_status = AXIOM_OK;
+    speculative->counters.poisoned = 0u;
+    *out = result;
+    return AXIOM_OK;
+#endif
+}
+
+extern "C" int axiom_qwen38_speculative_prefill_block8(
+        axiom_qwen38_speculative *speculative,
+        const axiom_qwen38_speculative_prefill_block8_request *request,
+        axiom_qwen38_speculative_prefill_block8_result *out) {
+    if (!speculative || !request || !out ||
+        request->abi_version != AXIOM_ABI_VERSION || out->abi_version != AXIOM_ABI_VERSION ||
+        request->stream != nullptr || request->flags != 0u) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    for (uint32_t time = 0u; time < AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH; ++time) {
+        if (request->token_ids[time] >= AXIOM_QWEN38_DSPARK_VOCAB) {
+            return AXIOM_ERR_INVALID_ARGUMENT;
+        }
+    }
+#if !AXIOM_QWEN38_SPECULATIVE_BACKEND_READY
+    return AXIOM_ERR_NOT_IMPLEMENTED;
+#else
+    constexpr uint64_t kTokens = AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH;
+    std::lock_guard<std::mutex> lock(speculative->mutex);
+    const auto total_begin = steady_clock::now();
+    add_saturated(&speculative->counters.prefill_attempted_tokens, kTokens);
+    if (speculative->poisoned) {
+        const uint64_t total = elapsed_ns(total_begin, steady_clock::now());
+        record_prefill_failure(
+                speculative, AXIOM_ERR_RUNTIME, true, kTokens, 0u, 0u, 0u, total);
+        return AXIOM_ERR_RUNTIME;
+    }
+
+    axiom_qwen38_model_dspark_temporal_capabilities capabilities{};
+    capabilities.abi_version = AXIOM_QWEN38_MODEL_DSPARK_ABI_VERSION;
+    int rc = axiom_qwen38_model_dspark_temporal_capabilities_get(
+            speculative->target, &capabilities);
+    axiom_qwen38_dspark_compute_info compute_info{};
+    compute_info.abi_version = AXIOM_ABI_VERSION;
+    if (rc == AXIOM_OK) {
+        rc = axiom_qwen38_dspark_compute_info_get(speculative->compute, &compute_info);
+    }
+    const uint32_t snapshot_position = axiom_qwen38_model_position(speculative->target);
+    if (rc != AXIOM_OK || !valid_target_capabilities(capabilities) ||
+        compute_info.transaction_open != 0u || compute_info.committed_position != snapshot_position) {
+        const int status = rc != AXIOM_OK
+                ? rc
+                : (!valid_target_capabilities(capabilities)
+                           ? AXIOM_ERR_NOT_IMPLEMENTED : AXIOM_ERR_RUNTIME);
+        const uint64_t total = elapsed_ns(total_begin, steady_clock::now());
+        record_prefill_failure(
+                speculative, status, false, kTokens, 0u, 0u, 0u, total);
+        return status;
+    }
+
+    axiom_qwen38_model_transaction *target_transaction = nullptr;
+    const auto target_begin = steady_clock::now();
+    rc = axiom_qwen38_model_transaction_begin(
+            speculative->target, &target_transaction);
+    axiom_qwen38_model_dspark_verify_block8_result target_result{};
+    target_result.abi_version = AXIOM_QWEN38_MODEL_DSPARK_ABI_VERSION;
+    if (rc == AXIOM_OK) {
+        rc = axiom_qwen38_model_transaction_verify_block8(
+                target_transaction, request->token_ids, nullptr, &target_result);
+    }
+    debug_prefill("target_block8", rc, snapshot_position);
+    const uint64_t target_ns = elapsed_ns(target_begin, steady_clock::now());
+    if (rc == AXIOM_OK &&
+        (target_result.abi_version != AXIOM_QWEN38_MODEL_DSPARK_ABI_VERSION ||
+         target_result.snapshot_position != snapshot_position ||
+         target_result.position_after_verify !=
+                 snapshot_position + AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH ||
+         target_result.target_tap_token_start_position != snapshot_position ||
+         target_result.target_tap_count != AXIOM_QWEN38_DSPARK_TARGET_FEATURES ||
+         target_result.target_tap_tokens != AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH ||
+         target_result.target_tap_hidden_size != AXIOM_QWEN38_DSPARK_HIDDEN ||
+         !target_result.target_aux_hidden)) {
+        rc = AXIOM_ERR_RUNTIME;
+    }
+    for (uint32_t time = 0u;
+         rc == AXIOM_OK && time < AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH; ++time) {
+        if (target_result.target_token_ids[time] >= AXIOM_QWEN38_DSPARK_VOCAB ||
+            !std::isfinite(target_result.target_logits[time])) {
+            rc = AXIOM_ERR_RUNTIME;
+        }
+    }
+    if (rc != AXIOM_OK) {
+        int abort_rc = AXIOM_OK;
+        if (target_transaction) {
+            abort_rc = axiom_qwen38_model_transaction_abort(target_transaction);
+            target_transaction = nullptr;
+        }
+        const uint64_t total = elapsed_ns(total_begin, steady_clock::now());
+        record_prefill_failure(
+                speculative, rc, abort_rc != AXIOM_OK, kTokens,
+                target_ns, 0u, 0u, total);
+        return rc;
+    }
+
+    const auto inject_begin = steady_clock::now();
+    axiom_qwen38_dspark_compute_inject_request inject{};
+    inject.abi_version = AXIOM_ABI_VERSION;
+    inject.target_taps = target_result.target_aux_hidden;
+    inject.target_position = snapshot_position;
+    inject.columns = AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH;
+    inject.stream = nullptr;
+    rc = axiom_qwen38_dspark_compute_inject_target(speculative->compute, &inject);
+    debug_prefill("inject_block8", rc, snapshot_position);
+    const bool compute_advanced = rc == AXIOM_OK;
+    compute_info = {};
+    compute_info.abi_version = AXIOM_ABI_VERSION;
+    if (rc == AXIOM_OK) {
+        rc = axiom_qwen38_dspark_compute_info_get(speculative->compute, &compute_info);
+    }
+    if (rc == AXIOM_OK &&
+        (compute_info.transaction_open != 0u ||
+         compute_info.committed_position !=
+                 snapshot_position + AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH)) {
+        rc = AXIOM_ERR_RUNTIME;
+    }
+    const uint64_t inject_ns = elapsed_ns(inject_begin, steady_clock::now());
+    if (rc != AXIOM_OK) {
+        int abort_rc = AXIOM_OK;
+        if (target_transaction) {
+            abort_rc = axiom_qwen38_model_transaction_abort(target_transaction);
+            target_transaction = nullptr;
+        }
+        const uint64_t total = elapsed_ns(total_begin, steady_clock::now());
+        record_prefill_failure(
+                speculative, rc, compute_advanced || abort_rc != AXIOM_OK, kTokens,
+                target_ns, 0u, inject_ns, total);
+        return rc;
+    }
+
+    const auto commit_begin = steady_clock::now();
+    rc = axiom_qwen38_model_transaction_commit_prefix(
+            target_transaction, AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH);
+    target_transaction = nullptr;
+    const uint64_t commit_ns = elapsed_ns(commit_begin, steady_clock::now());
+    if (rc == AXIOM_OK && axiom_qwen38_model_position(speculative->target) !=
+            snapshot_position + AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH) {
+        rc = AXIOM_ERR_RUNTIME;
+    }
+    const uint64_t total_ns = elapsed_ns(total_begin, steady_clock::now());
+    if (rc != AXIOM_OK) {
+        record_prefill_failure(
+                speculative, rc, true, kTokens,
+                target_ns, commit_ns, inject_ns, total_ns);
+        return rc;
+    }
+
+    axiom_qwen38_speculative_prefill_block8_result result{};
+    result.abi_version = AXIOM_ABI_VERSION;
+    result.token_start_position = snapshot_position;
+    result.position_after_commit =
+            snapshot_position + AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH;
+    std::memcpy(result.target_token_ids, target_result.target_token_ids,
+                sizeof(result.target_token_ids));
+    std::memcpy(result.target_logits, target_result.target_logits,
+                sizeof(result.target_logits));
+    result.target_ns = target_ns;
+    result.commit_ns = commit_ns;
+    result.inject_ns = inject_ns;
+    result.total_ns = total_ns;
+    add_saturated(&speculative->counters.prefill_committed_tokens, kTokens);
     add_saturated(&speculative->counters.prefill_target_ns, target_ns);
     add_saturated(&speculative->counters.prefill_commit_ns, commit_ns);
     add_saturated(&speculative->counters.prefill_inject_ns, inject_ns);
@@ -988,6 +1160,72 @@ extern "C" int axiom_qwen38_speculative_device_step_enqueue(
     speculative->counters.last_status = AXIOM_OK;
     speculative->counters.poisoned = 0u;
     return AXIOM_OK;
+#endif
+}
+
+extern "C" int axiom_qwen38_speculative_device_session_end(
+        axiom_qwen38_speculative *speculative,
+        void *stream,
+        const uint32_t *committed_token_ids,
+        const uint32_t committed_token_count) {
+    if (!speculative) return AXIOM_ERR_INVALID_ARGUMENT;
+#if !AXIOM_QWEN38_SPECULATIVE_BACKEND_READY
+    (void)stream;
+    (void)committed_token_ids;
+    (void)committed_token_count;
+    return AXIOM_ERR_NOT_IMPLEMENTED;
+#else
+    std::lock_guard<std::mutex> lock(speculative->mutex);
+    if (!stream ||
+        (speculative->device_session_started &&
+         stream != speculative->device_session_stream) ||
+        (committed_token_count != 0u && !committed_token_ids)) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    if (cudaSetDevice(speculative->device) != cudaSuccess) {
+        speculative->poisoned = true;
+        return AXIOM_ERR_CUDA;
+    }
+
+    /* The clear is ordered after every graph replay on the same nonblocking
+     * stream.  Draining once after it therefore establishes the ownership
+     * handoff to the ABI-v1/default-stream canonical path without a race. */
+    int rc = speculative->device_session_started
+            ? abort_device_step(speculative, stream, false)
+            : AXIOM_OK;
+    if (rc == AXIOM_OK) {
+        rc = cuda_status(cudaStreamSynchronize(static_cast<cudaStream_t>(stream)));
+    }
+    if (rc == AXIOM_OK) {
+        rc = axiom_qwen38_model_restore_position(
+                speculative->target, committed_token_count);
+    }
+    if (rc == AXIOM_OK) {
+        rc = axiom_qwen38_model_committed_history_install(
+                speculative->target, committed_token_ids, committed_token_count);
+    }
+    if (rc == AXIOM_OK) {
+        rc = axiom_qwen38_dspark_compute_restore_position(
+                speculative->compute, committed_token_count);
+    }
+    if (rc != AXIOM_OK) speculative->poisoned = true;
+    return rc;
+#endif
+}
+
+extern "C" int axiom_qwen38_speculative_device_commit_limit_set(
+        axiom_qwen38_speculative *speculative,
+        const uint32_t max_commit_tokens,
+        void *stream) {
+    if (!speculative || !stream) return AXIOM_ERR_INVALID_ARGUMENT;
+#if !AXIOM_QWEN38_SPECULATIVE_BACKEND_READY
+    (void)max_commit_tokens;
+    return AXIOM_ERR_NOT_IMPLEMENTED;
+#else
+    std::lock_guard<std::mutex> lock(speculative->mutex);
+    if (speculative->poisoned) return AXIOM_ERR_RUNTIME;
+    return axiom_qwen38_dspark_compute_device_commit_limit_set(
+            speculative->compute, max_commit_tokens, stream);
 #endif
 }
 

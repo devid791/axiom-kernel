@@ -212,6 +212,29 @@ typedef struct {
     uint64_t total_ns;
 } axiom_qwen38_speculative_prefill_result;
 
+/* Native same-session prompt ingestion at the target's temporal width.  The
+ * eight token ids are consecutive positions in one sequence (never batch
+ * lanes).  Vision embeddings intentionally stay on the scalar transactional
+ * path until an equally exact mixed-embedding M8 contract is available. */
+typedef struct {
+    uint32_t abi_version;
+    uint32_t token_ids[AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH];
+    void *stream;   /* ABI v1 requires NULL. */
+    uint64_t flags; /* Must be zero in ABI v1. */
+} axiom_qwen38_speculative_prefill_block8_request;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t token_start_position;
+    uint32_t position_after_commit;
+    uint32_t target_token_ids[AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH];
+    float target_logits[AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH];
+    uint64_t target_ns;
+    uint64_t commit_ns;
+    uint64_t inject_ns;
+    uint64_t total_ns;
+} axiom_qwen38_speculative_prefill_block8_result;
+
 typedef struct {
     uint32_t abi_version;
     uint32_t poisoned;
@@ -285,6 +308,11 @@ int axiom_qwen38_speculative_prefill_token(
         const axiom_qwen38_speculative_prefill_request *request,
         axiom_qwen38_speculative_prefill_result *out);
 
+int axiom_qwen38_speculative_prefill_block8(
+        axiom_qwen38_speculative *speculative,
+        const axiom_qwen38_speculative_prefill_block8_request *request,
+        axiom_qwen38_speculative_prefill_block8_result *out);
+
 int axiom_qwen38_speculative_step(
         axiom_qwen38_speculative *speculative,
         const axiom_qwen38_speculative_step_request *request,
@@ -299,6 +327,25 @@ int axiom_qwen38_speculative_device_step_enqueue(
         axiom_qwen38_speculative *speculative,
         const axiom_qwen38_speculative_device_step_request *request,
         axiom_qwen38_speculative_device_step_result *out);
+
+/* Bound the authoritative output of the next graph cycle to [1,8] tokens.
+ * Used at the public max_tokens boundary so the fixed-width verifier never
+ * commits a valid but client-invisible suffix. */
+int axiom_qwen38_speculative_device_commit_limit_set(
+        axiom_qwen38_speculative *speculative,
+        uint32_t max_commit_tokens,
+        void *stream);
+
+/* Close a live device-only decode session and materialize its exact host
+ * position/history after all queued graph work has completed. The function
+ * drains `stream`, releases resident DSpark controls and makes the same
+ * target/compute pair safe for canonical host prefill. It is idempotent when
+ * no device session was started. */
+int axiom_qwen38_speculative_device_session_end(
+        axiom_qwen38_speculative *speculative,
+        void *stream,
+        const uint32_t *committed_token_ids,
+        uint32_t committed_token_count);
 
 int axiom_qwen38_speculative_counters_get(
         const axiom_qwen38_speculative *speculative,

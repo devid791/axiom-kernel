@@ -56,6 +56,18 @@ int axiom_qwen38_bf16_linear_forward_f32_device(
         float *out,
         void *stream);
 
+/* Evaluate two shape-identical resident BF16 projections over the same
+ * batch-8 input. Each accumulation and reduction chain is identical to the
+ * reference single-projection primitive; the paired launch only shares input
+ * loads and launch overhead. NVFP4-dequantized selector heads are rejected. */
+int axiom_qwen38_bf16_linear_pair_forward_f32_device(
+        axiom_qwen38_bf16_linear *first,
+        axiom_qwen38_bf16_linear *second,
+        const float *input,
+        float *first_out,
+        float *second_out,
+        void *stream);
+
 /* Dynamic-width form used by proposal selectors.  `columns` is [1,8], with
  * column-major F32 input [cols,columns] and output [rows,columns]. */
 int axiom_qwen38_bf16_linear_forward_f32_device_m(

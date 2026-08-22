@@ -181,6 +181,14 @@ int axiom_qwen38_model_recurrent_state_import(
 int axiom_qwen38_model_restore_position(
         axiom_qwen38_model *model,
         uint32_t position);
+/* Install the exact logical token history for an already-restored or
+ * device-committed model state. This changes host metadata only: the caller
+ * must first synchronize CUDA work and restore the matching device position.
+ * It is the explicit bridge back from device-authoritative graph decode. */
+int axiom_qwen38_model_committed_history_install(
+        axiom_qwen38_model *model,
+        const uint32_t *token_ids,
+        uint32_t token_count);
 /* Synchronous page bridge for the native target's sixteen full-attention
  * layers. `attention_layer` is the compact index in [0,15], not the decoder
  * layer id. This is a storage-tier bridge; it is not used during graph replay. */

@@ -1,16 +1,21 @@
 {
-  "release_id": "axiom-kernel-public-2026-08-20",
+  "release_id": "axiom-kernel-v0.2.0-public",
+  "release_date": "2026-08-22",
   "project": "Axiom Kernel",
   "license": "MIT",
-  "source_commit": "7945f8bf595039c5e3be50896b16bdf86ca3fa1c",
-  "public_history": "fresh-public-snapshot",
+  "source_commit": "41403d5fed91f3481d92ae111e83fa75f544dcbb",
+  "production_evidence_commit": "a02799e241d68c24433e429ed96fdaa7159b653a",
+  "public_history": "sanitized-public-snapshot",
   "artifact_hashes": {
-    "lib/libaxiom.so": "d87f251db00b33374b23e12b664fcfa385e83bfcbf3e5fba88cb522680b08350",
-    "bin/axiom-qwen38-generate": "44f9f0bb085f8225a4cc1f764ea815ec64871981c6900cb31d2ffe9860be6bc1"
+    "lib/libaxiom.so": "cee469800501a0b0e81c0be00fa14fece80ed9577748b0c6ee34bb27cedcd5dd",
+    "bin/axiom-qwen38-generate": "44f9f0bb085f8225a4cc1f764ea815ec64871981c6900cb31d2ffe9860be6bc1",
+    "bin/axiom-qwen38-temporal-gate": "83f12860fef201d2128fc6d7df560e3d73eb96661f188d3db993cf55142a60d0",
+    "bin/axiom-qwen38-speculative-graph-gate": "6a989e0fd574ab21906ba020a38b0ec4e21c3b04a7d3fb633f647f870156df25",
+    "bin/axiom-qwen38-paged-runtime-gate": "e7242b7a9c21e6a7cb570f2d7a83e27a5c64780f4687c57cbba961894cecd77a"
   },
   "config_hashes": {
-    "Makefile": "8fffddc329b7d6f7d004dabd87e7ae8d347b2b1fd3c2300be87469d41d5825c8",
-    "README.md": "4666b3192fb7d2c63585e83882cc7d02e8c667559267db2e5ab438a88c980344"
+    "Makefile": "be3c3f6dcbb94715a2eac8e060329274244a3dc255273e855d1d1393a4539708",
+    "README.md": "6ac9872eba852084c1e0ab5e3816bd57d8bf2b3f9add534139629a3c08f0a67e"
   },
   "checkpoint_hashes": {},
   "gate_results": {
@@ -18,13 +23,27 @@
     "host_tests": "pass",
     "cuda_compile_sm120": "pass",
     "cuda_link": "pass",
-    "model_runtime_gate": "not_run-model-artifacts-not-published",
-    "gpu_benchmark": "not_run-production-gpu-left-undisturbed"
+    "public_gate_binaries": "pass-temporal-speculative-graph-paged-runtime",
+    "public_model_runtime_gate": "not_run-model-artifacts-not-published",
+    "production_temporal_parity": "pass-zero-logit-and-tap-error",
+    "production_paged_runtime": "pass-300-tokens-across-page-256",
+    "production_http_benchmark": "pass-four-consecutive-byte-exact-runs"
+  },
+  "benchmark_snapshot": {
+    "gpu_class": "RTX 5090",
+    "prompt_tokens": 1002,
+    "generated_tokens": 256,
+    "speculative_cycles": 33,
+    "accepted_proposals": 223,
+    "eligible_proposals": 224,
+    "decode_tokens_per_second_median": 384.1583,
+    "visible_tokens_per_second_median": 385.6648,
+    "output_sha256": "b0d7b6f4bad084c8bdba57559fccbbb3b4acef5d085274123c829aa0eb793b5b"
   },
   "installed_paths": [],
   "health_snapshot": {
-    "public_kernel": "library-and-cli-linked",
-    "production_service_touched": false,
+    "public_kernel": "library-cli-and-three-runtime-gates-linked",
+    "production_service_touched_by_public_release": false,
     "weights_in_repository": false,
     "private_endpoints_in_repository": false,
     "activation_steering_in_public_build": false,

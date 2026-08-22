@@ -11,11 +11,14 @@
 #include <cuda_fp8.h>
 #include <cublasLt.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -29,6 +32,7 @@ constexpr uint32_t kGroup = 16u;
 constexpr uint8_t kE4m3Epsilon = 0x20u;
 constexpr uint8_t kE4m3MaxFinite = 0x7eu;
 constexpr size_t kLtWorkspaceBytes = 8u * 1024u * 1024u;
+constexpr uint32_t kAutotuneCompareThreads = 256u;
 
 struct MatmulPlan {
     cublasLtMatrixLayout_t b_layout = nullptr;
@@ -152,6 +156,55 @@ __global__ void quantize_batch_to_tc_kernel(
     }
 }
 
+/* One 16-lane subgroup owns one NVFP4 scale group.  This preserves the
+ * per-value conversion and exact max-derived scale while exposing the 16
+ * independent conversions to the GPU instead of serializing them in one
+ * thread. */
+__global__ void quantize_batch_to_tc_warp_kernel(
+        const float *input,
+        float input_global,
+        uint8_t *out_packed,
+        uint8_t *out_scale_tc,
+        uint32_t cols,
+        uint32_t groups,
+        uint32_t inner_tiles,
+        uint32_t columns) {
+    constexpr uint32_t kSubgroup = 16u;
+    const uint32_t subgroup = threadIdx.x / kSubgroup;
+    const uint32_t lane = threadIdx.x % kSubgroup;
+    const uint32_t groups_per_block = blockDim.x / kSubgroup;
+    const uint32_t linear_group = blockIdx.x * groups_per_block + subgroup;
+    const uint32_t total_groups = groups * columns;
+    if (linear_group >= total_groups) return;
+    const uint32_t column = linear_group / groups;
+    const uint32_t group = linear_group - column * groups;
+    const uint32_t feature = group * kGroup + lane;
+    const float value = input[static_cast<size_t>(column) * cols + feature];
+    float max_abs = fabsf(value);
+    #pragma unroll
+    for (uint32_t offset = kSubgroup / 2u; offset != 0u; offset >>= 1u) {
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, offset, kSubgroup));
+    }
+    uint32_t scale_code = lane == 0u
+            ? encode_e4m3fn_scale(max_abs * (1.0f / 6.0f) * input_global)
+            : 0u;
+    scale_code = __shfl_sync(0xffffffffu, scale_code, 0, kSubgroup);
+    const float dequant_scale = e4m3fn(static_cast<uint8_t>(scale_code)) / input_global;
+    if (lane == 0u) {
+        out_scale_tc[scale_view_offset(column, group, inner_tiles)] =
+                static_cast<uint8_t>(scale_code);
+    }
+    const uint32_t nibble = static_cast<uint32_t>(__nv_cvt_float_to_fp4(
+            value / dequant_scale, __NV_E2M1, cudaRoundNearest)) & 0x0fu;
+    const uint32_t next_nibble = __shfl_down_sync(
+            0xffffffffu, nibble, 1u, kSubgroup) & 0x0fu;
+    if ((lane & 1u) == 0u) {
+        uint8_t *packed = out_packed + static_cast<size_t>(column) * (cols / 2u) +
+                group * (kGroup / 2u);
+        packed[lane / 2u] = static_cast<uint8_t>(nibble | (next_nibble << 4u));
+    }
+}
+
 /* Fuses the exact serving boundary between the packed gate/up projection and
  * the down projection.  The intermediate remains F32, matching the previous
  * store/load boundary, but never materializes in global memory: every thread
@@ -196,6 +249,53 @@ __global__ void silu_mul_quantize_batch_to_tc_kernel(
                 values[pair * 2u + 1u] / dequant_scale,
                 __NV_E2M1, cudaRoundNearest)) & 0x0fu;
         packed[pair] = static_cast<uint8_t>(low | (high << 4u));
+    }
+}
+
+__global__ void silu_mul_quantize_batch_to_tc_warp_kernel(
+        const float *gate_up,
+        float input_global,
+        uint8_t *out_packed,
+        uint8_t *out_scale_tc,
+        uint32_t rows,
+        uint32_t groups,
+        uint32_t inner_tiles,
+        uint32_t columns) {
+    constexpr uint32_t kSubgroup = 16u;
+    const uint32_t subgroup = threadIdx.x / kSubgroup;
+    const uint32_t lane = threadIdx.x % kSubgroup;
+    const uint32_t groups_per_block = blockDim.x / kSubgroup;
+    const uint32_t linear_group = blockIdx.x * groups_per_block + subgroup;
+    const uint32_t total_groups = groups * columns;
+    if (linear_group >= total_groups) return;
+    const uint32_t column = linear_group / groups;
+    const uint32_t group = linear_group - column * groups;
+    const uint32_t feature = group * kGroup + lane;
+    const float *column_base = gate_up + static_cast<size_t>(column) * rows * 2u;
+    const float x = column_base[feature];
+    const float value = (x / (1.0f + expf(-x))) * column_base[rows + feature];
+    float max_abs = fabsf(value);
+    #pragma unroll
+    for (uint32_t offset = kSubgroup / 2u; offset != 0u; offset >>= 1u) {
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, offset, kSubgroup));
+    }
+    uint32_t scale_code = lane == 0u
+            ? encode_e4m3fn_scale(max_abs * (1.0f / 6.0f) * input_global)
+            : 0u;
+    scale_code = __shfl_sync(0xffffffffu, scale_code, 0, kSubgroup);
+    const float dequant_scale = e4m3fn(static_cast<uint8_t>(scale_code)) / input_global;
+    if (lane == 0u) {
+        out_scale_tc[scale_view_offset(column, group, inner_tiles)] =
+                static_cast<uint8_t>(scale_code);
+    }
+    const uint32_t nibble = static_cast<uint32_t>(__nv_cvt_float_to_fp4(
+            value / dequant_scale, __NV_E2M1, cudaRoundNearest)) & 0x0fu;
+    const uint32_t next_nibble = __shfl_down_sync(
+            0xffffffffu, nibble, 1u, kSubgroup) & 0x0fu;
+    if ((lane & 1u) == 0u) {
+        uint8_t *packed = out_packed + static_cast<size_t>(column) * (rows / 2u) +
+                group * (kGroup / 2u);
+        packed[lane / 2u] = static_cast<uint8_t>(nibble | (next_nibble << 4u));
     }
 }
 
@@ -255,6 +355,360 @@ bool exact_f32_scalar(const axiom_tensor_info &info) {
 
 int cublas_to_axiom(cublasStatus_t status) {
     return status == CUBLAS_STATUS_SUCCESS ? AXIOM_OK : AXIOM_ERR_RUNTIME;
+}
+
+__global__ void nvfp4_exact_output_compare_kernel(
+        const float *__restrict__ reference,
+        const float *__restrict__ candidate,
+        uint64_t count,
+        uint32_t *__restrict__ mismatch) {
+    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count && __float_as_uint(reference[index]) != __float_as_uint(candidate[index])) {
+        atomicExch(mismatch, 1u);
+    }
+}
+
+__global__ void nvfp4_autotune_packed_pattern_kernel(
+        uint8_t *__restrict__ values,
+        uint64_t count,
+        uint32_t seed) {
+    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    uint32_t mixed = static_cast<uint32_t>(index) * 747796405u + seed * 2891336453u;
+    mixed = ((mixed >> ((mixed >> 28u) + 4u)) ^ mixed) * 277803737u;
+    mixed = (mixed >> 22u) ^ mixed;
+    values[index] = static_cast<uint8_t>(mixed);
+}
+
+__global__ void nvfp4_autotune_scale_pattern_kernel(
+        uint8_t *__restrict__ values,
+        uint64_t count,
+        uint32_t seed) {
+    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    uint32_t mixed = static_cast<uint32_t>(index) * 1597334677u + seed * 3812015801u;
+    mixed ^= mixed >> 16u;
+    values[index] = static_cast<uint8_t>(0x30u + ((mixed >> 5u) & 0x0cu));
+}
+
+bool nvfp4_autotune_enabled() {
+    const char *value = std::getenv("AXIOM_QWEN38_NVFP4_AUTOTUNE");
+    if (!value || value[0] == '\0') {
+        value = std::getenv("AXIOM_QWEN38_MATMUL_AUTOTUNE");
+    }
+    return value && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+            std::strcmp(value, "false") != 0 && std::strcmp(value, "False") != 0;
+}
+
+bool nvfp4_warp_quant_enabled() {
+    const char *value = std::getenv("AXIOM_QWEN38_NVFP4_WARP_QUANT");
+    return !value || value[0] == '\0' ||
+            (std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+             std::strcmp(value, "False") != 0);
+}
+
+struct AlgoCacheKey {
+    uint32_t rows = 0u;
+    uint32_t cols = 0u;
+    uint32_t columns = 0u;
+
+    bool operator<(const AlgoCacheKey &other) const {
+        if (rows != other.rows) return rows < other.rows;
+        if (cols != other.cols) return cols < other.cols;
+        return columns < other.columns;
+    }
+};
+
+struct AlgoCacheValue {
+    cublasLtMatmulHeuristicResult_t heuristic{};
+    uint32_t candidate_index = 0u;
+    uint32_t candidate_count = 0u;
+    float milliseconds = 0.0f;
+};
+
+std::atomic_flag g_algo_cache_lock = ATOMIC_FLAG_INIT;
+std::map<AlgoCacheKey, AlgoCacheValue> g_algo_cache;
+
+struct AlgoCacheGuard {
+    AlgoCacheGuard() {
+        while (g_algo_cache_lock.test_and_set(std::memory_order_acquire)) {}
+    }
+    ~AlgoCacheGuard() {
+        g_algo_cache_lock.clear(std::memory_order_release);
+    }
+};
+
+bool nvfp4_candidate_is_exact(
+        cublasLtHandle_t handle,
+        Projection *projection,
+        MatmulPlan *plan,
+        float *reference,
+        float *candidate_output,
+        uint32_t *mismatch_device,
+        void *workspace,
+        size_t input_bytes,
+        size_t scale_bytes,
+        uint64_t output_elements,
+        const cublasLtMatmulHeuristicResult_t &reference_candidate,
+        const cublasLtMatmulHeuristicResult_t &candidate,
+        cudaStream_t stream) {
+    if (!handle || !projection || !plan || !reference || !candidate_output ||
+        !mismatch_device || !workspace || !stream || input_bytes == 0u ||
+        scale_bytes == 0u || output_elements == 0u) {
+        return false;
+    }
+    constexpr uint32_t kValidationPatterns = 3u;
+    constexpr uint32_t kPatternSeeds[kValidationPatterns] = {
+            0x243f6a88u, 0x9e3779b9u, 0xb7e15162u};
+    const float beta = 0.0f;
+    const uint64_t input_grid =
+            (input_bytes + kAutotuneCompareThreads - 1u) / kAutotuneCompareThreads;
+    const uint64_t scale_grid =
+            (scale_bytes + kAutotuneCompareThreads - 1u) / kAutotuneCompareThreads;
+    const uint64_t output_grid =
+            (output_elements + kAutotuneCompareThreads - 1u) / kAutotuneCompareThreads;
+    if (input_grid > std::numeric_limits<uint32_t>::max() ||
+        scale_grid > std::numeric_limits<uint32_t>::max() ||
+        output_grid > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    for (uint32_t pattern = 0u; pattern < kValidationPatterns; ++pattern) {
+        nvfp4_autotune_packed_pattern_kernel<<<
+                static_cast<uint32_t>(input_grid), kAutotuneCompareThreads, 0, stream>>>(
+                projection->input_packed, input_bytes, kPatternSeeds[pattern]);
+        nvfp4_autotune_scale_pattern_kernel<<<
+                static_cast<uint32_t>(scale_grid), kAutotuneCompareThreads, 0, stream>>>(
+                projection->input_scale_tc, scale_bytes, kPatternSeeds[pattern]);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        cublasStatus_t status = cublasLtMatmul(
+                handle, projection->desc, &projection->alpha,
+                projection->weight, projection->a_layout,
+                projection->input_packed, plan->b_layout,
+                &beta, reference, plan->c_layout, reference, plan->d_layout,
+                &reference_candidate.algo, workspace,
+                reference_candidate.workspaceSize, stream);
+        if (status != CUBLAS_STATUS_SUCCESS) return false;
+        status = cublasLtMatmul(
+                handle, projection->desc, &projection->alpha,
+                projection->weight, projection->a_layout,
+                projection->input_packed, plan->b_layout,
+                &beta, candidate_output, plan->c_layout, candidate_output, plan->d_layout,
+                &candidate.algo, workspace, candidate.workspaceSize, stream);
+        if (status != CUBLAS_STATUS_SUCCESS) return false;
+        uint32_t mismatch = 1u;
+        cudaError_t compare_status = cudaMemsetAsync(
+                mismatch_device, 0, sizeof(uint32_t), stream);
+        if (compare_status == cudaSuccess) {
+            nvfp4_exact_output_compare_kernel<<<
+                    static_cast<uint32_t>(output_grid), kAutotuneCompareThreads, 0, stream>>>(
+                    reference, candidate_output, output_elements, mismatch_device);
+            compare_status = cudaGetLastError();
+        }
+        if (compare_status == cudaSuccess) compare_status = cudaMemcpyAsync(
+                &mismatch, mismatch_device, sizeof(uint32_t),
+                cudaMemcpyDeviceToHost, stream);
+        if (compare_status == cudaSuccess) compare_status = cudaStreamSynchronize(stream);
+        if (compare_status != cudaSuccess || mismatch != 0u) return false;
+    }
+    return true;
+}
+
+/* cuBLASLt's heuristic order is a useful default, but it is not a measured
+ * ordering for this exact Blackwell GPU/driver/shape.  When explicitly
+ * enabled, benchmark the returned M8 candidates once per unique projection
+ * geometry and reuse the winning algorithm for every layer.  The operation
+ * is load-time only; serving and CUDA graph capture remain allocation-free. */
+cublasStatus_t select_projection_algorithm(
+        cublasLtHandle_t handle,
+        Projection *projection,
+        MatmulPlan *plan,
+        cublasLtMatmulPreference_t preference,
+        uint32_t columns) {
+    if (!handle || !projection || !plan || !preference || columns == 0u) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    const bool tune = nvfp4_autotune_enabled() &&
+            columns == AXIOM_QWEN38_NVFP4_TC_BATCH;
+    const AlgoCacheKey key{projection->rows, projection->cols, columns};
+    if (tune) {
+        AlgoCacheGuard guard;
+        const auto cached = g_algo_cache.find(key);
+        if (cached != g_algo_cache.end()) {
+            plan->algo = cached->second.heuristic;
+            return CUBLAS_STATUS_SUCCESS;
+        }
+    }
+
+    constexpr int kMaxCandidates = 32;
+    cublasLtMatmulHeuristicResult_t candidates[kMaxCandidates]{};
+    int returned = 0;
+    cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
+            handle, projection->desc, projection->a_layout, plan->b_layout,
+            plan->c_layout, plan->d_layout, preference,
+            tune ? kMaxCandidates : 1, candidates, &returned);
+    if (status != CUBLAS_STATUS_SUCCESS || returned < 1) {
+        return status == CUBLAS_STATUS_SUCCESS
+                ? CUBLAS_STATUS_NOT_SUPPORTED : status;
+    }
+    plan->algo = candidates[0];
+    if (!tune || returned == 1) {
+        if (tune) {
+            {
+                AlgoCacheGuard guard;
+                g_algo_cache.emplace(key, AlgoCacheValue{
+                        candidates[0], 0u, static_cast<uint32_t>(returned), 0.0f});
+            }
+            std::fprintf(stderr,
+                         "axiom-qwen38-nvfp4: autotune rows=%u cols=%u columns=%u "
+                         "candidates=%d selected=0 measured_ms=0\n",
+                         projection->rows, projection->cols, columns, returned);
+        }
+        return CUBLAS_STATUS_SUCCESS;
+    }
+
+    void *workspace = nullptr;
+    float *output = nullptr;
+    float *reference = nullptr;
+    uint32_t *mismatch_device = nullptr;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t begin = nullptr;
+    cudaEvent_t end = nullptr;
+    const size_t input_bytes =
+            static_cast<size_t>(projection->cols / 2u) * columns;
+    const size_t scale_bytes = scale_view_bytes(columns, projection->groups);
+    const size_t output_bytes =
+            static_cast<size_t>(projection->rows) * columns * sizeof(float);
+    const uint64_t output_elements =
+            static_cast<uint64_t>(projection->rows) * columns;
+    cudaError_t cuda_status = cudaMalloc(&workspace, kLtWorkspaceBytes);
+    if (cuda_status == cudaSuccess) cuda_status = cudaMalloc(&output, output_bytes);
+    if (cuda_status == cudaSuccess) cuda_status = cudaMalloc(&reference, output_bytes);
+    if (cuda_status == cudaSuccess) cuda_status = cudaMalloc(&mismatch_device, sizeof(uint32_t));
+    if (cuda_status == cudaSuccess) cuda_status = cudaStreamCreateWithFlags(
+            &stream, cudaStreamNonBlocking);
+    if (cuda_status == cudaSuccess) cuda_status = cudaEventCreate(&begin);
+    if (cuda_status == cudaSuccess) cuda_status = cudaEventCreate(&end);
+    constexpr uint32_t kWarmupRuns = 2u;
+    constexpr uint32_t kMeasuredRuns = 20u;
+    constexpr float kMinimumSpeedup = 1.03f;
+    constexpr float kCandidateReplacementSpeedup = 1.03f;
+    const float beta = 0.0f;
+    uint32_t best_index = 0u;
+    uint32_t exact_candidates = 0u;
+    float best_ms = std::numeric_limits<float>::infinity();
+    float baseline_ms = std::numeric_limits<float>::infinity();
+    if (cuda_status == cudaSuccess) {
+        for (int candidate = 0; candidate < returned; ++candidate) {
+            if (candidates[candidate].state != CUBLAS_STATUS_SUCCESS ||
+                candidates[candidate].workspaceSize > kLtWorkspaceBytes) {
+                continue;
+            }
+            const bool exact = candidate == 0 || nvfp4_candidate_is_exact(
+                    handle, projection, plan, reference, output, mismatch_device,
+                    workspace, input_bytes, scale_bytes, output_elements,
+                    candidates[0], candidates[candidate], stream);
+            if (!exact) {
+                (void)cudaGetLastError();
+                continue;
+            }
+            ++exact_candidates;
+            const uint64_t input_grid =
+                    (input_bytes + kAutotuneCompareThreads - 1u) /
+                    kAutotuneCompareThreads;
+            const uint64_t scale_grid =
+                    (scale_bytes + kAutotuneCompareThreads - 1u) /
+                    kAutotuneCompareThreads;
+            nvfp4_autotune_packed_pattern_kernel<<<
+                    static_cast<uint32_t>(input_grid), kAutotuneCompareThreads, 0, stream>>>(
+                    projection->input_packed, input_bytes, 0xd1b54a35u);
+            nvfp4_autotune_scale_pattern_kernel<<<
+                    static_cast<uint32_t>(scale_grid), kAutotuneCompareThreads, 0, stream>>>(
+                    projection->input_scale_tc, scale_bytes, 0xd1b54a35u);
+            if (cudaGetLastError() != cudaSuccess) continue;
+            cublasStatus_t run_status = CUBLAS_STATUS_SUCCESS;
+            for (uint32_t run = 0u; run < kWarmupRuns &&
+                 run_status == CUBLAS_STATUS_SUCCESS; ++run) {
+                run_status = cublasLtMatmul(
+                        handle, projection->desc, &projection->alpha,
+                        projection->weight, projection->a_layout,
+                        projection->input_packed, plan->b_layout,
+                        &beta, output, plan->c_layout, output, plan->d_layout,
+                        &candidates[candidate].algo, workspace,
+                        candidates[candidate].workspaceSize, stream);
+            }
+            if (run_status != CUBLAS_STATUS_SUCCESS ||
+                cudaStreamSynchronize(stream) != cudaSuccess ||
+                cudaEventRecord(begin, stream) != cudaSuccess) {
+                (void)cudaGetLastError();
+                continue;
+            }
+            for (uint32_t run = 0u; run < kMeasuredRuns &&
+                 run_status == CUBLAS_STATUS_SUCCESS; ++run) {
+                run_status = cublasLtMatmul(
+                        handle, projection->desc, &projection->alpha,
+                        projection->weight, projection->a_layout,
+                        projection->input_packed, plan->b_layout,
+                        &beta, output, plan->c_layout, output, plan->d_layout,
+                        &candidates[candidate].algo, workspace,
+                        candidates[candidate].workspaceSize, stream);
+            }
+            float elapsed_ms = 0.0f;
+            if (run_status != CUBLAS_STATUS_SUCCESS ||
+                cudaEventRecord(end, stream) != cudaSuccess ||
+                cudaEventSynchronize(end) != cudaSuccess ||
+                cudaEventElapsedTime(&elapsed_ms, begin, end) != cudaSuccess) {
+                (void)cudaGetLastError();
+                continue;
+            }
+            const float per_call_ms = elapsed_ms / kMeasuredRuns;
+            if (candidate == 0) baseline_ms = per_call_ms;
+            if (!std::isfinite(best_ms) ||
+                per_call_ms * kCandidateReplacementSpeedup < best_ms) {
+                best_ms = per_call_ms;
+                best_index = static_cast<uint32_t>(candidate);
+            }
+        }
+    }
+    if (end) (void)cudaEventDestroy(end);
+    if (begin) (void)cudaEventDestroy(begin);
+    if (stream) (void)cudaStreamDestroy(stream);
+    if (mismatch_device) (void)cudaFree(mismatch_device);
+    if (reference) (void)cudaFree(reference);
+    if (output) (void)cudaFree(output);
+    if (workspace) (void)cudaFree(workspace);
+
+    if (!std::isfinite(best_ms)) {
+        best_index = 0u;
+        best_ms = 0.0f;
+    } else if (best_index != 0u &&
+               (!std::isfinite(baseline_ms) || best_ms * kMinimumSpeedup >= baseline_ms)) {
+        best_index = 0u;
+        best_ms = baseline_ms;
+    }
+    plan->algo = candidates[best_index];
+    {
+        AlgoCacheGuard guard;
+        g_algo_cache.emplace(
+                key, AlgoCacheValue{candidates[best_index], best_index,
+                                    static_cast<uint32_t>(returned), best_ms});
+    }
+    int algo_id = -1;
+    int split_k = 0;
+    size_t written = 0u;
+    (void)cublasLtMatmulAlgoConfigGetAttribute(
+            &candidates[best_index].algo, CUBLASLT_ALGO_CONFIG_ID,
+            &algo_id, sizeof(algo_id), &written);
+    (void)cublasLtMatmulAlgoConfigGetAttribute(
+            &candidates[best_index].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+            &split_k, sizeof(split_k), &written);
+    std::fprintf(stderr,
+                 "axiom-qwen38-nvfp4: autotune rows=%u cols=%u columns=%u "
+                 "candidates=%d exact=%u selected=%u algo=%d split_k=%d baseline_ms=%.6f "
+                 "measured_ms=%.6f workspace=%zu\n",
+                 projection->rows, projection->cols, columns, returned,
+                 exact_candidates, best_index, algo_id, split_k, static_cast<double>(baseline_ms),
+                 static_cast<double>(best_ms), candidates[best_index].workspaceSize);
+    return CUBLAS_STATUS_SUCCESS;
 }
 
 int read_projection_host_data(
@@ -445,15 +899,9 @@ int upload_projection(
             lt_status = cublasLtMatrixLayoutCreate(
                     &plan.d_layout, CUDA_R_32F, rows, columns, rows);
         }
-        int returned = 0;
         if (lt_status == CUBLAS_STATUS_SUCCESS) {
-            lt_status = cublasLtMatmulAlgoGetHeuristic(
-                    handle, projection.desc, projection.a_layout, plan.b_layout,
-                    plan.c_layout, plan.d_layout, preference, 1,
-                    &plan.algo, &returned);
-        }
-        if (lt_status == CUBLAS_STATUS_SUCCESS && returned != 1) {
-            lt_status = CUBLAS_STATUS_NOT_SUPPORTED;
+            lt_status = select_projection_algorithm(
+                    handle, &projection, &plan, preference, columns);
         }
     }
     if (preference) (void)cublasLtMatmulPreferenceDestroy(preference);
@@ -620,11 +1068,24 @@ int projection_run(
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
     constexpr uint32_t threads = 128u;
-    const uint32_t grid_x = (projection->groups + threads - 1u) / threads;
     const uint32_t inner_tiles = (projection->groups + 3u) / 4u;
-    quantize_batch_to_tc_kernel<<<dim3(grid_x, columns), threads, 0, stream>>>(
-            input, projection->input_global, projection->input_packed, projection->input_scale_tc,
-            projection->cols, projection->groups, inner_tiles, columns);
+    if (nvfp4_warp_quant_enabled()) {
+        constexpr uint32_t warp_threads = 256u;
+        constexpr uint32_t groups_per_block = warp_threads / kGroup;
+        const uint32_t total_groups = projection->groups * columns;
+        quantize_batch_to_tc_warp_kernel<<<
+                (total_groups + groups_per_block - 1u) / groups_per_block,
+                warp_threads, 0, stream>>>(
+                input, projection->input_global, projection->input_packed,
+                projection->input_scale_tc, projection->cols, projection->groups,
+                inner_tiles, columns);
+    } else {
+        const uint32_t grid_x = (projection->groups + threads - 1u) / threads;
+        quantize_batch_to_tc_kernel<<<dim3(grid_x, columns), threads, 0, stream>>>(
+                input, projection->input_global, projection->input_packed,
+                projection->input_scale_tc, projection->cols, projection->groups,
+                inner_tiles, columns);
+    }
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
     return projection_matmul(
             projection, handle, workspace, output, columns, stream);
@@ -767,14 +1228,27 @@ extern "C" int axiom_qwen38_nvfp4_mlp_forward_f32_device_m(
                 input, mlp->gate_up.output, columns, cuda_stream);
         if (rc != AXIOM_OK) return rc;
         constexpr uint32_t threads = 128u;
-        const uint32_t grid_x = (mlp->down.groups + threads - 1u) / threads;
         const uint32_t inner_tiles = (mlp->down.groups + 3u) / 4u;
-        silu_mul_quantize_batch_to_tc_kernel<<<
-                dim3(grid_x, columns), threads, 0, cuda_stream>>>(
-                mlp->gate_up.output, mlp->down.input_global,
-                mlp->down.input_packed, mlp->down.input_scale_tc,
-                AXIOM_QWEN38_NVFP4_FFN, mlp->down.groups,
-                inner_tiles, columns);
+        if (nvfp4_warp_quant_enabled()) {
+            constexpr uint32_t warp_threads = 256u;
+            constexpr uint32_t groups_per_block = warp_threads / kGroup;
+            const uint32_t total_groups = mlp->down.groups * columns;
+            silu_mul_quantize_batch_to_tc_warp_kernel<<<
+                    (total_groups + groups_per_block - 1u) / groups_per_block,
+                    warp_threads, 0, cuda_stream>>>(
+                    mlp->gate_up.output, mlp->down.input_global,
+                    mlp->down.input_packed, mlp->down.input_scale_tc,
+                    AXIOM_QWEN38_NVFP4_FFN, mlp->down.groups,
+                    inner_tiles, columns);
+        } else {
+            const uint32_t grid_x = (mlp->down.groups + threads - 1u) / threads;
+            silu_mul_quantize_batch_to_tc_kernel<<<
+                    dim3(grid_x, columns), threads, 0, cuda_stream>>>(
+                    mlp->gate_up.output, mlp->down.input_global,
+                    mlp->down.input_packed, mlp->down.input_scale_tc,
+                    AXIOM_QWEN38_NVFP4_FFN, mlp->down.groups,
+                    inner_tiles, columns);
+        }
         if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
         return projection_matmul(
                 &mlp->down, mlp->handle, mlp->workspace,

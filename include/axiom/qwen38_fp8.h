@@ -130,6 +130,22 @@ int axiom_qwen38_fp8_linear_forward_f32_device(
         float *out,
         void *stream);
 
+/* Split form for shape-identical ModelOpt projections. Prepare quantizes one
+ * F32 batch into `prepared`; subsequent projections consume those exact FP8
+ * bytes without quantizing the same input again. Producer and consumer must
+ * have identical device, K dimension, and bit-identical static input scale.
+ * Stream ordering remains the caller's responsibility. */
+int axiom_qwen38_fp8_linear_prepare_input_f32_device(
+        axiom_qwen38_fp8_linear *prepared,
+        const float *input,
+        void *stream);
+
+int axiom_qwen38_fp8_linear_forward_prepared_f32_device(
+        axiom_qwen38_fp8_linear *linear,
+        const axiom_qwen38_fp8_linear *prepared,
+        float *out,
+        void *stream);
+
 /* Numerical gate entry: force the CUDA reference dot product even when a
  * cuBLASLt tensor-core heuristic is available. */
 int axiom_qwen38_fp8_linear_forward_reference_f32_device(

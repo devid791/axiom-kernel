@@ -1,9 +1,11 @@
 # Public release scope
 
-This repository is a fresh public source snapshot derived from the internal
-source commit `7945f8bf595039c5e3be50896b16bdf86ca3fa1c`. The internal history,
-production branch names and deployment evidence are not copied into the public
-Git history.
+This repository is a fresh public source snapshot. Its Qwen3.8 performance
+update is derived from the reviewed kernel commit
+`41403d5fed91f3481d92ae111e83fa75f544dcbb`; the initial public snapshot was
+derived from `7945f8bf595039c5e3be50896b16bdf86ca3fa1c`. Internal history,
+production branch names and private deployment artifacts are not copied into
+the public Git history.
 
 Included:
 
@@ -13,6 +15,10 @@ Included:
 - generic engine contracts, reasoning profiles and swarm scheduler;
 - public tests, probes, FlashInfer source and its license/notice;
 - build and reproducibility documentation.
+
+The performance table publishes aggregate measurements and an output digest
+from the production fixture. It does not publish network identities, local
+paths, service configuration, model artifacts or credentials.
 
 Excluded deliberately:
 

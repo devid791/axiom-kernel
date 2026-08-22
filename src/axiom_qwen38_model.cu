@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <limits>
@@ -33,6 +34,7 @@ constexpr uint32_t kLayers = 64u;
 constexpr uint32_t kBatch = 8u;
 constexpr uint32_t kVocab = 248320u;
 constexpr uint32_t kThreads = 256u;
+constexpr uint32_t kTop1Blocks = 256u;
 constexpr uint32_t kTargetTapCount = AXIOM_QWEN38_MODEL_DSPARK_TARGET_TAP_COUNT;
 constexpr uint32_t kTemporalWidth = AXIOM_QWEN38_MODEL_DSPARK_TEMPORAL_VERIFY_WIDTH;
 constexpr uint32_t kTargetAttentionLayers = 16u;
@@ -398,6 +400,135 @@ __global__ void qwen38_top1_8_kernel(
     }
 }
 
+__device__ __forceinline__ void qwen38_top1_select(
+        const float candidate_value,
+        const uint32_t candidate_id,
+        float *best_value,
+        uint32_t *best_id) {
+    if (candidate_value > *best_value ||
+        (candidate_value == *best_value && candidate_id < *best_id)) {
+        *best_value = candidate_value;
+        *best_id = candidate_id;
+    }
+}
+
+__device__ __forceinline__ void qwen38_top1_warp_reduce(
+        float *best_value,
+        uint32_t *best_id,
+        uint32_t *invalid) {
+    constexpr uint32_t mask = 0xffffffffu;
+    for (uint32_t offset = 16u; offset != 0u; offset >>= 1u) {
+        const float candidate_value = __shfl_down_sync(mask, *best_value, offset);
+        const uint32_t candidate_id = __shfl_down_sync(mask, *best_id, offset);
+        const uint32_t candidate_invalid = __shfl_down_sync(mask, *invalid, offset);
+        qwen38_top1_select(candidate_value, candidate_id, best_value, best_id);
+        *invalid |= candidate_invalid;
+    }
+}
+
+__global__ void qwen38_top1_8_stage1_kernel(
+        const float *__restrict__ logits,
+        qwen38_top1_result *__restrict__ partials) {
+    const uint32_t column = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (column >= kBatch) return;
+    const float *column_logits = logits + static_cast<uint64_t>(column) * kVocab;
+    float best_value = -CUDART_INF_F;
+    uint32_t best_id = UINT32_MAX;
+    uint32_t invalid = 0u;
+    for (uint32_t token = blockIdx.x * blockDim.x + tid;
+         token < kVocab;
+         token += gridDim.x * blockDim.x) {
+        const float value = column_logits[token];
+        if (!isfinite(value)) invalid = 1u;
+        else qwen38_top1_select(value, token, &best_value, &best_id);
+    }
+    qwen38_top1_warp_reduce(&best_value, &best_id, &invalid);
+    __shared__ float warp_values[kThreads / 32u];
+    __shared__ uint32_t warp_ids[kThreads / 32u];
+    __shared__ uint32_t warp_invalids[kThreads / 32u];
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (lane == 0u) {
+        warp_values[warp] = best_value;
+        warp_ids[warp] = best_id;
+        warp_invalids[warp] = invalid;
+    }
+    __syncthreads();
+    if (warp == 0u) {
+        best_value = lane < kThreads / 32u ? warp_values[lane] : -CUDART_INF_F;
+        best_id = lane < kThreads / 32u ? warp_ids[lane] : UINT32_MAX;
+        invalid = lane < kThreads / 32u ? warp_invalids[lane] : 0u;
+        qwen38_top1_warp_reduce(&best_value, &best_id, &invalid);
+        if (lane == 0u) {
+            qwen38_top1_result &partial = partials[
+                    static_cast<uint64_t>(column) * kTop1Blocks + blockIdx.x];
+            partial.value = best_value;
+            partial.token_id = best_id;
+            partial.invalid = invalid;
+        }
+    }
+}
+
+__global__ void qwen38_top1_8_stage2_kernel(
+        const qwen38_top1_result *__restrict__ partials,
+        qwen38_top1_result *__restrict__ results) {
+    const uint32_t column = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (column >= kBatch) return;
+    const qwen38_top1_result partial = partials[
+            static_cast<uint64_t>(column) * kTop1Blocks + tid];
+    float best_value = partial.value;
+    uint32_t best_id = partial.token_id;
+    uint32_t invalid = partial.invalid;
+    qwen38_top1_warp_reduce(&best_value, &best_id, &invalid);
+    __shared__ float warp_values[kThreads / 32u];
+    __shared__ uint32_t warp_ids[kThreads / 32u];
+    __shared__ uint32_t warp_invalids[kThreads / 32u];
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (lane == 0u) {
+        warp_values[warp] = best_value;
+        warp_ids[warp] = best_id;
+        warp_invalids[warp] = invalid;
+    }
+    __syncthreads();
+    if (warp == 0u) {
+        best_value = lane < kThreads / 32u ? warp_values[lane] : -CUDART_INF_F;
+        best_id = lane < kThreads / 32u ? warp_ids[lane] : UINT32_MAX;
+        invalid = lane < kThreads / 32u ? warp_invalids[lane] : 0u;
+        qwen38_top1_warp_reduce(&best_value, &best_id, &invalid);
+        if (lane == 0u) {
+            results[column].value = best_value;
+            results[column].token_id = best_id;
+            results[column].invalid = invalid;
+        }
+    }
+}
+
+bool hierarchical_top1_enabled() {
+    const char *value = std::getenv("AXIOM_QWEN38_TARGET_HIERARCHICAL_TOP1");
+    return !(value && value[0] == '0' && value[1] == '\0');
+}
+
+int launch_qwen38_top1_8(
+        const float *logits,
+        qwen38_top1_result *partials,
+        qwen38_top1_result *results,
+        cudaStream_t stream) {
+    if (!logits || !results) return AXIOM_ERR_INVALID_ARGUMENT;
+    if (hierarchical_top1_enabled()) {
+        if (!partials) return AXIOM_ERR_INVALID_ARGUMENT;
+        qwen38_top1_8_stage1_kernel<<<
+                dim3(kTop1Blocks, kBatch), kThreads, 0, stream>>>(logits, partials);
+        if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        qwen38_top1_8_stage2_kernel<<<kBatch, kThreads, 0, stream>>>(partials, results);
+    } else {
+        qwen38_top1_8_kernel<<<kBatch, kThreads, 0, stream>>>(logits, results);
+    }
+    return cudaGetLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
+}
+
 /* The legacy top-1 ABI is compact per-column structs. The graph controller
  * needs contiguous temporal ID/logit arrays, so split them once on device. */
 __global__ void qwen38_split_top1_8_kernel(
@@ -468,6 +599,7 @@ struct axiom_qwen38_model {
     axiom_device_buffer *final_hidden = nullptr;
     axiom_device_buffer *logits = nullptr;
     axiom_device_buffer *top1_results = nullptr;
+    axiom_device_buffer *top1_partials = nullptr;
     axiom_device_buffer *device_target_token_ids = nullptr;
     axiom_device_buffer *device_target_logits = nullptr;
 
@@ -521,6 +653,7 @@ extern "C" void axiom_qwen38_model_destroy(axiom_qwen38_model *model) {
     axiom_device_buffer_destroy(model->norm);
     axiom_device_buffer_destroy(model->mixer);
     axiom_device_buffer_destroy(model->hidden);
+    axiom_device_buffer_destroy(model->top1_partials);
     axiom_device_buffer_destroy(model->top1_results);
     axiom_device_buffer_destroy(model->device_target_logits);
     axiom_device_buffer_destroy(model->device_target_token_ids);
@@ -653,6 +786,11 @@ extern "C" int axiom_qwen38_model_create(
     }
     if (rc == AXIOM_OK) {
         rc = axiom_device_buffer_create(
+                model->runtime, &model->top1_partials,
+                static_cast<uint64_t>(kBatch) * kTop1Blocks * sizeof(qwen38_top1_result));
+    }
+    if (rc == AXIOM_OK) {
+        rc = axiom_device_buffer_create(
                 model->runtime, &model->device_target_token_ids,
                 static_cast<uint64_t>(kBatch) * sizeof(uint32_t));
     }
@@ -693,6 +831,7 @@ extern "C" int axiom_qwen38_model_create(
         hidden_batch_bytes, hidden_batch_bytes, hidden_batch_bytes, hidden_batch_bytes,
         logits_batch_bytes, static_cast<uint64_t>(kBatch) * sizeof(uint32_t),
         static_cast<uint64_t>(kBatch) * sizeof(qwen38_top1_result),
+        static_cast<uint64_t>(kBatch) * kTop1Blocks * sizeof(qwen38_top1_result),
         static_cast<uint64_t>(kBatch) * sizeof(uint32_t),
         static_cast<uint64_t>(kBatch) * sizeof(float),
         temporal_taps_bytes, temporal_taps_bytes, prefill_taps_bytes,
@@ -817,11 +956,15 @@ extern "C" int axiom_qwen38_model_restore_position(
     if (!model || position > model->max_context || model->active_transaction) {
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
+    const bool materialize_device_position = model->device_position_authoritative;
     int rc = AXIOM_OK;
     for (uint32_t layer = 0u; layer < kLayers && rc == AXIOM_OK; ++layer) {
         if (model->layers[layer].attention) {
-            rc = axiom_qwen38_attention_layer_restore_position(
-                    model->layers[layer].attention, position);
+            rc = materialize_device_position
+                    ? axiom_qwen38_attention_layer_materialize_device_position(
+                            model->layers[layer].attention, position)
+                    : axiom_qwen38_attention_layer_restore_position(
+                            model->layers[layer].attention, position);
         }
     }
     if (rc == AXIOM_OK) {
@@ -831,6 +974,32 @@ extern "C" int axiom_qwen38_model_restore_position(
         model->device_position_authoritative = false;
     }
     return rc;
+}
+
+extern "C" int axiom_qwen38_model_committed_history_install(
+        axiom_qwen38_model *model,
+        const uint32_t *token_ids,
+        const uint32_t token_count) {
+    if (!model || model->active_transaction || model->device_position_authoritative ||
+        token_count != model->position || token_count > model->max_context ||
+        (token_count != 0u && !token_ids)) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    for (uint32_t index = 0u; index < token_count; ++index) {
+        if (token_ids[index] >= kVocab) return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    try {
+        if (token_count == 0u) {
+            model->committed_tokens.clear();
+        } else {
+            model->committed_tokens.assign(token_ids, token_ids + token_count);
+        }
+    } catch (...) {
+        model->committed_history_valid = false;
+        return AXIOM_ERR_BUDGET;
+    }
+    model->committed_history_valid = true;
+    return AXIOM_OK;
 }
 
 extern "C" int axiom_qwen38_model_kv_page_export(
@@ -1000,6 +1169,7 @@ int qwen38_model_forward_batch8_internal(
     void *final_hidden = nullptr;
     void *logits = nullptr;
     void *top1_results = nullptr;
+    void *top1_partials = nullptr;
     void *scalar_capture_taps = nullptr;
     int rc = embedding_override_device ? AXIOM_OK : buffer_pointer(model->embedding, &embedding);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->token_ids, &token_ids_device);
@@ -1010,6 +1180,7 @@ int qwen38_model_forward_batch8_internal(
     if (rc == AXIOM_OK) rc = buffer_pointer(model->final_hidden, &final_hidden);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->logits, &logits);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->top1_results, &top1_results);
+    if (rc == AXIOM_OK) rc = buffer_pointer(model->top1_partials, &top1_partials);
     if (rc == AXIOM_OK && model->scalar_tap_capture_active) {
         rc = buffer_pointer(model->validation_taps, &scalar_capture_taps);
     }
@@ -1084,9 +1255,11 @@ int qwen38_model_forward_batch8_internal(
                 static_cast<float *>(logits), nullptr);
     }
     if (rc != AXIOM_OK) return rc;
-    qwen38_top1_8_kernel<<<kBatch, kThreads>>>(
-            static_cast<const float *>(logits), static_cast<qwen38_top1_result *>(top1_results));
-    if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+    rc = launch_qwen38_top1_8(
+            static_cast<const float *>(logits),
+            static_cast<qwen38_top1_result *>(top1_partials),
+            static_cast<qwen38_top1_result *>(top1_results), nullptr);
+    if (rc != AXIOM_OK) return rc;
     qwen38_top1_result results[kBatch]{};
     status = cudaMemcpy(
             results, top1_results, sizeof(results), cudaMemcpyDeviceToHost);
@@ -1521,6 +1694,7 @@ int model_transaction_verify_block8_enqueue(
     void *final_hidden = nullptr;
     void *logits = nullptr;
     void *top1_results = nullptr;
+    void *top1_partials = nullptr;
     void *temporal_taps = nullptr;
     int rc = embedding_override_device ? AXIOM_OK : buffer_pointer(model->embedding, &embedding);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->hidden, &hidden);
@@ -1530,6 +1704,7 @@ int model_transaction_verify_block8_enqueue(
     if (rc == AXIOM_OK) rc = buffer_pointer(model->final_hidden, &final_hidden);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->logits, &logits);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->top1_results, &top1_results);
+    if (rc == AXIOM_OK) rc = buffer_pointer(model->top1_partials, &top1_partials);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->temporal_taps, &temporal_taps);
     if (rc != AXIOM_OK) return rc;
     if (cudaSetDevice(model->device) != cudaSuccess) return AXIOM_ERR_CUDA;
@@ -1600,9 +1775,11 @@ int model_transaction_verify_block8_enqueue(
                 static_cast<float *>(logits), cuda_stream);
     }
     if (rc != AXIOM_OK) return rc;
-    qwen38_top1_8_kernel<<<kBatch, kThreads, 0, cuda_stream>>>(
-            static_cast<const float *>(logits), static_cast<qwen38_top1_result *>(top1_results));
-    if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+    rc = launch_qwen38_top1_8(
+            static_cast<const float *>(logits),
+            static_cast<qwen38_top1_result *>(top1_partials),
+            static_cast<qwen38_top1_result *>(top1_results), cuda_stream);
+    if (rc != AXIOM_OK) return rc;
 
     out->snapshot_position = transaction->snapshot_position;
     out->position_after_verify = transaction->snapshot_position + kTemporalWidth;
@@ -1645,6 +1822,7 @@ int model_device_transaction_verify_block8_enqueue(
     void *final_hidden = nullptr;
     void *logits = nullptr;
     void *top1_results = nullptr;
+    void *top1_partials = nullptr;
     void *temporal_taps = nullptr;
     void *device_token_ids = nullptr;
     void *device_top1_logits = nullptr;
@@ -1656,6 +1834,7 @@ int model_device_transaction_verify_block8_enqueue(
     if (rc == AXIOM_OK) rc = buffer_pointer(model->final_hidden, &final_hidden);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->logits, &logits);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->top1_results, &top1_results);
+    if (rc == AXIOM_OK) rc = buffer_pointer(model->top1_partials, &top1_partials);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->temporal_taps, &temporal_taps);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->device_target_token_ids, &device_token_ids);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->device_target_logits, &device_top1_logits);
@@ -1726,9 +1905,11 @@ int model_device_transaction_verify_block8_enqueue(
                 static_cast<float *>(logits), cuda_stream);
     }
     if (rc != AXIOM_OK) return rc;
-    qwen38_top1_8_kernel<<<kBatch, kThreads, 0, cuda_stream>>>(
-            static_cast<const float *>(logits), static_cast<qwen38_top1_result *>(top1_results));
-    if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+    rc = launch_qwen38_top1_8(
+            static_cast<const float *>(logits),
+            static_cast<qwen38_top1_result *>(top1_partials),
+            static_cast<qwen38_top1_result *>(top1_results), cuda_stream);
+    if (rc != AXIOM_OK) return rc;
     qwen38_split_top1_8_kernel<<<1u, kThreads, 0, cuda_stream>>>(
             static_cast<const qwen38_top1_result *>(top1_results),
             static_cast<uint32_t *>(device_token_ids), static_cast<float *>(device_top1_logits));
