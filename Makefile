@@ -65,9 +65,10 @@ CORE_OBJECTS := $(CORE_CPP_OBJECTS) $(CORE_CU_OBJECTS)
 
 COMMON_LINK_LIBS := $(CUDA_LDFLAGS) $(CUDA_LIBS) $(VISION_LINK_LIBS) $(MEDIA_LINK_LIBS)
 
-.PHONY: all clean check public-scan host-tests smoke qwen38-generate qwen38-temporal-gate qwen38-speculative-graph-gate qwen38-paged-runtime-gate install cuda-check
+.PHONY: all clean check public-scan host-tests smoke qwen38-generate qwen38-temporal-gate qwen38-speculative-graph-gate qwen38-paged-runtime-gate qwen38-dspark-abi-gate install cuda-check
 
-all: cuda-check $(LIB_DIR)/libaxiom.so $(BIN_DIR)/axiom-qwen38-generate host-tests
+all: cuda-check $(LIB_DIR)/libaxiom.so $(BIN_DIR)/axiom-qwen38-generate \
+     $(BIN_DIR)/axiom-qwen38-dspark-abi-gate host-tests
 
 cuda-check:
 	@test -x "$(NVCC)" || { echo "Axiom CUDA build requires nvcc at $(NVCC); host-only tests remain available via make host-tests" >&2; exit 2; }
@@ -115,6 +116,15 @@ $(BIN_DIR)/axiom-qwen38-paged-runtime-gate: $(BUILD_DIR)/axiom_qwen38_paged_runt
 	$(CXX) -o $@ $< -L$(LIB_DIR) -laxiom $(COMMON_LINK_LIBS) -Wl,-rpath,'$$ORIGIN/../lib'
 
 qwen38-paged-runtime-gate: $(BIN_DIR)/axiom-qwen38-paged-runtime-gate
+
+$(BUILD_DIR)/axiom_qwen38_dspark_abi_gate.o: tests/axiom_qwen38_dspark_abi_gate.cpp include/axiom/axiom.h include/axiom/qwen38_dspark_compute.h | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+$(BIN_DIR)/axiom-qwen38-dspark-abi-gate: $(BUILD_DIR)/axiom_qwen38_dspark_abi_gate.o $(LIB_DIR)/libaxiom.so | $(BIN_DIR)
+	$(CXX) -o $@ $< -L$(LIB_DIR) -laxiom $(COMMON_LINK_LIBS) -Wl,-rpath,'$$ORIGIN/../lib'
+
+qwen38-dspark-abi-gate: $(BIN_DIR)/axiom-qwen38-dspark-abi-gate
+	$(BIN_DIR)/axiom-qwen38-dspark-abi-gate
 
 $(BUILD_DIR)/axiom_qwen38_session_store_test.o: tests/axiom_qwen38_session_store_test.cpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@

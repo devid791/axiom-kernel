@@ -85,6 +85,7 @@ decode. Build the three relevant gates with:
 make CUDA_ARCH=sm_120 qwen38-temporal-gate
 make CUDA_ARCH=sm_120 qwen38-speculative-graph-gate
 make CUDA_ARCH=sm_120 qwen38-paged-runtime-gate
+make CUDA_ARCH=sm_120 qwen38-dspark-abi-gate
 ```
 
 The binaries require compatible model artifacts supplied outside this
@@ -96,6 +97,18 @@ repository. A release result is valid only if:
 - a paged-runtime run crosses at least one page boundary without token or
   logit mismatch;
 - the output digest and artifact hashes are recorded with throughput.
+
+The DSpark ABI gate is model-independent and runs after linking. It verifies
+that the public header and library agree on layout revision 2, that undersized
+configuration/state/history buffers are rejected without being touched, and
+that revision-1 binary symbols fail closed. Passing this gate proves the ABI
+guards; it does not replace model-backed token/logit parity.
+
+For a resident graph executor, also verify request boundaries: begin a fresh
+device session for every borrowed executor, stop at the first configured EOS,
+record the exact committed-token count, and confirm that graph cycles already
+queued after termination are no-ops. The target model must not retain ownership
+from the preceding request.
 
 The optimization controls and their rollback values are listed in
 `docs/qwen38/PERFORMANCE.md`. Change one control at a time when diagnosing a

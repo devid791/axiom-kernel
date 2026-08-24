@@ -18,6 +18,7 @@
 
 #include "axiom/axiom.h"
 #include "axiom/qwen38_dspark.h"
+#define AXIOM_QWEN38_DSPARK_COMPUTE_IMPLEMENTATION 1
 #include "axiom/qwen38_dspark_compute.h"
 
 namespace {
@@ -889,10 +890,15 @@ __global__ void build_verify_input_kernel(
 }
 
 __global__ void accept_greedy_kernel(
+        const uint32_t *__restrict__ anchor,
         const uint32_t *__restrict__ proposal,
         const uint32_t *__restrict__ target_tokens,
         const float *__restrict__ target_logits,
         const uint32_t *__restrict__ commit_limit,
+        uint32_t *__restrict__ terminal_state,
+        const uint32_t stop_token_count,
+        const uint32_t stop_token_0,
+        const uint32_t stop_token_1,
         uint32_t *__restrict__ accepted_prefix,
         uint32_t *__restrict__ target_commit_prefix,
         uint32_t *__restrict__ continuation_token,
@@ -900,8 +906,17 @@ __global__ void accept_greedy_kernel(
         uint32_t *__restrict__ async_status) {
     if (threadIdx.x != 0u || blockIdx.x != 0u) return;
     uint32_t prefix = 0u;
-    if (!proposal || !target_tokens || !target_logits || !commit_limit || !accepted_prefix ||
+    if (!anchor || !proposal || !target_tokens || !target_logits || !commit_limit ||
+        !terminal_state || !accepted_prefix ||
         !target_commit_prefix || !continuation_token || !continuation_logit || !async_status) {
+        return;
+    }
+    if (terminal_state[0] != 0u) {
+        *accepted_prefix = 0u;
+        *target_commit_prefix = 0u;
+        *continuation_token = anchor[0];
+        *continuation_logit = 0.0f;
+        terminal_state[0] = 2u;
         return;
     }
     const uint32_t limit = commit_limit[0];
@@ -925,11 +940,23 @@ __global__ void accept_greedy_kernel(
         if (draft != target) break;
     }
     prefix = min(prefix, limit - 1u);
+    for (uint32_t index = 0u; index < prefix; ++index) {
+        const uint32_t token = proposal[index];
+        if ((stop_token_count > 0u && token == stop_token_0) ||
+            (stop_token_count > 1u && token == stop_token_1)) {
+            prefix = index;
+            break;
+        }
+    }
     const uint32_t continuation = target_tokens[prefix];
     *accepted_prefix = prefix;
     *target_commit_prefix = prefix + 1u;
     *continuation_token = continuation;
     *continuation_logit = target_logits[prefix];
+    if ((stop_token_count > 0u && continuation == stop_token_0) ||
+        (stop_token_count > 1u && continuation == stop_token_1)) {
+        terminal_state[0] = 1u;
+    }
 }
 
 __global__ void advance_device_position_kernel(
@@ -937,13 +964,15 @@ __global__ void advance_device_position_kernel(
         uint32_t *__restrict__ position,
         const uint32_t *__restrict__ accepted_prefix,
         const uint32_t *__restrict__ continuation_token,
+        uint32_t *__restrict__ terminal_state,
         uint32_t *__restrict__ async_status,
         const uint32_t max_context) {
-    if (threadIdx.x != 0u || blockIdx.x != 0u || !anchor_token || !position || !accepted_prefix ||
-        !continuation_token || !async_status) {
+    if (threadIdx.x != 0u || blockIdx.x != 0u || !anchor_token || !position ||
+        !accepted_prefix || !continuation_token || !terminal_state || !async_status) {
         return;
     }
     if (*async_status != static_cast<uint32_t>(AXIOM_OK)) return;
+    if (terminal_state[0] == 2u) return;
     const uint32_t accepted = accepted_prefix[0];
     const uint32_t current = position[0];
     if (accepted > kBlock || current > max_context ||
@@ -953,6 +982,7 @@ __global__ void advance_device_position_kernel(
     }
     anchor_token[0] = continuation_token[0];
     position[0] = current + 1u + accepted;
+    if (terminal_state[0] == 1u) terminal_state[0] = 2u;
 }
 
 /* PyTorch/SGLang executes the shared target head, the BF16 Markov projection,
@@ -1194,6 +1224,7 @@ struct axiom_qwen38_dspark_compute {
     axiom_device_buffer *device_continuation_token_buffer = nullptr;
     axiom_device_buffer *device_continuation_logit_buffer = nullptr;
     axiom_device_buffer *device_async_status_buffer = nullptr;
+    axiom_device_buffer *device_terminal_state_buffer = nullptr;
     axiom_device_buffer *device_history_buffer = nullptr;
     axiom_device_buffer *k_cache_buffer[kLayers]{};
     axiom_device_buffer *v_cache_buffer[kLayers]{};
@@ -1232,7 +1263,10 @@ struct axiom_qwen38_dspark_compute {
     uint32_t *device_continuation_token = nullptr;
     float *device_continuation_logit = nullptr;
     uint32_t *device_async_status = nullptr;
+    uint32_t *device_terminal_state = nullptr;
     axiom_qwen38_dspark_device_history *device_history = nullptr;
+    uint32_t stop_token_count = 0u;
+    uint32_t stop_token_ids[2]{};
     uint64_t device_control_bytes = 0u;
     cudaStream_t proposal_graph_capture_stream = nullptr;
     cudaGraph_t proposal_graph = nullptr;
@@ -1255,6 +1289,7 @@ void destroy_workspace(axiom_qwen38_dspark_compute *compute) {
     axiom_device_buffer_destroy(compute->greedy_block_values_buffer);
     axiom_device_buffer_destroy(compute->rank_buffer);
     axiom_device_buffer_destroy(compute->device_async_status_buffer);
+    axiom_device_buffer_destroy(compute->device_terminal_state_buffer);
     axiom_device_buffer_destroy(compute->device_history_buffer);
     axiom_device_buffer_destroy(compute->device_continuation_logit_buffer);
     axiom_device_buffer_destroy(compute->device_continuation_token_buffer);
@@ -1289,6 +1324,7 @@ void destroy_workspace(axiom_qwen38_dspark_compute *compute) {
     compute->greedy_block_values_buffer = nullptr;
     compute->rank_buffer = nullptr;
     compute->device_async_status_buffer = nullptr;
+    compute->device_terminal_state_buffer = nullptr;
     compute->device_history_buffer = nullptr;
     compute->device_continuation_logit_buffer = nullptr;
     compute->device_continuation_token_buffer = nullptr;
@@ -1331,6 +1367,7 @@ void destroy_workspace(axiom_qwen38_dspark_compute *compute) {
     compute->device_continuation_token = nullptr;
     compute->device_continuation_logit = nullptr;
     compute->device_async_status = nullptr;
+    compute->device_terminal_state = nullptr;
     compute->device_history = nullptr;
     compute->device_control_bytes = 0u;
 }
@@ -1500,6 +1537,9 @@ int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
             &compute->device_async_status_buffer,
             reinterpret_cast<void **>(&compute->device_async_status), sizeof(uint32_t));
     if (rc == AXIOM_OK) rc = allocate_device_control(
+            &compute->device_terminal_state_buffer,
+            reinterpret_cast<void **>(&compute->device_terminal_state), sizeof(uint32_t));
+    if (rc == AXIOM_OK) rc = allocate_device_control(
             &compute->device_history_buffer,
             reinterpret_cast<void **>(&compute->device_history),
             sizeof(axiom_qwen38_dspark_device_history));
@@ -1518,6 +1558,11 @@ int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
         const cudaError_t status = cudaMemcpy(
                 compute->device_commit_limit, &default_commit_limit,
                 sizeof(default_commit_limit), cudaMemcpyHostToDevice);
+        if (status != cudaSuccess) rc = cuda_status(status);
+    }
+    if (rc == AXIOM_OK) {
+        const cudaError_t status = cudaMemset(
+                compute->device_terminal_state, 0, sizeof(uint32_t));
         if (status != cudaSuccess) rc = cuda_status(status);
     }
     if (rc == AXIOM_OK && !checked_add(compute->workspace_bytes, compute->kv_cache_bytes,
@@ -1834,18 +1879,37 @@ extern "C" void axiom_qwen38_dspark_compute_destroy(axiom_qwen38_dspark_compute 
 }
 
 extern "C" int axiom_qwen38_dspark_compute_create(
+        const axiom_qwen38_dspark *,
+        axiom_runtime *,
+        const int,
+        const axiom_qwen38_dspark_compute_config *,
+        const axiom_qwen38_dspark_target_binding *,
+        axiom_qwen38_dspark_compute **out) {
+    if (out) *out = nullptr;
+    return AXIOM_ERR_INVALID_ARGUMENT;
+}
+
+extern "C" int axiom_qwen38_dspark_compute_create_v2(
         const axiom_qwen38_dspark *dspark,
         axiom_runtime *runtime,
         const int device,
         const axiom_qwen38_dspark_compute_config *config,
+        const uint64_t config_bytes,
         const axiom_qwen38_dspark_target_binding *target,
         axiom_qwen38_dspark_compute **out) {
     if (out) *out = nullptr;
+    if (config_bytes != sizeof(axiom_qwen38_dspark_compute_config)) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
     if (!dspark || !runtime || device < 0 || !config || !target || !out ||
         config->abi_version != AXIOM_ABI_VERSION || target->abi_version != AXIOM_ABI_VERSION ||
         config->max_context == 0u || config->max_context > 262144u ||
+        config->stop_token_count > 2u ||
         !target->embed_f32_device || !target->lm_head_f32_device) {
         return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    for (uint32_t index = 0u; index < config->stop_token_count; ++index) {
+        if (config->stop_token_ids[index] >= kVocab) return AXIOM_ERR_INVALID_ARGUMENT;
     }
     uint32_t runtime_device = 0u;
     int rc = axiom_runtime_device_id(runtime, &runtime_device);
@@ -1869,6 +1933,10 @@ extern "C" int axiom_qwen38_dspark_compute_create(
     compute->runtime = runtime;
     compute->device = device;
     compute->max_context = config->max_context;
+    compute->stop_token_count = config->stop_token_count;
+    for (uint32_t index = 0u; index < config->stop_token_count; ++index) {
+        compute->stop_token_ids[index] = config->stop_token_ids[index];
+    }
     compute->target = *target;
     rc = cublas_status(cublasCreate(&compute->cublas));
     if (rc == AXIOM_OK) rc = cublas_status(cublasSetPointerMode(compute->cublas, CUBLAS_POINTER_MODE_HOST));
@@ -2160,7 +2228,7 @@ bool device_controls_ready(const axiom_qwen38_dspark_compute *compute) {
             compute->device_commit_limit &&
             compute->device_continuation_token &&
             compute->device_continuation_logit && compute->device_async_status &&
-            compute->device_history;
+            compute->device_terminal_state && compute->device_history;
 }
 
 bool device_operation_active(const axiom_qwen38_dspark_compute *compute) {
@@ -2173,6 +2241,7 @@ __global__ void pack_device_history_kernel(
         const uint32_t *continuation_token,
         const uint32_t *async_status,
         const uint32_t *next_position,
+        const uint32_t *committed_tokens,
         axiom_qwen38_dspark_device_history *output) {
     const uint32_t index = static_cast<uint32_t>(threadIdx.x);
     if (index < 7u) output->proposal_tokens[index] = proposal_tokens[index];
@@ -2181,6 +2250,7 @@ __global__ void pack_device_history_kernel(
         output->continuation_token = continuation_token[0];
         output->async_status = async_status[0];
         output->next_position = next_position[0];
+        output->committed_tokens = committed_tokens[0];
     }
 }
 
@@ -2212,28 +2282,54 @@ bool valid_device_target_view(const axiom_qwen38_dspark_compute_device_target_vi
 }  // namespace
 
 extern "C" int axiom_qwen38_dspark_compute_device_history_pack_enqueue(
+        const uint32_t *,
+        const uint32_t *,
+        const uint32_t *,
+        const uint32_t *,
+        const uint32_t *,
+        axiom_qwen38_dspark_device_history *,
+        void *) {
+    return AXIOM_ERR_INVALID_ARGUMENT;
+}
+
+extern "C" int axiom_qwen38_dspark_compute_device_history_pack_enqueue_v2(
         const uint32_t *proposal_tokens_device,
         const uint32_t *accepted_prefix_device,
         const uint32_t *continuation_token_device,
         const uint32_t *async_status_device,
         const uint32_t *next_position_device,
+        const uint32_t *committed_tokens_device,
         axiom_qwen38_dspark_device_history *output_device,
+        const uint64_t output_device_bytes,
         void *stream) {
+    if (output_device_bytes != sizeof(axiom_qwen38_dspark_device_history)) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
     if (!proposal_tokens_device || !accepted_prefix_device ||
         !continuation_token_device || !async_status_device ||
-        !next_position_device || !output_device || !stream) {
+        !next_position_device || !committed_tokens_device || !output_device || !stream) {
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
     pack_device_history_kernel<<<1u, 32u, 0, static_cast<cudaStream_t>(stream)>>>(
             proposal_tokens_device, accepted_prefix_device,
             continuation_token_device, async_status_device,
-            next_position_device, output_device);
+            next_position_device, committed_tokens_device, output_device);
     return cudaGetLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
 }
 
 extern "C" int axiom_qwen38_dspark_compute_device_state_get(
+        const axiom_qwen38_dspark_compute *,
+        axiom_qwen38_dspark_compute_device_state *) {
+    return AXIOM_ERR_INVALID_ARGUMENT;
+}
+
+extern "C" int axiom_qwen38_dspark_compute_device_state_get_v2(
         const axiom_qwen38_dspark_compute *compute,
-        axiom_qwen38_dspark_compute_device_state *out) {
+        axiom_qwen38_dspark_compute_device_state *out,
+        const uint64_t out_bytes) {
+    if (out_bytes != sizeof(axiom_qwen38_dspark_compute_device_state)) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
     if (!compute || !out || out->abi_version != AXIOM_QWEN38_DSPARK_COMPUTE_DEVICE_ABI_VERSION ||
         !device_controls_ready(compute)) {
         return AXIOM_ERR_INVALID_ARGUMENT;
@@ -2255,6 +2351,7 @@ extern "C" int axiom_qwen38_dspark_compute_device_state_get(
     out->continuation_token_device = compute->device_continuation_token;
     out->continuation_logit_device = compute->device_continuation_logit;
     out->async_status_device = compute->device_async_status;
+    out->terminal_state_device = compute->device_terminal_state;
     out->history_device = compute->device_history;
     return AXIOM_OK;
 }
@@ -2343,6 +2440,10 @@ extern "C" int axiom_qwen38_dspark_compute_device_session_begin(
                                  sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream);
     }
     int rc = status == cudaSuccess ? clear_device_step_state(compute, stream) : cuda_status(status);
+    if (rc == AXIOM_OK) {
+        rc = cuda_status(cudaMemsetAsync(
+                compute->device_terminal_state, 0, sizeof(uint32_t), stream));
+    }
     if (rc == AXIOM_OK) compute->device_session_active = true;
     return rc;
 }
@@ -2352,7 +2453,12 @@ extern "C" int axiom_qwen38_dspark_compute_device_session_abort(
         void *stream) {
     if (!compute || !stream || !compute->device_session_active) return AXIOM_ERR_INVALID_ARGUMENT;
     if (cudaSetDevice(compute->device) != cudaSuccess) return AXIOM_ERR_CUDA;
-    const int rc = clear_device_step_state(compute, static_cast<cudaStream_t>(stream));
+    int rc = clear_device_step_state(compute, static_cast<cudaStream_t>(stream));
+    if (rc == AXIOM_OK) {
+        rc = cuda_status(cudaMemsetAsync(
+                compute->device_terminal_state, 0, sizeof(uint32_t),
+                static_cast<cudaStream_t>(stream)));
+    }
     if (rc == AXIOM_OK) compute->device_session_active = false;
     return rc;
 }
@@ -2443,8 +2549,10 @@ extern "C" int axiom_qwen38_dspark_compute_device_accept_greedy(
     }
     if (cudaSetDevice(compute->device) != cudaSuccess) return AXIOM_ERR_CUDA;
     accept_greedy_kernel<<<1u, 1u, 0, static_cast<cudaStream_t>(target->stream)>>>(
-            compute->device_proposal_tokens, target->target_token_ids_device, target->target_logits_device,
-            compute->device_commit_limit,
+            compute->device_anchor_token, compute->device_proposal_tokens,
+            target->target_token_ids_device, target->target_logits_device,
+            compute->device_commit_limit, compute->device_terminal_state,
+            compute->stop_token_count, compute->stop_token_ids[0], compute->stop_token_ids[1],
             compute->device_accepted_prefix, compute->device_target_commit_prefix,
             compute->device_continuation_token,
             compute->device_continuation_logit, compute->device_async_status);
@@ -2508,6 +2616,7 @@ extern "C" int axiom_qwen38_dspark_compute_device_advance(
     advance_device_position_kernel<<<1u, 1u, 0, static_cast<cudaStream_t>(stream)>>>(
             compute->device_anchor_token, compute->device_anchor_position,
             compute->device_accepted_prefix, compute->device_continuation_token,
-            compute->device_async_status, compute->max_context);
+            compute->device_terminal_state, compute->device_async_status,
+            compute->max_context);
     return cudaGetLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
 }

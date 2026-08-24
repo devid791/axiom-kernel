@@ -92,7 +92,8 @@ uint32_t graph_planning_kv_len(
     char *end = nullptr;
     const unsigned long parsed = std::strtoul(value, &end, 10);
     if (!end || end == value || end[0] != '\0' ||
-        (parsed != 256ul && parsed != 512ul && parsed != 1024ul && parsed != 2048ul)) {
+        (parsed != 256ul && parsed != 512ul && parsed != 1024ul &&
+         parsed != 2048ul && parsed != 4096ul && parsed != 8192ul)) {
         return kv_len_host;
     }
     return static_cast<uint32_t>(parsed);

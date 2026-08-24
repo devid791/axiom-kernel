@@ -32,6 +32,14 @@ extern "C" {
 
 typedef struct axiom_qwen38_dspark_compute axiom_qwen38_dspark_compute;
 
+/* DSpark compute layout revision.  The library-wide AXIOM_ABI_VERSION still
+ * identifies the common Axiom API, while this revision protects DSpark-only
+ * structures whose layouts changed independently.  New source is routed to
+ * size-checked v2 symbols below; the legacy binary symbols remain exported
+ * only to reject callers compiled against revision 1 without dereferencing
+ * their smaller buffers. */
+#define AXIOM_QWEN38_DSPARK_COMPUTE_LAYOUT_VERSION 2u
+
 /* Target callbacks borrow target-owned CUDA storage.  `columns` is a temporal
  * width in [1,7], not a request batch. Token/hidden/logit storage is
  * column-major [hidden_size, columns] and [vocab_size, columns], with column
@@ -55,6 +63,11 @@ typedef int (*axiom_qwen38_dspark_target_lm_head_f32_device_fn)(
 typedef struct {
     uint32_t abi_version;
     uint32_t max_context;
+    /* Greedy graph termination is device-owned so a stop token in an early
+     * cycle of a batched replay cannot let later cycles advance recurrent
+     * state. Zero disables stop handling for low-level parity tools. */
+    uint32_t stop_token_count;
+    uint32_t stop_token_ids[2];
     uint64_t flags;
 } axiom_qwen38_dspark_compute_config;
 
@@ -99,7 +112,8 @@ typedef struct {
  * pointers.  Reading `async_status_device` is the caller's responsibility;
  * no API in this plane synchronizes to inspect it.
  */
-#define AXIOM_QWEN38_DSPARK_COMPUTE_DEVICE_ABI_VERSION 1u
+#define AXIOM_QWEN38_DSPARK_COMPUTE_DEVICE_ABI_VERSION \
+    AXIOM_QWEN38_DSPARK_COMPUTE_LAYOUT_VERSION
 
 typedef struct axiom_qwen38_dspark_device_history axiom_qwen38_dspark_device_history;
 
@@ -116,30 +130,48 @@ typedef struct {
     const uint32_t *proposal_tokens_device;   /* U32[7] */
     const uint32_t *verify_tokens_device;     /* U32[8], [anchor,draft0,...,draft6] */
     const uint32_t *accepted_prefix_device;   /* U32[1], in [0,7] */
-    /* U32[1], in [1,8], exactly 1 + accepted_prefix_device[0].  This is
-     * the target transaction's input-prefix count (the anchor is included). */
+    /* U32[1], normally in [1,8] and exactly 1 + accepted prefix. Zero is a
+     * terminal no-op for cycles already queued behind a selected stop token. */
     const uint32_t *target_commit_prefix_device;
     const uint32_t *continuation_token_device;/* U32[1], target[accepted_prefix] */
     const float *continuation_logit_device;   /* F32[1], optional target logits path */
     const uint32_t *async_status_device;      /* U32[1], AXIOM_OK or an AXIOM error */
+    /* 0=active, 1=stop selected in this cycle, 2=terminal/no-op. */
+    const uint32_t *terminal_state_device;
     axiom_qwen38_dspark_device_history *history_device;
 } axiom_qwen38_dspark_compute_device_state;
 
 /* Compact device-to-host history record used by the native API after one
  * graph replay.  Keeping the five scalar results next to the seven proposal
- * ids turns five small D2H transactions into one ordered transfer without
- * changing the graph's device ABI or its correctness checks. */
+ * ids turns small D2H transactions into one ordered transfer.  The added
+ * committed-token authority field is part of DSpark device ABI revision 2. */
 struct axiom_qwen38_dspark_device_history {
     uint32_t proposal_tokens[7];
     uint32_t accepted_prefix;
     uint32_t continuation_token;
     uint32_t async_status;
     uint32_t next_position;
+    /* Exact authoritative inputs committed by this replay. Zero identifies a
+     * terminal no-op cycle already queued behind the cycle that selected EOS. */
+    uint32_t committed_tokens;
 };
 
 /* Enqueue the compacting kernel and one contiguous record write on `stream`.
  * All input pointers are borrowed device addresses and the output record is
  * caller-owned device memory large enough for the struct above. */
+int axiom_qwen38_dspark_compute_device_history_pack_enqueue_v2(
+        const uint32_t *proposal_tokens_device,
+        const uint32_t *accepted_prefix_device,
+        const uint32_t *continuation_token_device,
+        const uint32_t *async_status_device,
+        const uint32_t *next_position_device,
+        const uint32_t *committed_tokens_device,
+        axiom_qwen38_dspark_device_history *output_device,
+        uint64_t output_device_bytes,
+        void *stream);
+
+/* Legacy revision-1 symbol.  It is retained for deterministic binary
+ * compatibility failure and always returns AXIOM_ERR_INVALID_ARGUMENT. */
 int axiom_qwen38_dspark_compute_device_history_pack_enqueue(
         const uint32_t *proposal_tokens_device,
         const uint32_t *accepted_prefix_device,
@@ -242,6 +274,17 @@ int axiom_qwen38_dspark_compute_transaction_abort(
 /* `dspark` and `target` storage must outlive `compute`. `max_context` is a
  * real BF16 K/V-cache allocation limit, not the 262K checkpoint declaration;
  * set it to the serving context budget. */
+int axiom_qwen38_dspark_compute_create_v2(
+        const axiom_qwen38_dspark *dspark,
+        axiom_runtime *runtime,
+        int device,
+        const axiom_qwen38_dspark_compute_config *config,
+        uint64_t config_bytes,
+        const axiom_qwen38_dspark_target_binding *target,
+        axiom_qwen38_dspark_compute **out);
+
+/* Legacy revision-1 symbol.  No config fields are read; the call is rejected
+ * before any access to the historical, smaller config layout. */
 int axiom_qwen38_dspark_compute_create(
         const axiom_qwen38_dspark *dspark,
         axiom_runtime *runtime,
@@ -296,6 +339,12 @@ int axiom_qwen38_dspark_compute_propose(
  * capture fails.  This keeps a device-only caller from accidentally taking a
  * host-synchronized path.
  */
+int axiom_qwen38_dspark_compute_device_state_get_v2(
+        const axiom_qwen38_dspark_compute *compute,
+        axiom_qwen38_dspark_compute_device_state *out,
+        uint64_t out_bytes);
+/* Legacy revision-1 symbol.  The old, smaller output buffer is never
+ * inspected or cleared and the call always fails closed. */
 int axiom_qwen38_dspark_compute_device_state_get(
         const axiom_qwen38_dspark_compute *compute,
         axiom_qwen38_dspark_compute_device_state *out);
@@ -345,6 +394,24 @@ int axiom_qwen38_dspark_compute_device_inject_target(
 int axiom_qwen38_dspark_compute_device_advance(
         axiom_qwen38_dspark_compute *compute,
         void *stream);
+
+/* Source-compatibility shims route every caller rebuilt with this header to
+ * the size-checked revision-2 symbols.  Define the implementation guard only
+ * in the translation unit that exports both the legacy and v2 symbols. */
+#if !defined(AXIOM_QWEN38_DSPARK_COMPUTE_IMPLEMENTATION)
+#define axiom_qwen38_dspark_compute_create(dspark, runtime, device, config, target, out) \
+    axiom_qwen38_dspark_compute_create_v2(                                      \
+            (dspark), (runtime), (device), (config),                            \
+            (uint64_t) sizeof(*(config)), (target), (out))
+#define axiom_qwen38_dspark_compute_device_state_get(compute, out) \
+    axiom_qwen38_dspark_compute_device_state_get_v2(              \
+            (compute), (out), (uint64_t) sizeof(*(out)))
+#define axiom_qwen38_dspark_compute_device_history_pack_enqueue(                 \
+        proposal, accepted, continuation, status, position, committed, output, stream) \
+    axiom_qwen38_dspark_compute_device_history_pack_enqueue_v2(                  \
+            (proposal), (accepted), (continuation), (status), (position),        \
+            (committed), (output), (uint64_t) sizeof(*(output)), (stream))
+#endif
 
 #ifdef __cplusplus
 }

@@ -40,7 +40,7 @@ boundary and maturity of each public integration.
 | Native execution | C++17 host ABI, CUDA device runtime, Blackwell-oriented kernels |
 | Quantization | NVIDIA NVFP4/E2M1, FP8 E4M3, BF16 and fused MoE primitives |
 | Reference backend | Qwen3.8 native 27B decoder, GDN, attention, MLP banks and NVFP4/FP8 LM head |
-| Decode path | DSpark/M8 temporal speculative path and device-side verification ABI |
+| Decode path | Resident DSpark/M8 temporal speculative path, device-side verification and size-checked layout ABI v2 |
 | Attention | FlashInfer headers vendored under their upstream license |
 | KV | Paged KV, persistent sessions, hot GPU pages, cold NVMe pages and bounded crash-safe lifecycle GC |
 | Context | YaRN-compatible long-context plumbing and deterministic compaction hooks |
@@ -81,6 +81,7 @@ Examples:
 make CUDA_ARCH=sm_120
 make check
 make public-scan
+make CUDA_ARCH=sm_120 qwen38-dspark-abi-gate
 ```
 
 `MEDIA=0` (the default) keeps the optional FFmpeg object out of the core build;
@@ -101,6 +102,12 @@ weights and production configuration are not published here. See
 [the complete methodology](docs/qwen38/PERFORMANCE.md) and reproduce the result
 with recorded artifact hashes, toolchain, CUDA architecture, sampling policy
 and benchmark protocol.
+
+Version 0.4 publishes the resident-graph correctness substrate used by the
+later private serving integration: a size-checked DSpark ABI, device-owned
+terminal state, exact committed-token accounting, per-request resident-session
+ownership and a configurable 2K–8K speculative hot window. It deliberately
+does not replace the measured v0.3 performance record with an unverified peak.
 
 ## Community
 

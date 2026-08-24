@@ -250,7 +250,7 @@ int prepare_device_cycle_graph(
         rc = axiom_qwen38_dspark_compute_device_history_pack_enqueue(
                 state.proposal_tokens_device, state.accepted_prefix_device,
                 state.continuation_token_device, state.async_status_device,
-                state.anchor_position_device,
+                state.anchor_position_device, state.target_commit_prefix_device,
                 state.history_device,
                 reinterpret_cast<void *>(stream));
     }
@@ -1102,6 +1102,8 @@ extern "C" int axiom_qwen38_speculative_device_step_enqueue(
         if (rc == AXIOM_OK) {
             speculative->device_session_started = true;
             speculative->device_session_stream = request->stream;
+            rc = axiom_qwen38_model_dspark_device_session_begin(
+                    speculative->target);
         }
     } else if (request->anchor_token_device != state.anchor_token_device ||
                request->anchor_position_device != state.anchor_position_device ||

@@ -109,3 +109,27 @@ The 0.26% difference from the preceding 384.1583 tokens/s median is within
 normal run variation and does not indicate a material decode regression. The
 lifecycle work runs outside graph replay and persistence quiescence is checked
 separately from decode throughput.
+
+## Resident graph correctness update — 2026-08-24
+
+Version 0.4 adds the kernel substrate required to reuse one captured DSpark/M8
+executor safely across requests:
+
+- layout ABI revision 2 with size-checked configuration, state and history;
+- device-owned stop-token state, including terminal no-op graph cycles;
+- an exact committed-token count in the compact device history;
+- explicit target-model device-session ownership renewal per request;
+- a startup-selected 2,048–8,192-token speculative hot window with matching
+  FlashInfer planning and workspace allocation.
+
+The model-backed qualification recorded temporal, paged-KV, vision and
+8,192-token speculative-graph runtime gates as passing. Serving-contract,
+multi-session, cancellation and swarm gates also passed in the private
+application layer, which remains outside this repository.
+
+This publication makes no new speed claim. Two later qualification attempts on
+the same kernel code observed median visible throughput of approximately
+374.154 and 362.949 tokens/s; the latter missed the release policy threshold of
+370 tokens/s. Correctness evidence therefore ships independently from the
+historical v0.3 performance record above. Do not present 384 tokens/s—or any
+single peak—as continuous throughput without reproducing the exact fixture.

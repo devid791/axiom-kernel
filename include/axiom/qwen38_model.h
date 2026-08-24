@@ -395,6 +395,15 @@ int axiom_qwen38_model_dspark_device_transaction_abort(
         axiom_qwen38_model *model,
         void *stream);
 
+/* Mark the target position/KV metadata as device-authoritative for a CUDA
+ * graph replay session. Graph capture invokes the transaction callbacks only
+ * once, so a resident graph executor must renew this ownership explicitly on
+ * every later request before its first replay. The matching session handoff
+ * materializes the device position through axiom_qwen38_model_restore_position.
+ */
+int axiom_qwen38_model_dspark_device_session_begin(
+        axiom_qwen38_model *model);
+
 #ifdef __cplusplus
 }
 #endif

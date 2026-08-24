@@ -2281,6 +2281,21 @@ extern "C" int axiom_qwen38_model_dspark_device_transaction_abort(
     return axiom_qwen38_model_transaction_abort_stream(model->active_transaction, stream);
 }
 
+extern "C" int axiom_qwen38_model_dspark_device_session_begin(
+        axiom_qwen38_model *model) {
+    if (!model || model->active_transaction || model->scalar_tap_capture_active) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    /* CUDA graph capture executes the host transaction callbacks only while
+     * building the graph. Replays mutate target KV/GDN state entirely on the
+     * device, so renew this host-side ownership bit for every request that
+     * takes a resident executor. Keeping this idempotent also covers the first
+     * request, whose freshly captured graph already established ownership. */
+    model->device_position_authoritative = true;
+    model->committed_history_valid = false;
+    return AXIOM_OK;
+}
+
 namespace {
 
 int qwen38_speculative_device_begin_callback(

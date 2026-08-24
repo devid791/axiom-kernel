@@ -19,6 +19,21 @@ behind Axiom's stable interfaces; it does not identify the project itself.
    authentication and deployment policy are separate from this sanitized
    kernel repository.
 
+## Resident graph ownership
+
+The Qwen3.8 DSpark/M8 backend separates graph capture from request ownership.
+Capture creates fixed-shape CUDA work once; every executor reuse begins a new
+device session for both draft and target state. Stop-token selection, terminal
+no-op cycles and the exact committed-token count remain device-authoritative
+until the synchronized handoff installs the committed host history.
+
+DSpark-specific structures carry layout revision 2 independently of Axiom's
+family-neutral ABI version. Rebuilt callers are routed to size-checked v2
+symbols. Historical revision-1 binary symbols remain exported only to return a
+deterministic invalid-argument error without touching a smaller caller buffer.
+This prevents a model-backend layout change from becoming silent memory
+corruption at the shared-library boundary.
+
 ## Public backend maturity
 
 | Family or integration | Evidence in this repository | Public status |

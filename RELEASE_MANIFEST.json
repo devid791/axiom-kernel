@@ -1,11 +1,11 @@
 {
-  "release_id": "axiom-kernel-v0.3.1-public",
-  "release_date": "2026-08-22",
-  "release_type": "documentation-clarification",
+  "release_id": "axiom-kernel-v0.4.0-public",
+  "release_date": "2026-08-24",
+  "release_type": "resident-graph-abi-hardening",
   "project": "Axiom Kernel",
   "license": "MIT",
-  "source_commit": "3ae57422ff8fcb7ebcf8f12074a2c16d921eed53",
-  "production_evidence_commit": "defb646261b021766f5fbde40894a27aa7b417fe",
+  "source_commit": "aa4aa9ff708d3476d3959945e70a8cac1a50647b",
+  "production_evidence_commit": "2bd1c8cb0eaa038859044c727be1e545f45fba2d",
   "public_history": "sanitized-public-snapshot",
   "build_snapshot": {
     "cuda_toolkit": "13.3.73",
@@ -15,64 +15,85 @@
     "media_decoder": false
   },
   "artifact_hashes": {
-    "lib/libaxiom.so": "10b10683af4360a39b4d0b07c1939a01bd6adb907270415a4d1c5abd0f26a517",
+    "lib/libaxiom.so": "7da70ceac66d5f8fbed9b2f8b58df65b7243da086c138a391614fe1a6b77a480",
     "bin/axiom-qwen38-generate": "44f9f0bb085f8225a4cc1f764ea815ec64871981c6900cb31d2ffe9860be6bc1",
     "bin/axiom-qwen38-temporal-gate": "83f12860fef201d2128fc6d7df560e3d73eb96661f188d3db993cf55142a60d0",
     "bin/axiom-qwen38-speculative-graph-gate": "6a989e0fd574ab21906ba020a38b0ec4e21c3b04a7d3fb633f647f870156df25",
-    "bin/axiom-qwen38-paged-runtime-gate": "e7242b7a9c21e6a7cb570f2d7a83e27a5c64780f4687c57cbba961894cecd77a"
+    "bin/axiom-qwen38-paged-runtime-gate": "e7242b7a9c21e6a7cb570f2d7a83e27a5c64780f4687c57cbba961894cecd77a",
+    "bin/axiom-qwen38-dspark-abi-gate": "9bd1b52bdf057a1b04d90d134f65b15bb7224e5202587be768f312decb04a2e2"
   },
   "config_hashes": {
-    "Makefile": "be3c3f6dcbb94715a2eac8e060329274244a3dc255273e855d1d1393a4539708",
-    "README.md": "81b60e7d44b946b43d81839b1a159f55903409d945cda344310ed80ab9059cb4",
-    "docs/ARCHITECTURE.md": "c9e074e2768c020ed43854c6adf2fd64429a976dd1e1886cafc35a29e3bfa8d5",
-    "docs/PUBLIC_SCOPE.md": "419968860e74511c57052fb1a58c5bd7347b0357606ed9a1d773ac5987cce815"
+    "Makefile": "3f7e66e179b1ccb4185243f2d6758d268b65167bdbfca7851a509343b7c83c51",
+    "README.md": "e61f991c76521270dc918cb0cd7c431b59023d760cc94a9a7579b798569d270b",
+    "CHANGELOG.md": "8630259f61a6bc4ca80f976a4d0f782da23da32366baa884d3e903b4183d7cb2",
+    "docs/ARCHITECTURE.md": "1fc00bd79209c37831ab874b9ae2912564b42fd9a6fc456be86491e551c5c139",
+    "docs/BUILD_AND_VERIFY.md": "a528d0e03ae0c06898c1e1984c9270470981aab32b6db14bdd2123e79725a355",
+    "docs/PUBLIC_SCOPE.md": "1f05380aacddfd7f113dabd3c4bd6b4c0a664069c12d8243cdaacd7bbf5870e9",
+    "docs/qwen38/KV_NVME.md": "eed70766c1fba7d51e06bca0f6906456b085ae5cd366af3dc15e0e5ba27f9c3f",
+    "docs/qwen38/PERFORMANCE.md": "a2a44abc68097dcd5ca120684566155b912908a260971e8ad43d3ba1e64eacc8"
   },
   "checkpoint_hashes": {},
   "gate_results": {
     "public_scan": "pass",
+    "repository_secret_and_internal_identity_scan": "pass",
+    "repository_han_script_scan": "pass",
     "host_tests": "pass",
     "host_asan_ubsan": "pass",
     "cuda_compile_sm120": "pass",
-    "cuda_link": "pass",
-    "public_gate_binaries": "pass-built-and-linked-temporal-speculative-graph-paged-runtime",
+    "cuda_link_and_dynamic_symbols": "pass",
+    "dspark_layout_abi_v2": "pass-config-32-over-16-state-120-over-112-history-48-over-44-legacy-symbols-reject",
+    "public_gate_binaries": "pass-built-and-linked-temporal-speculative-graph-paged-runtime-dspark-abi",
     "public_model_runtime_gate": "not_run-model-artifacts-not-published",
     "production_temporal_parity": "pass-zero-logit-and-tap-error",
-    "production_paged_runtime": "pass-300-tokens-across-page-256",
+    "production_paged_runtime": "pass-crossed-page-256",
+    "production_vision_tower": "pass",
+    "production_speculative_graph_runtime": "pass-8192-token-hot-context",
+    "production_agentic_contract": "pass",
     "production_multisession_resume": "pass-exact-prefix-and-stateful-tail",
-    "production_lifecycle_gc": "pass-active-session-protection-and-idempotent-cleanup",
-    "production_http_benchmark": "pass-four-consecutive-byte-exact-runs"
+    "production_cancellation": "pass",
+    "production_swarm": "pass",
+    "production_resident_graph_performance_policy": "variation-crossed-370-visible-tokens-per-second-threshold-no-new-record-claimed"
   },
-  "runtime_delta_from_v0_3_0_public": "none",
-  "benchmark_snapshot": {
+  "runtime_delta_from_v0_3_1_public": {
+    "dspark_layout_abi": 2,
+    "legacy_layout_symbols": "fail-closed",
+    "device_owned_graph_termination": true,
+    "exact_committed_token_authority": true,
+    "resident_target_session_renewal": true,
+    "speculative_hot_context_tokens": {
+      "minimum": 2048,
+      "default": 2048,
+      "maximum": 8192,
+      "page_tokens": 256
+    }
+  },
+  "benchmark_record": {
+    "record_release": "v0.3.0-public",
     "gpu_class": "RTX 5090",
     "prompt_tokens": 1002,
     "generated_tokens": 256,
-    "speculative_cycles": 32,
-    "accepted_proposals": 223,
-    "eligible_proposals": 224,
-    "decode_tokens_per_second_runs": [383.6865, 383.1897, 382.5082, 383.1387],
-    "visible_tokens_per_second_runs": [385.191, 384.692, 384.008, 384.641],
-    "decode_tokens_per_second_median": 383.1642,
-    "visible_tokens_per_second_median": 384.6665,
-    "output_sha256": "b0d7b6f4bad084c8bdba57559fccbbb3b4acef5d085274123c829aa0eb793b5b"
+    "decode_tokens_per_second_median": 384.1583,
+    "visible_tokens_per_second_median": 385.6648,
+    "output_sha256": "b0d7b6f4bad084c8bdba57559fccbbb3b4acef5d085274123c829aa0eb793b5b",
+    "new_record_claimed_by_v0_4_0": false
   },
-  "lifecycle_snapshot": {
-    "gc_state": "pass",
-    "persistence_pending": 0,
-    "active_leases": 0,
-    "unsafe_namespaces": 0,
-    "reclaimed_bytes": 3939336192,
-    "ttl_seconds": 604800,
-    "max_namespaces": 128,
-    "gc_interval_seconds": 300
+  "qualification_snapshot": {
+    "same_kernel_code_visible_tokens_per_second_medians": [
+      374.15361556009475,
+      362.9489579010939
+    ],
+    "release_policy_minimum_visible_tokens_per_second": 370,
+    "performance_policy_result": "variable-one-pass-one-below-threshold",
+    "correctness_release_independent_of_speed_record": true
   },
   "installed_paths": [],
   "health_snapshot": {
-    "public_kernel": "library-cli-and-three-runtime-gates-linked",
+    "public_kernel": "library-cli-and-four-runtime-gates-built-linked",
     "production_service_touched_by_public_release": false,
     "weights_in_repository": false,
     "private_endpoints_in_repository": false,
     "activation_steering_in_public_build": false,
-    "dflash2_executor_in_public_build": false
+    "dflash2_executor_in_public_build": false,
+    "private_serving_daemon_in_public_build": false
   }
 }

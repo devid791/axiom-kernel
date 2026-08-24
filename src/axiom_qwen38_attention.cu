@@ -39,17 +39,14 @@ constexpr uint32_t kAttentionTileTokens = 16u;
 constexpr uint32_t kAttentionThreads = kGqaHeads * 32u;
 /* Keep the operator-configured hottest logical pages resident per target
  * layer. The current page is one of these slots; older pages continue to use
- * the durable NVMe tier. The M8/FlashInfer path deliberately remains fixed at
- * eight pages (2,048 tokens), while the scalar paged provider may use a larger
- * bounded HBM page pool to reduce cold reads. */
+ * the durable NVMe tier. The DSpark/M8 window is independently selected by a
+ * startup gate and remains immutable for the lifetime of the loaded model. */
 constexpr uint32_t kDefaultStreamHotPages = 256u;
-constexpr uint32_t kTemporalHotPages = 8u;
-constexpr uint32_t kTemporalHotTokens =
-        kTemporalHotPages * AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
-constexpr uint32_t kFlashInferWorkspaceChunks = kTemporalHotPages;
-constexpr uint64_t kFlashInferWorkspaceBytes =
-        static_cast<uint64_t>(kFlashInferWorkspaceChunks) * kBatch * kHeads *
-                (kHeadDim * sizeof(uint16_t) + sizeof(float));
+constexpr uint32_t kDefaultTemporalHotTokens =
+        8u * AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+constexpr uint32_t kMinTemporalHotTokens = kDefaultTemporalHotTokens;
+constexpr uint32_t kMaxTemporalHotTokens =
+        32u * AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
 constexpr uint32_t kMaxStreamHotPages = 256u;
 constexpr uint32_t kKvParityMaxContext = 64u;
 constexpr float kEps = 1.0e-6f;
@@ -108,6 +105,19 @@ uint32_t stream_hot_pages_from_env() {
     const unsigned long parsed = std::strtoul(text, &end, 10);
     if (end == text || *end != '\0' || parsed == 0u) return kDefaultStreamHotPages;
     return static_cast<uint32_t>(std::min<unsigned long>(parsed, kMaxStreamHotPages));
+}
+
+uint32_t temporal_hot_tokens_from_env() {
+    const char *text = std::getenv("AXIOM_QWEN38_SPECULATIVE_CONTEXT_TOKENS");
+    if (!text || !text[0]) return kDefaultTemporalHotTokens;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || parsed < kMinTemporalHotTokens ||
+        parsed > kMaxTemporalHotTokens ||
+        parsed % AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS != 0u) {
+        return 0u;
+    }
+    return static_cast<uint32_t>(parsed);
 }
 
 bool checked_mul(uint64_t a, uint64_t b, uint64_t *out) {
@@ -972,9 +982,10 @@ __global__ void qwen38_stream_store_hot_kv_row_kernel(
         const float *__restrict__ v,
         uint8_t *__restrict__ hot_k_cache,
         uint8_t *__restrict__ hot_v_cache,
-        uint32_t position) {
+        uint32_t position,
+        uint32_t hot_context) {
     const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= kKvDim || position >= kTemporalHotTokens) return;
+    if (index >= kKvDim || position >= hot_context) return;
     const uint64_t cache_index = static_cast<uint64_t>(position) * kKvDim + index;
     hot_k_cache[cache_index] = qwen38_kv_encode_e4m3fn_scale1(k[index]);
     hot_v_cache[cache_index] = qwen38_kv_encode_e4m3fn_scale1(
@@ -1217,6 +1228,7 @@ struct axiom_qwen38_attention_layer {
      * provider; the API selects this mode only when the complete request fits
      * in the hot window. */
     bool streaming_temporal_hot = false;
+    uint32_t temporal_hot_tokens = kDefaultTemporalHotTokens;
     axiom_qwen38_kv_tier *kv_tier = nullptr;
     uint32_t tier_layer = 0u;
     uint32_t stream_hot_pages = 0u;
@@ -1227,6 +1239,7 @@ struct axiom_qwen38_attention_layer {
      * BF16-Q/E4M3-KV/BF16-O D256 specialization. */
     bool flashinfer_ready = false;
     bool flashinfer_split_kv = false;
+    uint64_t flashinfer_workspace_bytes = 0u;
 
     axiom_qwen38_fp8_linear *q_proj = nullptr;
     axiom_qwen38_fp8_linear *k_proj = nullptr;
@@ -1423,6 +1436,13 @@ extern "C" int axiom_qwen38_attention_layer_load(
     layer->streaming_kv = env_enabled("AXIOM_QWEN38_KV_STREAMING");
     layer->streaming_temporal_hot = layer->streaming_kv &&
             env_enabled("AXIOM_QWEN38_KV_TEMPORAL8");
+    layer->temporal_hot_tokens = temporal_hot_tokens_from_env();
+    if (layer->streaming_temporal_hot &&
+        (layer->temporal_hot_tokens == 0u ||
+         layer->temporal_hot_tokens > max_context)) {
+        axiom_qwen38_attention_layer_destroy(layer);
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
     layer->shared_projection_input =
             !env_disabled("AXIOM_QWEN38_ATTENTION_SHARED_FP8_INPUT");
     layer->parallel_projection_streams =
@@ -1518,7 +1538,8 @@ extern "C" int axiom_qwen38_attention_layer_load(
     layer->cache_columns = (!env_disabled("AXIOM_QWEN38_COMPACT_KV") && max_context > 8192u)
             ? 1u : kBatch;
     const uint64_t resident_cache_context = layer->streaming_kv
-            ? (layer->streaming_temporal_hot ? kTemporalHotTokens : 0u) : max_context;
+            ? (layer->streaming_temporal_hot ? layer->temporal_hot_tokens : 0u)
+            : max_context;
     if (!checked_mul(resident_cache_context, layer->cache_columns, &cache_elements) ||
         !checked_mul(cache_elements, kKvDim, &cache_elements) ||
         !checked_mul(cache_elements, sizeof(uint8_t), &cache_fp8_bytes) ||
@@ -1564,11 +1585,17 @@ extern "C" int axiom_qwen38_attention_layer_load(
                 return rc;
             }
         }
-        if (resident_cache_context != 0u && resident_cache_context <= kTemporalHotTokens &&
+        if (resident_cache_context != 0u &&
+            resident_cache_context <= layer->temporal_hot_tokens &&
             !env_disabled("AXIOM_QWEN38_FLASHINFER_SPLIT_KV")) {
+            layer->flashinfer_workspace_bytes =
+                    (resident_cache_context /
+                     AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS) *
+                    static_cast<uint64_t>(kBatch) * kHeads *
+                    (kHeadDim * sizeof(uint16_t) + sizeof(float));
             rc = axiom_device_buffer_create(
                     runtime, &layer->flashinfer_split_kv_workspace,
-                    kFlashInferWorkspaceBytes);
+                    layer->flashinfer_workspace_bytes);
             if (rc != AXIOM_OK) {
                 axiom_qwen38_attention_layer_destroy(layer);
                 return rc;
@@ -1656,7 +1683,7 @@ extern "C" int axiom_qwen38_attention_layer_load(
         }
         if (warm_rc == AXIOM_OK) {
             const uint32_t warm_context = layer->streaming_temporal_hot
-                    ? kTemporalHotTokens : max_context;
+                    ? layer->temporal_hot_tokens : max_context;
             const uint32_t warm_kv_len = warm_context < 1024u ? warm_context : 1024u;
             warm_rc = axiom_qwen38_flashinfer_temporal8_bf16_e4m3_device(
                     static_cast<const uint16_t *>(flashinfer_q_bf16),
@@ -1686,7 +1713,7 @@ extern "C" int axiom_qwen38_attention_layer_load(
         (!layer->streaming_kv && !layer->streaming_temporal_hot) ? 0u : q_batch_bf16,
         (!layer->streaming_kv && !layer->streaming_temporal_hot) ? 0u : q_batch_bf16,
         (!layer->streaming_kv && !layer->streaming_temporal_hot) ? 0u : sizeof(uint32_t),
-        layer->flashinfer_split_kv ? kFlashInferWorkspaceBytes : 0u,
+        layer->flashinfer_split_kv ? layer->flashinfer_workspace_bytes : 0u,
         resident_cache_context == 0u ? 0u : cache_fp8_bytes,
         resident_cache_context == 0u ? 0u : cache_fp8_bytes,
     };
@@ -1777,12 +1804,14 @@ extern "C" int axiom_qwen38_attention_layer_reset(axiom_qwen38_attention_layer *
         if (status == cudaSuccess && layer->streaming_temporal_hot) {
             status = cudaMemset(
                     hot_k_cache, 0,
-                    static_cast<size_t>(kTemporalHotTokens) * kKvDim * sizeof(uint8_t));
+                    static_cast<size_t>(layer->temporal_hot_tokens) * kKvDim *
+                            sizeof(uint8_t));
         }
         if (status == cudaSuccess && layer->streaming_temporal_hot) {
             status = cudaMemset(
                     hot_v_cache, 0,
-                    static_cast<size_t>(kTemporalHotTokens) * kKvDim * sizeof(uint8_t));
+                    static_cast<size_t>(layer->temporal_hot_tokens) * kKvDim *
+                            sizeof(uint8_t));
         }
         if (status == cudaSuccess && layer->streaming_temporal_hot) {
             status = cudaMemset(flashinfer_q, 0, kQDim * kBatch * sizeof(uint16_t));
@@ -2058,12 +2087,13 @@ int forward_streaming_kv(
             layer->position % AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS);
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
     layer->stream_page_dirty = true;
-    if (layer->streaming_temporal_hot && layer->position < kTemporalHotTokens) {
+    if (layer->streaming_temporal_hot &&
+        layer->position < layer->temporal_hot_tokens) {
         qwen38_stream_store_hot_kv_row_kernel<<<
                 (kKvDim + kThreads - 1u) / kThreads, kThreads>>>(
                 static_cast<const float *>(k), static_cast<const float *>(v),
                 static_cast<uint8_t *>(hot_k_cache), static_cast<uint8_t *>(hot_v_cache),
-                layer->position);
+                layer->position, layer->temporal_hot_tokens);
         if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
     }
 
@@ -2227,7 +2257,8 @@ extern "C" int axiom_qwen38_attention_layer_materialize_device_position(
         const uint32_t position) {
     if (!layer || position > layer->max_context || layer->spec_active ||
         (layer->streaming_kv && !layer->streaming_temporal_hot) ||
-        (layer->streaming_temporal_hot && position > kTemporalHotTokens)) {
+        (layer->streaming_temporal_hot &&
+         position > layer->temporal_hot_tokens)) {
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
     if (!layer->streaming_kv) {
@@ -2313,7 +2344,8 @@ extern "C" int axiom_qwen38_attention_layer_kv_page_export(
     const uint64_t page_start = static_cast<uint64_t>(logical_page) *
             AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
     if (layer->streaming_kv &&
-        (!layer->streaming_temporal_hot || page_start >= kTemporalHotTokens)) {
+        (!layer->streaming_temporal_hot ||
+         page_start >= layer->temporal_hot_tokens)) {
         const uint32_t slot = logical_page % layer->stream_hot_pages;
         if (layer->stream_hot_page_ids[slot] != logical_page) {
             return AXIOM_ERR_INVALID_ARGUMENT;
@@ -2332,7 +2364,7 @@ extern "C" int axiom_qwen38_attention_layer_kv_page_export(
     if (rc != AXIOM_OK) return rc;
     std::memset(host_page, 0, static_cast<size_t>(host_page_bytes));
     const uint64_t resident_limit = layer->streaming_temporal_hot
-            ? std::min<uint64_t>(layer->max_context, kTemporalHotTokens)
+            ? std::min<uint64_t>(layer->max_context, layer->temporal_hot_tokens)
             : layer->max_context;
     const uint64_t valid_tokens = std::min<uint64_t>(
             AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS,
@@ -2372,7 +2404,8 @@ extern "C" int axiom_qwen38_attention_layer_kv_page_import(
         if (status != cudaSuccess) return cuda_status(status);
         const uint64_t page_start = static_cast<uint64_t>(logical_page) *
                 AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
-        if (layer->streaming_temporal_hot && page_start < kTemporalHotTokens) {
+        if (layer->streaming_temporal_hot &&
+            page_start < layer->temporal_hot_tokens) {
             void *hot_k_cache = nullptr;
             void *hot_v_cache = nullptr;
             rc = buffer_pointer(layer->k_cache, &hot_k_cache);
@@ -2380,7 +2413,7 @@ extern "C" int axiom_qwen38_attention_layer_kv_page_import(
             if (rc != AXIOM_OK) return rc;
             const uint64_t valid_tokens = std::min<uint64_t>(
                     AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS,
-                    kTemporalHotTokens - page_start);
+                    layer->temporal_hot_tokens - page_start);
             const size_t valid_bytes = static_cast<size_t>(valid_tokens) * kKvDim;
             const size_t destination_offset = static_cast<size_t>(page_start) * kKvDim;
             status = cudaMemcpy(
@@ -2754,7 +2787,7 @@ extern "C" int axiom_qwen38_attention_layer_spec_begin(
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
     const uint32_t cache_context = layer->streaming_temporal_hot
-            ? kTemporalHotTokens : layer->max_context;
+            ? layer->temporal_hot_tokens : layer->max_context;
     if (layer->position > cache_context || kBatch > cache_context - layer->position) {
         return AXIOM_ERR_BUDGET;
     }
@@ -2780,7 +2813,7 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device(
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
     const uint32_t cache_context = layer->streaming_temporal_hot
-            ? kTemporalHotTokens : layer->max_context;
+            ? layer->temporal_hot_tokens : layer->max_context;
     if (layer->spec_base_position > cache_context ||
         kBatch > cache_context - layer->spec_base_position) {
         return AXIOM_ERR_BUDGET;
@@ -2960,7 +2993,7 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device_positio
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
     const uint32_t cache_context = layer->streaming_temporal_hot
-            ? kTemporalHotTokens : layer->max_context;
+            ? layer->temporal_hot_tokens : layer->max_context;
     if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
     void *input_norm_weight = nullptr;

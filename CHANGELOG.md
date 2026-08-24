@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.4.0-public — 2026-08-24
+
+- Published DSpark device-layout ABI revision 2 with size-checked entry points.
+  Legacy revision-1 binary symbols now reject incompatible buffers before
+  dereferencing or clearing them.
+- Added device-owned stop-token and terminal-cycle state. CUDA graph cycles
+  already queued after EOS become deterministic no-ops instead of advancing
+  recurrent or KV state.
+- Added an explicit committed-token authority field to the compact device
+  history record and renewed target-model device ownership for every resident
+  executor request.
+- Made the DSpark/M8 hot speculative context configurable from 2,048 through
+  8,192 tokens in 256-token pages, with matching FlashInfer planning and
+  workspace sizing.
+- Added a public DSpark ABI gate covering layout revision, undersized-buffer
+  rejection and fail-closed legacy symbols.
+- Retained the v0.3 measured performance record. This release publishes
+  correctness and resident-executor hardening; it does not claim a new
+  throughput record.
+
 ## v0.3.1-public — 2026-08-22
 
 - Clarified that Axiom is the model-agnostic kernel and Qwen3.8 is its current

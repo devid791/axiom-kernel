@@ -21,6 +21,13 @@ preserves the graph's hot path while allowing the session store to evict and
 restore cold pages. A deployment may choose its NVMe directory and capacity;
 the public kernel contains no machine-specific path or endpoint.
 
+The resident DSpark/M8 path has a separate immutable hot-context budget. The
+public backend accepts 2,048 through 8,192 tokens in 256-token increments via
+`AXIOM_QWEN38_SPECULATIVE_CONTEXT_TOKENS`; invalid or oversized values fail
+model initialization. FlashInfer planning and workspace allocation use the
+same selected budget. This hot window accelerates speculative graph reuse; it
+does not replace the paged NVMe tier for longer logical context.
+
 ## Bounded session lifecycle
 
 Generation cleanup and whole-session retention are separate operations. The
