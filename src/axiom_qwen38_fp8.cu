@@ -14,6 +14,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cublasLt.h>
+#include "axiom_qwen38_tune_candidates.h"
 
 #include <atomic>
 #include <cmath>
@@ -534,7 +535,16 @@ cublasStatus_t select_fp8_algorithm(
     }
 
     constexpr int kMaxCandidates = 32;
-    cublasLtMatmulHeuristicResult_t candidates[kMaxCandidates]{};
+    const char *expanded_pool_value = tune
+            ? std::getenv("AXIOM_QWEN38_AUTOTUNE_EXPANDED_POOL") : nullptr;
+    const bool expanded_pool = expanded_pool_value &&
+            std::strcmp(expanded_pool_value, "1") == 0;
+    const int candidate_capacity = expanded_pool ? 64 : kMaxCandidates;
+    // Keep the original heuristic pool; extra slots are append-only (4 seeds x 8 tiles).
+    cublasLtMatmulHeuristicResult_t default_candidates[kMaxCandidates]{};
+    std::vector<cublasLtMatmulHeuristicResult_t> expanded_candidates(
+            expanded_pool ? candidate_capacity : 0);
+    auto *candidates = expanded_pool ? expanded_candidates.data() : default_candidates;
     int returned = 0;
     cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
             handle, desc, a_layout, b_layout, c_layout, d_layout,
@@ -542,6 +552,14 @@ cublasStatus_t select_fp8_algorithm(
     if (status != CUBLAS_STATUS_SUCCESS || returned < 1) {
         return status == CUBLAS_STATUS_SUCCESS
                 ? CUBLAS_STATUS_NOT_SUPPORTED : status;
+    }
+    const int original_count = returned;
+    if (tune) append_narrow_algorithms(handle, desc, a_layout, b_layout,
+            c_layout, d_layout, kWorkspaceBytes, candidates, candidate_capacity, &returned);
+    if (expanded_pool) {
+        std::fprintf(stderr,
+                     "axiom-qwen38-fp8: expanded-pool rows=%u cols=%u original=%d appended=%d\n",
+                     rows, cols, original_count, returned - original_count);
     }
     *out = candidates[0];
     if (!tune || returned == 1) {
@@ -566,6 +584,11 @@ cublasStatus_t select_fp8_algorithm(
     cudaStream_t stream = nullptr;
     cudaEvent_t begin = nullptr;
     cudaEvent_t end = nullptr;
+    const char *cold_cache_value = std::getenv("AXIOM_QWEN38_AUTOTUNE_COLD_CACHE");
+    const bool cold_cache = cold_cache_value &&
+            cold_cache_value[0] == '1' && cold_cache_value[1] == '\0';
+    constexpr size_t kEvictionBytes = 128ull * 1024ull * 1024ull;
+    void *eviction_buffer = nullptr;
     const size_t input_bytes = static_cast<size_t>(cols) * AXIOM_QWEN38_FP8_BATCH;
     const size_t output_bytes = static_cast<size_t>(rows) *
             AXIOM_QWEN38_FP8_BATCH * sizeof(float);
@@ -578,6 +601,8 @@ cublasStatus_t select_fp8_algorithm(
             &stream, cudaStreamNonBlocking);
     if (cuda_status == cudaSuccess) cuda_status = cudaEventCreate(&begin);
     if (cuda_status == cudaSuccess) cuda_status = cudaEventCreate(&end);
+    if (cuda_status == cudaSuccess && cold_cache)
+        cuda_status = cudaMalloc(&eviction_buffer, kEvictionBytes);
     constexpr uint32_t kWarmupRuns = 2u;
     constexpr uint32_t kMeasuredRuns = 20u;
     constexpr float kMinimumSpeedup = 1.03f;
@@ -617,27 +642,63 @@ cublasStatus_t select_fp8_algorithm(
                         &candidates[candidate].algo, workspace,
                         candidates[candidate].workspaceSize, stream);
             }
-            if (run_status != CUBLAS_STATUS_SUCCESS ||
-                cudaStreamSynchronize(stream) != cudaSuccess ||
-                cudaEventRecord(begin, stream) != cudaSuccess) {
-                (void)cudaGetLastError();
-                continue;
-            }
-            for (uint32_t run = 0u; run < kMeasuredRuns &&
-                 run_status == CUBLAS_STATUS_SUCCESS; ++run) {
-                run_status = cublasLtMatmul(
-                        handle, desc, &alpha, weight, a_layout, input, b_layout,
-                        &beta, scratch, c_layout, scratch, d_layout,
-                        &candidates[candidate].algo, workspace,
-                        candidates[candidate].workspaceSize, stream);
-            }
             float elapsed_ms = 0.0f;
-            if (run_status != CUBLAS_STATUS_SUCCESS ||
-                cudaEventRecord(end, stream) != cudaSuccess ||
-                cudaEventSynchronize(end) != cudaSuccess ||
-                cudaEventElapsedTime(&elapsed_ms, begin, end) != cudaSuccess) {
-                (void)cudaGetLastError();
-                continue;
+            if (cold_cache) {
+                if (run_status != CUBLAS_STATUS_SUCCESS ||
+                    cudaStreamSynchronize(stream) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    continue;
+                }
+                bool samples_ok = true;
+                for (uint32_t run = 0u; run < kMeasuredRuns; ++run) {
+                    // Same-stream eviction completes before the start event;
+                    // only this single matmul contributes to the sample time.
+                    if (cudaMemsetAsync(eviction_buffer, 0, kEvictionBytes, stream) != cudaSuccess ||
+                        cudaEventRecord(begin, stream) != cudaSuccess) {
+                        samples_ok = false;
+                        break;
+                    }
+                    run_status = cublasLtMatmul(
+                            handle, desc, &alpha, weight, a_layout, input, b_layout,
+                            &beta, scratch, c_layout, scratch, d_layout,
+                            &candidates[candidate].algo, workspace,
+                            candidates[candidate].workspaceSize, stream);
+                    float sample_ms = 0.0f;
+                    if (run_status != CUBLAS_STATUS_SUCCESS ||
+                        cudaEventRecord(end, stream) != cudaSuccess ||
+                        cudaEventSynchronize(end) != cudaSuccess ||
+                        cudaEventElapsedTime(&sample_ms, begin, end) != cudaSuccess) {
+                        samples_ok = false;
+                        break;
+                    }
+                    elapsed_ms += sample_ms;
+                }
+                if (!samples_ok) {
+                    (void)cudaGetLastError();
+                    continue;
+                }
+            } else {
+                if (run_status != CUBLAS_STATUS_SUCCESS ||
+                    cudaStreamSynchronize(stream) != cudaSuccess ||
+                    cudaEventRecord(begin, stream) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    continue;
+                }
+                for (uint32_t run = 0u; run < kMeasuredRuns &&
+                     run_status == CUBLAS_STATUS_SUCCESS; ++run) {
+                    run_status = cublasLtMatmul(
+                            handle, desc, &alpha, weight, a_layout, input, b_layout,
+                            &beta, scratch, c_layout, scratch, d_layout,
+                            &candidates[candidate].algo, workspace,
+                            candidates[candidate].workspaceSize, stream);
+                }
+                if (run_status != CUBLAS_STATUS_SUCCESS ||
+                    cudaEventRecord(end, stream) != cudaSuccess ||
+                    cudaEventSynchronize(end) != cudaSuccess ||
+                    cudaEventElapsedTime(&elapsed_ms, begin, end) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    continue;
+                }
             }
             const float per_call_ms = elapsed_ms / kMeasuredRuns;
             if (candidate == 0) baseline_ms = per_call_ms;
@@ -651,6 +712,7 @@ cublasStatus_t select_fp8_algorithm(
     if (end) (void)cudaEventDestroy(end);
     if (begin) (void)cudaEventDestroy(begin);
     if (stream) (void)cudaStreamDestroy(stream);
+    if (eviction_buffer) (void)cudaFree(eviction_buffer);
     if (mismatch_device) (void)cudaFree(mismatch_device);
     if (reference) (void)cudaFree(reference);
     if (scratch) (void)cudaFree(scratch);

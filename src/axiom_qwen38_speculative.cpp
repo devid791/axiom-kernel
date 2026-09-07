@@ -119,13 +119,40 @@ bool valid_target_capabilities(const axiom_qwen38_model_dspark_temporal_capabili
 }
 
 bool valid_dspark_contract(const axiom_qwen38_dspark_forward_contract &contract) {
-    return contract.hidden_size == AXIOM_QWEN38_DSPARK_HIDDEN &&
+    constexpr uint32_t expected_taps[AXIOM_QWEN38_DSPARK_TARGET_FEATURES] = {
+            4u, 16u, 28u, 40u, 52u};
+    bool taps_match = true;
+    for (uint32_t index = 0u;
+         index < AXIOM_QWEN38_DSPARK_TARGET_FEATURES; ++index) {
+        taps_match = taps_match &&
+                contract.target_layer_ids[index] == expected_taps[index];
+    }
+    return contract.abi_version == AXIOM_ABI_VERSION && taps_match &&
+            contract.scalar_dtype == AXIOM_TENSOR_DTYPE_F32 &&
+            contract.hidden_size == AXIOM_QWEN38_DSPARK_HIDDEN &&
             contract.target_feature_count == AXIOM_QWEN38_DSPARK_TARGET_FEATURES &&
+            contract.draft_layers == AXIOM_QWEN38_DSPARK_LAYERS &&
+            contract.attention_heads == AXIOM_QWEN38_DSPARK_HEADS &&
+            contract.key_value_heads == AXIOM_QWEN38_DSPARK_KV_HEADS &&
+            contract.head_dim == AXIOM_QWEN38_DSPARK_HEAD_DIM &&
             contract.block_size == AXIOM_QWEN38_SPECULATIVE_DRAFT_TOKENS &&
             contract.verify_width == AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH &&
+            contract.mask_token_id == AXIOM_QWEN38_DSPARK_MASK_TOKEN_ID &&
+            contract.markov_rank == AXIOM_QWEN38_DSPARK_MARKOV_RANK &&
+            contract.confidence_features == AXIOM_QWEN38_DSPARK_CONFIDENCE_FEATURES &&
             contract.requires_draft_kv_injection == 1u &&
             contract.requires_draft_kv_transaction == 1u &&
-            contract.uses_target_embedding == 1u && contract.uses_target_lm_head == 1u;
+            contract.uses_target_embedding == 1u && contract.uses_target_lm_head == 1u &&
+            contract.attention_is_noncausal_over_draft_block == 1u &&
+            contract.rmsnorm_zero_centered == 0u &&
+            contract.max_context == 262144u &&
+            contract.rms_norm_eps == 1.0e-6f &&
+            contract.confidence_head_alpha == 1.0f &&
+            contract.rope_theta == 10000000.0f &&
+            contract.yarn_factor == 32.0f &&
+            contract.yarn_beta_fast == 32.0f &&
+            contract.yarn_beta_slow == 1.0f &&
+            contract.yarn_original_context == 8192u;
 }
 
 bool valid_device_target_binding(const axiom_qwen38_speculative_device_target_binding *binding) {
@@ -248,7 +275,8 @@ int prepare_device_cycle_graph(
     }
     if (rc == AXIOM_OK) {
         rc = axiom_qwen38_dspark_compute_device_history_pack_enqueue(
-                state.proposal_tokens_device, state.accepted_prefix_device,
+                state.proposal_tokens_device, state.proposal_confidence_device,
+                state.accepted_prefix_device,
                 state.continuation_token_device, state.async_status_device,
                 state.anchor_position_device, state.target_commit_prefix_device,
                 state.history_device,

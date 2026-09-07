@@ -40,7 +40,8 @@ boundary and maturity of each public integration.
 | Native execution | C++17 host ABI, CUDA device runtime, Blackwell-oriented kernels |
 | Quantization | NVIDIA NVFP4/E2M1, FP8 E4M3, BF16 and fused MoE primitives |
 | Reference backend | Qwen3.8 native 27B decoder, GDN, attention, MLP banks and NVFP4/FP8 LM head |
-| Decode path | Resident DSpark/M8 temporal speculative path, device-side verification and size-checked layout ABI v2 |
+| Flash-Next backend | Qwen3.8 Flash-Next NVFP4 (`qwen4_exp`): native MoE decoder, QSA/GDN, mHC, PLE and GPU/RAM/NVMe expert paging; separate opt-in build |
+| Decode path | Resident DSpark/M8 temporal speculative path, device-side verification and size-checked layout ABI v3 |
 | Attention | FlashInfer headers vendored under their upstream license |
 | KV | Paged KV, persistent sessions, hot GPU pages, cold NVMe pages and bounded crash-safe lifecycle GC |
 | Context | YaRN-compatible long-context plumbing and deterministic compaction hooks |
@@ -71,6 +72,7 @@ Qwen path is the DSpark/M8 path used by the current Axiom kernel integration.
 - CUDA architecture selected explicitly, for example `CUDA_ARCH=sm_120`
 - Optional image libraries for the vision preprocessor: JPEG, PNG and WebP
 - Optional FFmpeg development libraries for the video-container decoder
+- OpenSSL development libraries for SHA-256 protected session manifests
 
 No weights or tokenizer assets are included. A model-specific integration must
 provide them separately and must verify their format and checksum before use.
@@ -89,12 +91,23 @@ use `make MEDIA=1` only on a machine where the decoder toolchain is verified.
 
 ## Performance record
 
-The lifecycle update sustained a median **383.164 decoded tokens/s** across
-four consecutive requests to a separate private production fixture on one RTX
-5090. The fixed test used a 1,002-token prompt, generated 256 tokens through 32
-speculative cycles and produced the same output SHA-256 on every run. Individual
-decode rates were 383.686, 383.190, 382.508 and 383.139 tokens/s. This is within
-0.26% of the preceding 384.158 tokens/s median and is not a material regression.
+**409.324 decoded tokens/s on one RTX 5090**, measured as the median of three
+post-restart requests through the real private OpenAI-compatible HTTP API on
+September 5, 2026. The normal Qwen3.8-27B NVFP4 checkpoint used the native
+DSpark speculative path, a 1,002-token prompt and 256 completion tokens.
+
+| Run | Decode tokens/s |
+| ---: | ---: |
+| 1 | 409.112 |
+| 2 | 409.410 |
+| 3 | 409.324 |
+| **Median** | **409.324** |
+
+All three responses matched the golden output SHA-256. Decode throughput
+counts the 255 graph-emitted tokens after the initial anchor; it excludes
+prefill, transport and persistence time. This is the normal-checkpoint record,
+not a claim of 409 tokens/s for the uncensored checkpoint or Flash-Next.
+The earlier 384.158 tokens/s record remains documented as historical evidence.
 
 This is a measured result for one exact fixture, not a universal guarantee for
 this source tree, another GPU or another checkpoint. The private HTTP daemon,
@@ -103,11 +116,22 @@ weights and production configuration are not published here. See
 with recorded artifact hashes, toolchain, CUDA architecture, sampling policy
 and benchmark protocol.
 
-Version 0.4 publishes the resident-graph correctness substrate used by the
+Version 0.4 published the resident-graph correctness substrate used by the
 later private serving integration: a size-checked DSpark ABI, device-owned
 terminal state, exact committed-token accounting, per-request resident-session
 ownership and a configurable 2K–8K speculative hot window. It deliberately
-does not replace the measured v0.3 performance record with an unverified peak.
+did not replace the measured v0.3 performance record with an unverified peak.
+
+Version 0.5 adds the subsequent native DSpark exact-path optimizations,
+transactional KV recovery, SHA-256 session manifests and **Qwen3.8 Flash-Next
+NVFP4 support as a separate native backend**. See the
+[Flash-Next support matrix](docs/qwen4exp/README.md) for build instructions and
+the boundary between historical private validation and this public source.
+Flash-Next has run real text inference on an RTX 5090, with approximately
+**41 tok/s measured on a warm short greeting** (see the linked methodology).
+Its current qualification covers short-context text; full 262K/1M execution,
+accelerated MTP and image-question-answering are not claimed. It is not the
+27B throughput record, and it is not a default replacement for the 27B backend.
 
 ## Community
 

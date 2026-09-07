@@ -33,12 +33,42 @@ struct legacy_device_state_v1 {
     axiom_qwen38_dspark_device_history *history_device;
 };
 
+struct legacy_device_state_v2 {
+    uint32_t abi_version;
+    uint32_t graph_ready;
+    uint32_t device_session_active;
+    uint32_t proposal_tokens;
+    uint32_t verify_width;
+    uint32_t reserved0;
+    uint64_t resident_device_bytes;
+    const uint32_t *anchor_token_device;
+    const uint32_t *anchor_position_device;
+    const uint32_t *proposal_tokens_device;
+    const uint32_t *verify_tokens_device;
+    const uint32_t *accepted_prefix_device;
+    const uint32_t *target_commit_prefix_device;
+    const uint32_t *continuation_token_device;
+    const float *continuation_logit_device;
+    const uint32_t *async_status_device;
+    const uint32_t *terminal_state_device;
+    axiom_qwen38_dspark_device_history *history_device;
+};
+
 struct legacy_history_v1 {
     uint32_t proposal_tokens[7];
     uint32_t accepted_prefix;
     uint32_t continuation_token;
     uint32_t async_status;
     uint32_t next_position;
+};
+
+struct legacy_history_v2 {
+    uint32_t proposal_tokens[7];
+    uint32_t accepted_prefix;
+    uint32_t continuation_token;
+    uint32_t async_status;
+    uint32_t next_position;
+    uint32_t committed_tokens;
 };
 
 template <typename T>
@@ -59,13 +89,15 @@ bool expect_invalid(const char *name, const int rc) {
 
 }  // namespace
 
-static_assert(AXIOM_QWEN38_DSPARK_COMPUTE_LAYOUT_VERSION == 2u,
-              "DSpark compute layout must remain revision 2");
-static_assert(AXIOM_QWEN38_DSPARK_COMPUTE_DEVICE_ABI_VERSION == 2u,
-              "DSpark device ABI must reject revision 1");
+static_assert(AXIOM_QWEN38_DSPARK_COMPUTE_LAYOUT_VERSION == 3u,
+              "DSpark compute layout must remain revision 3");
+static_assert(AXIOM_QWEN38_DSPARK_COMPUTE_DEVICE_ABI_VERSION == 3u,
+              "DSpark device ABI must reject revisions 1 and 2");
 static_assert(sizeof(legacy_config_v1) < sizeof(axiom_qwen38_dspark_compute_config));
 static_assert(sizeof(legacy_device_state_v1) < sizeof(axiom_qwen38_dspark_compute_device_state));
 static_assert(sizeof(legacy_history_v1) < sizeof(axiom_qwen38_dspark_device_history));
+static_assert(sizeof(legacy_device_state_v2) < sizeof(axiom_qwen38_dspark_compute_device_state));
+static_assert(sizeof(legacy_history_v2) < sizeof(axiom_qwen38_dspark_device_history));
 
 int main() {
     bool ok = true;
@@ -120,6 +152,18 @@ int main() {
                     reinterpret_cast<const axiom_qwen38_dspark_compute *>(uintptr_t{1}),
                     reinterpret_cast<axiom_qwen38_dspark_compute_device_state *>(uintptr_t{1}),
                     sizeof(legacy_device_state_v1)));
+    ok &= expect_invalid(
+            "legacy v2 device-state symbol",
+            axiom_qwen38_dspark_compute_device_state_get_v2(
+                    reinterpret_cast<const axiom_qwen38_dspark_compute *>(uintptr_t{1}),
+                    reinterpret_cast<axiom_qwen38_dspark_compute_device_state *>(uintptr_t{1}),
+                    sizeof(legacy_device_state_v2)));
+    ok &= expect_invalid(
+            "v3 device-state with v2 output size",
+            axiom_qwen38_dspark_compute_device_state_get_v3(
+                    reinterpret_cast<const axiom_qwen38_dspark_compute *>(uintptr_t{1}),
+                    reinterpret_cast<axiom_qwen38_dspark_compute_device_state *>(uintptr_t{1}),
+                    sizeof(legacy_device_state_v2)));
 
     guarded<legacy_history_v1> history{};
     history.before = kBefore;
@@ -142,14 +186,28 @@ int main() {
                     fake_u32, fake_u32, fake_u32, fake_u32, fake_u32, fake_u32,
                     reinterpret_cast<axiom_qwen38_dspark_device_history *>(uintptr_t{1}),
                     sizeof(legacy_history_v1), reinterpret_cast<void *>(uintptr_t{1})));
+    ok &= expect_invalid(
+            "legacy v2 history-pack symbol",
+            axiom_qwen38_dspark_compute_device_history_pack_enqueue_v2(
+                    fake_u32, fake_u32, fake_u32, fake_u32, fake_u32, fake_u32,
+                    reinterpret_cast<axiom_qwen38_dspark_device_history *>(uintptr_t{1}),
+                    sizeof(legacy_history_v2), reinterpret_cast<void *>(uintptr_t{1})));
+    ok &= expect_invalid(
+            "v3 history-pack with v2 output size",
+            axiom_qwen38_dspark_compute_device_history_pack_enqueue_v3(
+                    fake_u32, reinterpret_cast<const float *>(uintptr_t{1}),
+                    fake_u32, fake_u32, fake_u32, fake_u32, fake_u32,
+                    reinterpret_cast<axiom_qwen38_dspark_device_history *>(uintptr_t{1}),
+                    sizeof(legacy_history_v2), reinterpret_cast<void *>(uintptr_t{1})));
 
     if (!ok) return 1;
     std::printf(
             "axiom-qwen38-dspark-abi-gate: PASS layout=%u config=%zu>%zu "
-            "state=%zu>%zu history=%zu>%zu legacy_symbols=reject\n",
+            "state=%zu>%zu>%zu history=%zu>%zu>%zu legacy_symbols=reject\n",
             AXIOM_QWEN38_DSPARK_COMPUTE_LAYOUT_VERSION,
             sizeof(axiom_qwen38_dspark_compute_config), sizeof(legacy_config_v1),
-            sizeof(axiom_qwen38_dspark_compute_device_state), sizeof(legacy_device_state_v1),
-            sizeof(axiom_qwen38_dspark_device_history), sizeof(legacy_history_v1));
+            sizeof(axiom_qwen38_dspark_compute_device_state), sizeof(legacy_device_state_v2),
+            sizeof(legacy_device_state_v1), sizeof(axiom_qwen38_dspark_device_history),
+            sizeof(legacy_history_v2), sizeof(legacy_history_v1));
     return 0;
 }

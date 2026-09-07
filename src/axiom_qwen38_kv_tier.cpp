@@ -11,6 +11,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <string>
 #include <vector>
 
 #if defined(__linux__)
@@ -86,6 +87,30 @@ struct disk_header {
 
 static_assert(sizeof(disk_header) == AXIOM_QWEN38_KV_TIER_HEADER_BYTES,
               "Qwen3.8 KV tier header must be one direct-I/O block");
+
+constexpr uint32_t kTransactionAbi = 1u;
+
+struct transaction_journal_header {
+    char magic[8];
+    uint32_t abi_version;
+    uint32_t header_bytes;
+    uint32_t record_count;
+    uint32_t logical_page;
+    uint32_t base_committed_tokens;
+    uint32_t target_layers;
+    uint32_t dspark_layers;
+    uint32_t target_page_bytes;
+    uint32_t dspark_page_bytes;
+    uint32_t reserved0;
+    uint64_t tier_generation;
+    uint64_t tier_file_bytes;
+    uint64_t payload_bytes;
+    uint64_t checksum;
+    uint8_t reserved[4016];
+};
+
+static_assert(sizeof(transaction_journal_header) == kAlignment,
+              "Qwen3.8 KV transaction header must be one filesystem block");
 
 void fill_header(
         const axiom_qwen38_kv_tier_plan &plan,
@@ -170,6 +195,205 @@ int exact_pwrite(const int fd, const void *buffer, const size_t bytes, const uin
         }
     }
     return AXIOM_OK;
+}
+
+bool parent_directory_sync(const std::string &path) {
+    const size_t slash = path.rfind('/');
+    const std::string directory = slash == std::string::npos
+            ? "." : (slash == 0u ? "/" : path.substr(0u, slash));
+    const int fd = open(directory.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+    if (fd < 0) return false;
+    const int rc = fsync(fd);
+    close(fd);
+    return rc == 0;
+}
+
+bool regular_private_file(const int fd, const uint64_t expected_bytes) {
+    struct stat status{};
+    return fd >= 0 && fstat(fd, &status) == 0 && S_ISREG(status.st_mode) &&
+            status.st_nlink == 1 && status.st_uid == geteuid() &&
+            status.st_size >= 0 &&
+            static_cast<uint64_t>(status.st_size) == expected_bytes;
+}
+
+uint64_t journal_checksum(
+        const transaction_journal_header &header,
+        const std::vector<uint8_t> &payload) {
+    transaction_journal_header copy = header;
+    copy.checksum = 0u;
+    uint64_t hash = checksum64(&copy, sizeof(copy));
+    for (const uint8_t byte : payload) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+int page_offset_for_plan(
+        const axiom_qwen38_kv_tier_plan &plan,
+        const uint32_t family,
+        const uint32_t layer,
+        const uint32_t logical_page,
+        uint64_t *out) {
+    if (!out || logical_page >= plan.logical_pages) return AXIOM_ERR_INVALID_ARGUMENT;
+    uint64_t offset = AXIOM_QWEN38_KV_TIER_HEADER_BYTES;
+    uint64_t layer_span = 0u;
+    uint64_t within = 0u;
+    if (family == AXIOM_QWEN38_KV_TIER_TARGET) {
+        if (layer >= plan.target_layers ||
+            !checked_mul(plan.logical_pages, plan.target_page_bytes, &layer_span) ||
+            !checked_mul(layer, layer_span, &within) ||
+            !checked_add(offset, within, &offset) ||
+            !checked_mul(logical_page, plan.target_page_bytes, &within) ||
+            !checked_add(offset, within, &offset)) {
+            return AXIOM_ERR_INVALID_ARGUMENT;
+        }
+    } else if (family == AXIOM_QWEN38_KV_TIER_DSPARK) {
+        if (layer >= plan.dspark_layers ||
+            !checked_add(offset, plan.target_payload_bytes, &offset) ||
+            !checked_mul(plan.logical_pages, plan.dspark_page_bytes, &layer_span) ||
+            !checked_mul(layer, layer_span, &within) ||
+            !checked_add(offset, within, &offset) ||
+            !checked_mul(logical_page, plan.dspark_page_bytes, &within) ||
+            !checked_add(offset, within, &offset)) {
+            return AXIOM_ERR_INVALID_ARGUMENT;
+        }
+    } else {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    *out = offset;
+    return AXIOM_OK;
+}
+
+struct loaded_journal {
+    transaction_journal_header header{};
+    disk_header old_tier_header{};
+    axiom_qwen38_kv_tier_plan plan{};
+    std::vector<uint8_t> payload;
+};
+
+int load_transaction_journal(
+        const char *path, loaded_journal *out, bool *exists) {
+    if (exists) *exists = false;
+    if (!path || !path[0] || !out || !exists) return AXIOM_ERR_INVALID_ARGUMENT;
+    const int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return errno == ENOENT ? AXIOM_OK : AXIOM_ERR_IO;
+    transaction_journal_header header{};
+    int rc = exact_pread(fd, &header, sizeof(header), 0u);
+    const char magic[8] = {'A', 'X', 'Q', '3', '8', 'T', 'X', '1'};
+    if (rc == AXIOM_OK &&
+        (std::memcmp(header.magic, magic, sizeof(magic)) != 0 ||
+         header.abi_version != kTransactionAbi || header.header_bytes != kAlignment ||
+         header.target_layers != AXIOM_QWEN38_KV_TIER_TARGET_LAYERS ||
+         header.dspark_layers != AXIOM_QWEN38_KV_TIER_DSPARK_LAYERS ||
+         header.target_page_bytes != AXIOM_QWEN38_KV_TIER_TARGET_PAGE_BYTES ||
+         header.dspark_page_bytes != AXIOM_QWEN38_KV_TIER_DSPARK_PAGE_BYTES ||
+         header.record_count != (header.base_committed_tokens %
+                                 AXIOM_QWEN38_KV_TIER_PAGE_TOKENS == 0u
+                                 ? 0u : header.target_layers + header.dspark_layers))) {
+        rc = AXIOM_ERR_IO;
+    }
+    uint64_t expected_payload = sizeof(disk_header);
+    if (rc == AXIOM_OK) {
+        uint64_t target_bytes = 0u;
+        uint64_t dspark_bytes = 0u;
+        if (header.record_count != 0u &&
+            (!checked_mul(header.target_layers, header.target_page_bytes, &target_bytes) ||
+             !checked_mul(header.dspark_layers, header.dspark_page_bytes, &dspark_bytes) ||
+             !checked_add(expected_payload, target_bytes, &expected_payload) ||
+             !checked_add(expected_payload, dspark_bytes, &expected_payload))) {
+            rc = AXIOM_ERR_IO;
+        }
+    }
+    if (rc == AXIOM_OK &&
+        (header.payload_bytes != expected_payload ||
+         header.payload_bytes > std::numeric_limits<size_t>::max() ||
+         !regular_private_file(fd, sizeof(header) + header.payload_bytes))) {
+        rc = AXIOM_ERR_IO;
+    }
+    std::vector<uint8_t> payload;
+    if (rc == AXIOM_OK) {
+        try {
+            payload.resize(static_cast<size_t>(header.payload_bytes));
+        } catch (...) {
+            rc = AXIOM_ERR_BUDGET;
+        }
+    }
+    if (rc == AXIOM_OK && !payload.empty()) {
+        rc = exact_pread(fd, payload.data(), payload.size(), sizeof(header));
+    }
+    close(fd);
+    if (rc != AXIOM_OK) return rc;
+    if (header.checksum != journal_checksum(header, payload) ||
+        payload.size() < sizeof(disk_header)) {
+        return AXIOM_ERR_IO;
+    }
+    disk_header old_header{};
+    std::memcpy(&old_header, payload.data(), sizeof(old_header));
+    axiom_qwen38_kv_tier_plan plan{};
+    plan.abi_version = kAbi;
+    rc = axiom_qwen38_kv_tier_plan_get(old_header.max_context, 0u, &plan);
+    if (rc != AXIOM_OK || !valid_header(old_header, plan) ||
+        header.base_committed_tokens != old_header.committed_tokens ||
+        header.tier_generation != old_header.generation ||
+        header.tier_file_bytes != old_header.file_bytes ||
+        header.logical_page != header.base_committed_tokens /
+                AXIOM_QWEN38_KV_TIER_PAGE_TOKENS) {
+        return AXIOM_ERR_IO;
+    }
+    out->header = header;
+    out->old_tier_header = old_header;
+    out->plan = plan;
+    out->payload = std::move(payload);
+    *exists = true;
+    return AXIOM_OK;
+}
+
+int restore_transaction_fd(const int fd, const loaded_journal &journal) {
+    if (!regular_private_file(fd, journal.plan.file_bytes)) return AXIOM_ERR_IO;
+    size_t cursor = sizeof(disk_header);
+    if (journal.header.record_count != 0u) {
+        void *page = nullptr;
+        if (posix_memalign(&page, kAlignment, AXIOM_QWEN38_KV_TIER_TARGET_PAGE_BYTES) != 0 ||
+            !page) return AXIOM_ERR_BUDGET;
+        int rc = AXIOM_OK;
+        for (uint32_t family = AXIOM_QWEN38_KV_TIER_TARGET;
+             family <= AXIOM_QWEN38_KV_TIER_DSPARK && rc == AXIOM_OK; ++family) {
+            const uint32_t layers = family == AXIOM_QWEN38_KV_TIER_TARGET
+                    ? journal.plan.target_layers : journal.plan.dspark_layers;
+            const uint64_t bytes = axiom_qwen38_kv_tier_family_page_bytes(family);
+            for (uint32_t layer = 0u; layer < layers && rc == AXIOM_OK; ++layer) {
+                if (cursor + bytes > journal.payload.size()) {
+                    rc = AXIOM_ERR_IO;
+                    break;
+                }
+                std::memcpy(page, journal.payload.data() + cursor, static_cast<size_t>(bytes));
+                uint64_t offset = 0u;
+                rc = page_offset_for_plan(
+                        journal.plan, family, layer, journal.header.logical_page, &offset);
+                if (rc == AXIOM_OK) rc = exact_pwrite(fd, page, static_cast<size_t>(bytes), offset);
+                cursor += static_cast<size_t>(bytes);
+            }
+        }
+        std::free(page);
+        if (rc != AXIOM_OK || cursor != journal.payload.size()) return AXIOM_ERR_IO;
+        if (fdatasync(fd) != 0) return AXIOM_ERR_IO;
+    }
+    void *raw = nullptr;
+    if (posix_memalign(&raw, kAlignment, sizeof(disk_header)) != 0 || !raw) {
+        return AXIOM_ERR_BUDGET;
+    }
+    std::memcpy(raw, &journal.old_tier_header, sizeof(disk_header));
+    const int rc = exact_pwrite(fd, raw, sizeof(disk_header), 0u);
+    std::free(raw);
+    if (rc != AXIOM_OK || fdatasync(fd) != 0) return AXIOM_ERR_IO;
+    return AXIOM_OK;
+}
+
+int discard_transaction_path(const char *path) {
+    if (!path || !path[0]) return AXIOM_ERR_INVALID_ARGUMENT;
+    if (unlink(path) != 0 && errno != ENOENT) return AXIOM_ERR_IO;
+    return parent_directory_sync(path) ? AXIOM_OK : AXIOM_ERR_IO;
 }
 
 struct pending_slot {
@@ -740,4 +964,180 @@ extern "C" int axiom_qwen38_kv_tier_reset(axiom_qwen38_kv_tier *tier) {
         tier->committed_tokens = previous_tokens;
     }
     return rc;
+}
+
+extern "C" int axiom_qwen38_kv_tier_transaction_begin(
+        axiom_qwen38_kv_tier *tier,
+        const char *journal_path,
+        const uint32_t base_committed_tokens) {
+    if (!tier || !journal_path || !journal_path[0] || base_committed_tokens == 0u) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    std::lock_guard<std::mutex> guard(tier->lock);
+    if (tier->outstanding != 0u || base_committed_tokens != tier->committed_tokens ||
+        base_committed_tokens > tier->plan.max_context) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    struct stat existing{};
+    if (lstat(journal_path, &existing) == 0 || errno != ENOENT) {
+        return AXIOM_ERR_IO;
+    }
+
+    disk_header old_header{};
+    int rc = read_header(tier->fd, &old_header);
+    if (rc != AXIOM_OK || !valid_header(old_header, tier->plan) ||
+        old_header.generation != tier->generation ||
+        old_header.committed_tokens != base_committed_tokens) {
+        return AXIOM_ERR_IO;
+    }
+
+    const bool partial = base_committed_tokens % AXIOM_QWEN38_KV_TIER_PAGE_TOKENS != 0u;
+    uint64_t payload_bytes = sizeof(disk_header);
+    if (partial &&
+        (!checked_add(payload_bytes, tier->plan.target_layers * tier->plan.target_page_bytes,
+                      &payload_bytes) ||
+         !checked_add(payload_bytes, tier->plan.dspark_layers * tier->plan.dspark_page_bytes,
+                      &payload_bytes))) {
+        return AXIOM_ERR_BUDGET;
+    }
+    if (payload_bytes > std::numeric_limits<size_t>::max()) return AXIOM_ERR_BUDGET;
+    std::vector<uint8_t> payload;
+    try {
+        payload.resize(static_cast<size_t>(payload_bytes));
+    } catch (...) {
+        return AXIOM_ERR_BUDGET;
+    }
+    std::memcpy(payload.data(), &old_header, sizeof(old_header));
+    size_t cursor = sizeof(old_header);
+    if (partial) {
+        void *page = nullptr;
+        if (posix_memalign(&page, kAlignment, AXIOM_QWEN38_KV_TIER_TARGET_PAGE_BYTES) != 0 ||
+            !page) return AXIOM_ERR_BUDGET;
+        const uint32_t logical_page =
+                base_committed_tokens / AXIOM_QWEN38_KV_TIER_PAGE_TOKENS;
+        for (uint32_t family = AXIOM_QWEN38_KV_TIER_TARGET;
+             family <= AXIOM_QWEN38_KV_TIER_DSPARK && rc == AXIOM_OK; ++family) {
+            const uint32_t layers = family == AXIOM_QWEN38_KV_TIER_TARGET
+                    ? tier->plan.target_layers : tier->plan.dspark_layers;
+            const uint64_t bytes = axiom_qwen38_kv_tier_family_page_bytes(family);
+            for (uint32_t layer = 0u; layer < layers && rc == AXIOM_OK; ++layer) {
+                uint64_t offset = 0u;
+                rc = page_offset_for_plan(tier->plan, family, layer, logical_page, &offset);
+                if (rc == AXIOM_OK) {
+                    rc = exact_pread(tier->fd, page, static_cast<size_t>(bytes), offset);
+                }
+                if (rc == AXIOM_OK) {
+                    std::memcpy(payload.data() + cursor, page, static_cast<size_t>(bytes));
+                    cursor += static_cast<size_t>(bytes);
+                }
+            }
+        }
+        std::free(page);
+    }
+    if (rc != AXIOM_OK || cursor != payload.size()) return AXIOM_ERR_IO;
+
+    transaction_journal_header header{};
+    const char magic[8] = {'A', 'X', 'Q', '3', '8', 'T', 'X', '1'};
+    std::memcpy(header.magic, magic, sizeof(magic));
+    header.abi_version = kTransactionAbi;
+    header.header_bytes = sizeof(header);
+    header.record_count = partial
+            ? tier->plan.target_layers + tier->plan.dspark_layers : 0u;
+    header.logical_page =
+            base_committed_tokens / AXIOM_QWEN38_KV_TIER_PAGE_TOKENS;
+    header.base_committed_tokens = base_committed_tokens;
+    header.target_layers = tier->plan.target_layers;
+    header.dspark_layers = tier->plan.dspark_layers;
+    header.target_page_bytes = static_cast<uint32_t>(tier->plan.target_page_bytes);
+    header.dspark_page_bytes = static_cast<uint32_t>(tier->plan.dspark_page_bytes);
+    header.tier_generation = tier->generation;
+    header.tier_file_bytes = tier->plan.file_bytes;
+    header.payload_bytes = payload.size();
+    header.checksum = journal_checksum(header, payload);
+
+    const std::string temporary = std::string(journal_path) + ".tmp";
+    if (unlink(temporary.c_str()) != 0 && errno != ENOENT) return AXIOM_ERR_IO;
+    const int fd = open(
+            temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            0600);
+    if (fd < 0) return AXIOM_ERR_IO;
+    rc = exact_pwrite(fd, &header, sizeof(header), 0u);
+    if (rc == AXIOM_OK) {
+        rc = exact_pwrite(fd, payload.data(), payload.size(), sizeof(header));
+    }
+    if (rc == AXIOM_OK && fdatasync(fd) != 0) rc = AXIOM_ERR_IO;
+    if (close(fd) != 0 && rc == AXIOM_OK) rc = AXIOM_ERR_IO;
+    if (rc == AXIOM_OK && rename(temporary.c_str(), journal_path) != 0) {
+        rc = AXIOM_ERR_IO;
+    }
+    if (rc == AXIOM_OK && !parent_directory_sync(journal_path)) rc = AXIOM_ERR_IO;
+    if (rc != AXIOM_OK) (void)unlink(temporary.c_str());
+    return rc;
+}
+
+extern "C" int axiom_qwen38_kv_tier_transaction_rollback(
+        axiom_qwen38_kv_tier *tier,
+        const char *journal_path) {
+    if (!tier || !journal_path || !journal_path[0]) return AXIOM_ERR_INVALID_ARGUMENT;
+    loaded_journal journal;
+    bool exists = false;
+    int rc = load_transaction_journal(journal_path, &journal, &exists);
+    if (rc != AXIOM_OK || !exists) return rc;
+    std::lock_guard<std::mutex> guard(tier->lock);
+    if (tier->outstanding != 0u || tier->plan.file_bytes != journal.plan.file_bytes ||
+        tier->generation != journal.old_tier_header.generation) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    rc = restore_transaction_fd(tier->fd, journal);
+    if (rc == AXIOM_OK) {
+        tier->generation = journal.old_tier_header.generation;
+        tier->committed_tokens =
+                static_cast<uint32_t>(journal.old_tier_header.committed_tokens);
+        rc = discard_transaction_path(journal_path);
+    }
+    return rc;
+}
+
+extern "C" int axiom_qwen38_kv_tier_transaction_recover_file(
+        const char *tier_path,
+        const char *journal_path,
+        const uint32_t manifest_committed_tokens) {
+    if (!tier_path || !tier_path[0] || !journal_path || !journal_path[0]) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    loaded_journal journal;
+    bool exists = false;
+    int rc = load_transaction_journal(journal_path, &journal, &exists);
+    if (rc != AXIOM_OK || !exists) return rc;
+#if !defined(O_DIRECT)
+    return AXIOM_ERR_UNSUPPORTED_BACKEND;
+#else
+    const int fd = open(tier_path, O_RDWR | O_CLOEXEC | O_DIRECT | O_NOFOLLOW);
+    if (fd < 0 || !regular_private_file(fd, journal.plan.file_bytes)) {
+        if (fd >= 0) close(fd);
+        return AXIOM_ERR_IO;
+    }
+    disk_header current{};
+    const int read_rc = read_header(fd, &current);
+    const bool current_valid = read_rc == AXIOM_OK && valid_header(current, journal.plan) &&
+            current.generation == journal.old_tier_header.generation;
+    if (manifest_committed_tokens == journal.header.base_committed_tokens) {
+        rc = restore_transaction_fd(fd, journal);
+    } else if (current_valid &&
+               current.committed_tokens == manifest_committed_tokens) {
+        rc = AXIOM_OK;
+    } else {
+        /* The manifest and tier do not identify either side of the atomic
+         * transition. Keep the journal intact and fail closed. */
+        rc = AXIOM_ERR_IO;
+    }
+    if (close(fd) != 0 && rc == AXIOM_OK) rc = AXIOM_ERR_IO;
+    if (rc == AXIOM_OK) rc = discard_transaction_path(journal_path);
+    return rc;
+#endif
+}
+
+extern "C" int axiom_qwen38_kv_tier_transaction_discard(
+        const char *journal_path) {
+    return discard_transaction_path(journal_path);
 }

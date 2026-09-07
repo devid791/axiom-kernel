@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -26,6 +27,8 @@ constexpr uint32_t kNvfp4NibbleValues = 16u;
 __device__ __forceinline__ float decode_bf16(uint16_t bits) {
     return __uint_as_float(static_cast<uint32_t>(bits) << 16u);
 }
+
+#include "axiom_qwen38_bf16_pair_virtual.cuh"
 
 __global__ void bf16_linear_batch8_reference_kernel(
         const uint16_t *__restrict__ weight,
@@ -272,6 +275,7 @@ struct axiom_qwen38_bf16_linear {
     uint16_t *input_bf16 = nullptr;
     cublasHandle_t cublas = nullptr;
     bool nvfp4_dequantized = false;
+    bool pair_virtual128 = false;
     uint64_t device_bytes = 0u;
 };
 
@@ -311,6 +315,10 @@ extern "C" int axiom_qwen38_bf16_linear_load(
     linear->device = device;
     linear->rows = static_cast<uint32_t>(info.shape[0]);
     linear->cols = static_cast<uint32_t>(info.shape[1]);
+    // Snapshot at weight load, outside forward/graph capture. Only exact "1"
+    // opts in; changing the environment requires reloading both paired handles.
+    const char *pair_virtual128 = std::getenv("AXIOM_QWEN38_BF16_PAIR_VIRTUAL128");
+    linear->pair_virtual128 = pair_virtual128 && std::strcmp(pair_virtual128, "1") == 0;
 
     const cudaError_t allocation = cudaMalloc(
             reinterpret_cast<void **>(&linear->weight), static_cast<size_t>(weight_bytes));
@@ -470,11 +478,19 @@ extern "C" int axiom_qwen38_bf16_linear_pair_forward_f32_device(
     }
     if (cudaSetDevice(first->device) != cudaSuccess) return AXIOM_ERR_CUDA;
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-    bf16_linear_pair_batch8_reference_kernel<<<
-            dim3(first->rows, AXIOM_QWEN38_BF16_LINEAR_BATCH),
-            kThreads, 0, cuda_stream>>>(
-            first->weight, second->weight, input, first_out, second_out,
-            first->rows, first->cols);
+    if (first->pair_virtual128 && second->pair_virtual128) {
+        bf16_linear_pair_batch8_virtual_kernel<128><<<
+                dim3(first->rows, AXIOM_QWEN38_BF16_LINEAR_BATCH),
+                128, 0, cuda_stream>>>(
+                first->weight, second->weight, input, first_out, second_out,
+                first->rows, first->cols);
+    } else {
+        bf16_linear_pair_batch8_reference_kernel<<<
+                dim3(first->rows, AXIOM_QWEN38_BF16_LINEAR_BATCH),
+                kThreads, 0, cuda_stream>>>(
+                first->weight, second->weight, input, first_out, second_out,
+                first->rows, first->cols);
+    }
     return cudaGetLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
 }
 

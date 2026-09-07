@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #include "axiom/axiom.h"
+#include "axiom/qwen38_attention.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,6 +30,14 @@ typedef struct axiom_qwen38_kv_tier axiom_qwen38_kv_tier;
  *   target_aux_hidden[((tap * 8 + time) * 5120) + hidden]
  * `time == 0` is the input token at `token_start_position`. */
 #define AXIOM_QWEN38_MODEL_DSPARK_ABI_VERSION 1u
+#define AXIOM_QWEN38_MODEL_DSPARK_CAPTURE_ABI_VERSION 2u
+#define AXIOM_QWEN38_MODEL_DSPARK_CAPTURE_SEMANTICS_VERSION 1u
+#define AXIOM_QWEN38_MODEL_DSPARK_CAPTURE_LAYOUT_TAP_TIME_HIDDEN 1u
+#define AXIOM_QWEN38_MODEL_DSPARK_CAPTURE_STORAGE_F32_BF16_MATERIALIZED 1u
+#define AXIOM_QWEN38_MODEL_DSPARK_DEVICE_HIDDEN_VIEW_ABI_VERSION 1u
+#define AXIOM_QWEN38_MODEL_DSPARK_DEVICE_HIDDEN_SEMANTICS_VERSION 1u
+#define AXIOM_QWEN38_MODEL_DSPARK_DEVICE_HIDDEN_LAYOUT_TOKEN_HIDDEN 1u
+#define AXIOM_QWEN38_MODEL_DSPARK_DEVICE_HIDDEN_STORAGE_F32_BF16_MATERIALIZED 1u
 #define AXIOM_QWEN38_MODEL_DSPARK_TARGET_TAP_COUNT 5u
 #define AXIOM_QWEN38_MODEL_DSPARK_TEMPORAL_VERIFY_WIDTH 8u
 #define AXIOM_QWEN38_MODEL_DSPARK_BLOCK_SIZE 7u
@@ -125,6 +134,38 @@ typedef struct axiom_qwen38_model_dspark_device_target_verify_view {
     uint32_t reserved;
 } axiom_qwen38_model_dspark_device_target_verify_view;
 
+/* Revisioned extension view for the target's final hidden state.  This is a
+ * separate ABI rather than an in-place extension of
+ * axiom_qwen38_model_dspark_device_target_verify_view, so existing serving
+ * and speculative binaries retain their original layout.
+ *
+ * On success, `target_last_hidden_device` is a borrowed CUDA F32 pointer to
+ * token-major [temporal_tokens][hidden_size] storage.  Rows are the temporal
+ * M8 inputs [anchor,d1,...,d7] after the target final RMSNorm; values are
+ * BF16-materialized in F32 containers and adjacent rows are separated by
+ * `token_stride_elements` floats.  The allocation address is stable for the
+ * model lifetime.  Its contents become valid only after a successful device
+ * M8 verification and remain valid until the next target forward, reset, or
+ * destruction.  Work consuming the pointer must be ordered after verification
+ * on the same CUDA stream.
+ *
+ * The model retains exclusive ownership.  Callers must never free, resize,
+ * write through, or otherwise assume ownership of this pointer.  The getter
+ * leaves it NULL whenever a valid M8 hidden view is unavailable.  Callers must
+ * initialize `abi_version` and `struct_size` before invoking the getter. */
+typedef struct axiom_qwen38_model_dspark_device_hidden_view {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t semantics_version;
+    uint32_t temporal_tokens;
+    uint32_t hidden_size;
+    uint32_t token_stride_elements;
+    uint32_t layout;
+    uint32_t storage;
+    uint64_t flags;  /* Reserved; zero in ABI v1. */
+    const float *target_last_hidden_device;
+} axiom_qwen38_model_dspark_device_hidden_view;
+
 typedef struct axiom_qwen38_model_dspark_temporal_validation_result {
     uint32_t abi_version;
     uint32_t passed;
@@ -151,6 +192,33 @@ typedef struct axiom_qwen38_model_dspark_prefill_token_result {
     float target_logit;
 } axiom_qwen38_model_dspark_prefill_token_result;
 
+/* Offline teacher-feature capture view.  This is deliberately separate from
+ * the serving result structs so adding an export-only pointer cannot change
+ * their ABI.  It is available only after one transaction forward and before
+ * commit/abort.  Both pointers are borrowed CUDA F32 storage owned by the
+ * target model and are invalidated by the next forward/reset/destruction.
+ *
+ * `target_aux_hidden` uses tap-major layout [5][tokens][5120], where tap N is
+ * the post-block residual convention `hidden_states[layer_id + 1]` for layer
+ * ids [4,16,28,40,52]. `target_last_hidden` is token-major [tokens][5120]
+ * after the target's final RMSNorm. Every value is already BF16-materialized
+ * in an F32 container, so an offline exporter can store exact BF16 payloads
+ * without changing the teacher contract. */
+typedef struct axiom_qwen38_model_dspark_capture_view {
+    uint32_t abi_version;
+    uint32_t semantics_version;
+    uint32_t token_start_position;
+    uint32_t tokens;
+    uint32_t target_tap_count;
+    uint32_t hidden_size;
+    uint32_t layout;
+    uint32_t storage;
+    uint32_t target_layer_ids[AXIOM_QWEN38_MODEL_DSPARK_TARGET_TAP_COUNT];
+    uint32_t reserved[3];
+    const float *target_aux_hidden;
+    const float *target_last_hidden;
+} axiom_qwen38_model_dspark_capture_view;
+
 /* `max_context` applies to the sixteen full-attention KV caches. */
 int axiom_qwen38_model_create(
         const char *model_path,
@@ -161,7 +229,11 @@ int axiom_qwen38_model_create(
 void axiom_qwen38_model_destroy(axiom_qwen38_model *model);
 int axiom_qwen38_model_reset(axiom_qwen38_model *model);
 uint32_t axiom_qwen38_model_position(const axiom_qwen38_model *model);
+/* CUDA device that owns every model allocation, or -1 for a null handle. */
+int axiom_qwen38_model_device(const axiom_qwen38_model *model);
 uint64_t axiom_qwen38_model_device_bytes(const axiom_qwen38_model *model);
+axiom_qwen38_rope_profile axiom_qwen38_model_rope_profile(
+        const axiom_qwen38_model *model);
 /* Borrowed checkpoint handle used by native auxiliary modules (for example
  * the Qwen vision tower).  The model owns it; callers must not close or
  * destroy the returned handle and must release their auxiliary module before
@@ -331,6 +403,9 @@ int axiom_qwen38_model_transaction_verify_block8(
         const uint32_t input_tokens[AXIOM_QWEN38_MODEL_DSPARK_TEMPORAL_VERIFY_WIDTH],
         void *stream,
         axiom_qwen38_model_dspark_verify_block8_result *out);
+int axiom_qwen38_model_transaction_dspark_capture_view_get(
+        const axiom_qwen38_model_transaction *transaction,
+        axiom_qwen38_model_dspark_capture_view *out);
 int axiom_qwen38_model_transaction_commit_prefix(
         axiom_qwen38_model_transaction *transaction,
         uint32_t input_prefix_count);
@@ -379,6 +454,13 @@ int axiom_qwen38_model_dspark_device_transaction_verify(
         uint32_t verify_width,
         void *stream,
         axiom_qwen38_model_dspark_device_target_verify_view *out);
+/* Retrieve the revisioned borrowed hidden-state view for the currently active
+ * device-only transaction.  It succeeds only after that transaction has
+ * completed a successful temporal-M8 enqueue.  This getter enqueues no CUDA
+ * work and performs no device-to-host transfer. */
+int axiom_qwen38_model_dspark_device_transaction_hidden_view_get(
+        const axiom_qwen38_model *model,
+        axiom_qwen38_model_dspark_device_hidden_view *out);
 /* Eager device path: prefix is CUDA U32[1] in [1,8], anchor included. */
 int axiom_qwen38_model_dspark_device_transaction_commit(
         axiom_qwen38_model *model,
@@ -394,6 +476,12 @@ int axiom_qwen38_model_dspark_device_transaction_finalize(
 int axiom_qwen38_model_dspark_device_transaction_abort(
         axiom_qwen38_model *model,
         void *stream);
+
+/* Select the attention implementation used by the next CUDA graph capture.
+ * Existing graph executables are immutable and are not affected. */
+int axiom_qwen38_model_dspark_device_temporal_exact_set(
+        axiom_qwen38_model *model,
+        int enabled);
 
 /* Mark the target position/KV metadata as device-authoritative for a CUDA
  * graph replay session. Graph capture invokes the transaction callbacks only

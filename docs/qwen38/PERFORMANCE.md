@@ -6,7 +6,41 @@ record prompt/output token counts, sampling mode, speculative cycles, accepted
 draft tokens, GPU architecture, driver/CUDA/compiler versions and hashes for
 the executable, shared library, checkpoints and output.
 
-## Verified RTX 5090 fixture — 2026-08-22
+## Current record: RTX 5090, DSpark — 2026-09-05
+
+The selected R4 production profile completed three post-restart requests
+through the real private OpenAI-compatible HTTP API using the **normal
+Qwen3.8-27B NVFP4 checkpoint**, native DSpark speculative generation and one
+RTX 5090 on a dedicated physical host. The fixture used a 1,002-token prompt,
+256 completion tokens and greedy/no-thinking generation.
+
+| Run | Decode tokens/s |
+| ---: | ---: |
+| 1 | 409.111724 |
+| 2 | 409.410438 |
+| 3 | 409.323798 |
+| **Median** | **409.323798** |
+
+The decode numerator is **255 graph-emitted tokens**, excluding the first
+anchor token. The denominator is native decode time, not total HTTP time:
+prefill, time to first token, network delivery and session persistence are
+separate measurements. All responses matched the golden text SHA-256
+`b0d7b6f4bad084c8bdba57559fccbbb3b4acef5d085274123c829aa0eb793b5b`.
+The saved strict agentic gate also passed SSE, tool continuation, speculative
+path and exact-prefix session restore checks.
+
+This supersedes the historical approximately 384 tokens/s record for this
+deployment. It does not imply continuous end-to-end 409 tokens/s on arbitrary
+prompts, the uncensored checkpoint or Flash-Next. The selected production
+profile, rather than an isolated microbenchmark or faster experimental peak,
+is the record published here. See [the sanitized record](RECORD_409.json).
+
+Publication on September 7 adds source and host/build verification, not a new
+GPU benchmark. The historical private build included a source snapshot beyond
+its recorded commit; its commit alone is not a byte-identical build recipe.
+Public artifact hashes describe the newly compiled sanitized source separately.
+
+## Historical RTX 5090 fixture — 2026-08-22
 
 A separate private production fixture ran four consecutive requests through
 the real OpenAI-compatible HTTP path. Each request used:
@@ -86,9 +120,9 @@ legally obtained compatible checkpoint, and record the complete fixture
 described in `docs/BUILD_AND_VERIFY.md`. Do not compare only a peak sample:
 report repeated runs, output identity and acceptance counters.
 
-The verified result does **not** claim more than 400 tokens/s and does not prove
-performance on a different GPU, model artifact, context length or serving
-adapter.
+The August fixture did not establish more than 400 tokens/s; the September
+record above subsequently did. Neither proves performance on a different GPU,
+model artifact, context length or serving adapter.
 
 ## Persistent-session lifecycle confirmation — 2026-08-22
 
@@ -127,7 +161,7 @@ The model-backed qualification recorded temporal, paged-KV, vision and
 multi-session, cancellation and swarm gates also passed in the private
 application layer, which remains outside this repository.
 
-This publication makes no new speed claim. Two later qualification attempts on
+That v0.4 publication made no new speed claim. Two later qualification attempts on
 the same kernel code observed median visible throughput of approximately
 374.154 and 362.949 tokens/s; the latter missed the release policy threshold of
 370 tokens/s. Correctness evidence therefore ships independently from the

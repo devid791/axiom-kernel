@@ -169,6 +169,8 @@ __device__ __forceinline__ float qwen38_gdn_round_bf16(float value) {
     return __bfloat162float(__float2bfloat16_rn(value));
 }
 
+#include "axiom_qwen38_gdn_register.cuh"
+
 /* Input RMSNorm is a public BF16 boundary in the target graph.  Materialize
  * that boundary in the norm kernel itself rather than enqueueing a second
  * elementwise pass. */
@@ -181,18 +183,42 @@ __global__ void qwen38_rmsnorm8_kernel(
     if (column >= kBatch) return;
     const float *x = input + static_cast<uint64_t>(column) * kHidden;
     float *y = out + static_cast<uint64_t>(column) * kHidden;
+    static_assert(kHidden % kThreads == 0u, "RMSNorm requires complete per-thread chunks");
+    static_assert(kThreads == 256u, "Exact reduction requires the existing 256-thread block");
+    constexpr uint32_t kValuesPerThread = kHidden / kThreads;
+    // Unrolled constant indices allow 20 FP32 input/merged values to stay in
+    // registers across normalization; no extra BF16 rounding is introduced.
+    float values[kValuesPerThread];
     __shared__ float sums[kThreads];
     float sum = 0.0f;
-    for (uint32_t i = tid; i < kHidden; i += blockDim.x) sum = fmaf(x[i], x[i], sum);
+#pragma unroll
+    for (uint32_t slot = 0u; slot < kValuesPerThread; ++slot) {
+        const uint32_t i = tid + slot * kThreads;
+        values[slot] = x[i];
+        sum = fmaf(values[slot], values[slot], sum);
+    }
     sums[tid] = sum;
     __syncthreads();
-    for (uint32_t stride = blockDim.x / 2u; stride != 0u; stride >>= 1u) {
+    // Preserve the descending FP32 tree: shared 128/64/32, warp 16..1.
+    for (uint32_t stride = kThreads / 2u; stride >= 32u; stride >>= 1u) {
         if (tid < stride) sums[tid] += sums[tid + stride];
         __syncthreads();
     }
+    if (tid < 32u) {
+        float total = sums[tid];
+#pragma unroll
+        for (uint32_t stride = 16u; stride != 0u; stride >>= 1u) {
+            const float other = __shfl_down_sync(0xffffffffu, total, stride);
+            if (tid < stride) total = __fadd_rn(total, other);
+        }
+        if (tid == 0u) sums[0] = total;
+    }
+    __syncthreads();
     const float inv = rsqrtf(sums[0] / static_cast<float>(kHidden) + kEps);
-    for (uint32_t i = tid; i < kHidden; i += blockDim.x) {
-        y[i] = qwen38_gdn_round_bf16(x[i] * inv * weight[i]);
+#pragma unroll
+    for (uint32_t slot = 0u; slot < kValuesPerThread; ++slot) {
+        const uint32_t i = tid + slot * kThreads;
+        y[i] = qwen38_gdn_round_bf16(values[slot] * inv * weight[i]);
     }
 }
 
@@ -712,6 +738,7 @@ struct axiom_qwen38_gdn_layer {
     int device = -1;
     uint32_t layer = 0u;
     uint32_t temporal_value_tile = kDefaultTemporalValueTile;
+    bool temporal_register_state = false;
     bool bf16_pair = true;
     bool parallel_projection_streams = true;
     cudaStream_t ab_projection_stream = nullptr;
@@ -854,6 +881,10 @@ extern "C" int axiom_qwen38_gdn_layer_load(
     layer->device = device;
     layer->layer = layer_index;
     layer->temporal_value_tile = temporal_value_tile_from_env();
+    // Capture the exact opt-in once per layer, keeping CUDA graph dispatch stable.
+    const char *register_state = std::getenv("AXIOM_QWEN38_GDN_REGISTER_STATE");
+    layer->temporal_register_state =
+            register_state && register_state[0] == '1' && register_state[1] == '\0';
     layer->bf16_pair = !env_disabled("AXIOM_QWEN38_GDN_BF16_PAIR");
     layer->parallel_projection_streams =
             !env_disabled("AXIOM_QWEN38_PARALLEL_PROJECTIONS");
@@ -1357,6 +1388,16 @@ extern "C" int axiom_qwen38_gdn_layer_forward_temporal8_f32_device(
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
     float *final_state = static_cast<float *>(state) +
             static_cast<uint64_t>(kBatch - 1u) * kValueHeads * kHeadDim * kHeadDim;
+    if (layer->temporal_register_state) {
+        // The qualified register path is fixed at tile16; temporal_value_tile
+        // (AXIOM_QWEN38_GDN_TEMPORAL_VALUE_TILE) applies only to the fallback.
+        rc = launch_register_recurrence<16u>(
+                static_cast<const float *>(conv), static_cast<const float *>(g),
+                static_cast<const float *>(beta), static_cast<const float *>(state),
+                final_state, static_cast<float *>(recurrent),
+                static_cast<float *>(spec_delta), static_cast<float *>(spec_decay),
+                cuda_stream);
+    } else
     switch (layer->temporal_value_tile) {
         case 16u:
             rc = launch_gdn_recurrence_temporal8<16u>(

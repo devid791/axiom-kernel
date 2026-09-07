@@ -22,12 +22,14 @@ int fail(const char *what, int rc = AXIOM_OK) {
     return 1;
 }
 
-void fill_input(std::vector<float> *values) {
+void fill_input(std::vector<float> *values, float phase) {
     for (uint32_t column = 0u; column < kBatch; ++column) {
         for (uint32_t i = 0u; i < kHidden; ++i) {
             (*values)[static_cast<size_t>(column) * kHidden + i] =
-                    0.37f * std::sin(0.0023f * static_cast<float>(i) + 0.11f * column) +
-                    0.31f * std::cos(0.0059f * static_cast<float>(i) - 0.037f * column);
+                    0.37f * std::sin(
+                            0.0023f * static_cast<float>(i) + 0.11f * column + phase) +
+                    0.31f * std::cos(
+                            0.0059f * static_cast<float>(i) - 0.037f * column - phase);
         }
     }
 }
@@ -95,16 +97,20 @@ int main(int argc, char **argv) {
     }
 
     const size_t bytes = static_cast<size_t>(kHidden) * kBatch * sizeof(float);
-    std::vector<float> input(bytes / sizeof(float));
+    std::vector<float> first_input(bytes / sizeof(float));
+    std::vector<float> second_input(bytes / sizeof(float));
     std::vector<float> first(bytes / sizeof(float));
     std::vector<float> second(bytes / sizeof(float));
     std::vector<float> after_reset(bytes / sizeof(float));
-    fill_input(&input);
+    fill_input(&first_input, 0.0f);
+    fill_input(&second_input, 0.73f);
     float *d_input = nullptr;
     float *d_output = nullptr;
     cudaError_t status = cudaMalloc(&d_input, bytes);
     if (status == cudaSuccess) status = cudaMalloc(&d_output, bytes);
-    if (status == cudaSuccess) status = cudaMemcpy(d_input, input.data(), bytes, cudaMemcpyHostToDevice);
+    if (status == cudaSuccess) {
+        status = cudaMemcpy(d_input, first_input.data(), bytes, cudaMemcpyHostToDevice);
+    }
     if (status != cudaSuccess) {
         if (d_output) (void)cudaFree(d_output);
         if (d_input) (void)cudaFree(d_input);
@@ -113,18 +119,31 @@ int main(int argc, char **argv) {
         return fail("device setup");
     }
     rc = axiom_qwen38_attention_layer_forward_f32_device(layer, d_input, d_output, nullptr);
+    const int first_forward_rc = rc;
     if (rc == AXIOM_OK && cudaDeviceSynchronize() != cudaSuccess) rc = AXIOM_ERR_CUDA;
     if (rc == AXIOM_OK && cudaMemcpy(first.data(), d_output, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
         rc = AXIOM_ERR_CUDA;
     }
-    if (rc == AXIOM_OK) rc = axiom_qwen38_attention_layer_forward_f32_device(layer, d_input, d_output, nullptr);
+    if (rc == AXIOM_OK &&
+        cudaMemcpy(d_input, second_input.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        rc = AXIOM_ERR_CUDA;
+    }
+    if (rc == AXIOM_OK) {
+        rc = axiom_qwen38_attention_layer_forward_f32_device(layer, d_input, d_output, nullptr);
+    }
+    const int second_forward_rc = rc;
     if (rc == AXIOM_OK && cudaDeviceSynchronize() != cudaSuccess) rc = AXIOM_ERR_CUDA;
     if (rc == AXIOM_OK && cudaMemcpy(second.data(), d_output, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
         rc = AXIOM_ERR_CUDA;
     }
     const uint32_t position_after_two = axiom_qwen38_attention_layer_position(layer);
     if (rc == AXIOM_OK) rc = axiom_qwen38_attention_layer_reset(layer);
+    if (rc == AXIOM_OK &&
+        cudaMemcpy(d_input, first_input.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        rc = AXIOM_ERR_CUDA;
+    }
     if (rc == AXIOM_OK) rc = axiom_qwen38_attention_layer_forward_f32_device(layer, d_input, d_output, nullptr);
+    const int reset_forward_rc = rc;
     if (rc == AXIOM_OK && cudaDeviceSynchronize() != cudaSuccess) rc = AXIOM_ERR_CUDA;
     if (rc == AXIOM_OK && cudaMemcpy(after_reset.data(), d_output, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
         rc = AXIOM_ERR_CUDA;
@@ -136,10 +155,14 @@ int main(int argc, char **argv) {
             axiom_qwen38_attention_layer_position(layer) == 1u && state_delta > 0.0f && reset_delta == 0.0f;
     std::printf("{\"status\":\"%s\",\"source\":\"unsloth/Qwen3.8-27B-NVFP4\","
                 "\"backend\":\"axiom-native-qwen38-attention\",\"layer\":%u,\"batch\":8,"
-                "\"max_context\":%u,\"device_bytes\":%llu,\"state_delta\":%.9g,"
-                "\"reset_delta\":%.9g}\n",
+                "\"max_context\":%u,\"device_bytes\":%llu,\"first_forward_rc\":%d,"
+                "\"second_forward_rc\":%d,\"reset_forward_rc\":%d,\"final_rc\":%d,"
+                "\"position_after_two\":%u,\"final_position\":%u,"
+                "\"state_delta\":%.9g,\"reset_delta\":%.9g}\n",
                 pass ? "pass" : "fail", layer_index, max_context,
                 static_cast<unsigned long long>(axiom_qwen38_attention_layer_device_bytes(layer)),
+                first_forward_rc, second_forward_rc, reset_forward_rc, rc,
+                position_after_two, axiom_qwen38_attention_layer_position(layer),
                 static_cast<double>(state_delta), static_cast<double>(reset_delta));
     (void)cudaFree(d_output);
     (void)cudaFree(d_input);

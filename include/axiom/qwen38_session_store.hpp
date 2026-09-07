@@ -38,6 +38,7 @@ struct qwen38_session_paths {
     std::string session_stem;
     std::string manifest_path;
     std::string tier_path;
+    std::string transaction_path;
     uint64_t generation = 0u;
 };
 
@@ -52,6 +53,10 @@ struct qwen38_session_manifest {
     std::string profile;
     std::vector<uint32_t> token_ids;
     std::vector<uint8_t> recurrent_state;
+    /* Optional speculative-controller state at the same durable watermark as
+     * token_ids, recurrent_state and the paged KV tier. Native MTP stores its
+     * shifted pending-hidden row here; legacy DSpark leaves it empty. */
+    std::vector<uint8_t> speculative_state;
 };
 
 /* Build the exact prompt used to continue a durable native assistant state
@@ -108,14 +113,24 @@ public:
     qwen38_persistent_session_store(
             std::string base_path,
             uint32_t max_context,
-            uint64_t recurrent_state_bytes = 0u);
+            uint64_t recurrent_state_bytes = 0u,
+            uint64_t speculative_state_bytes = 0u);
 
     void configure(
             std::string base_path,
             uint32_t max_context,
-            uint64_t recurrent_state_bytes = 0u);
+            uint64_t recurrent_state_bytes = 0u,
+            uint64_t speculative_state_bytes = 0u);
 
     bool enabled() const { return !base_path_.empty(); }
+    // Writer opt-in only. Readers always accept validated v1 and v2 manifests.
+    // Old binaries cannot read v2; retain their cache namespace for rollback.
+    bool set_manifest_version(uint32_t version) {
+        if (version != 1u && version != 2u) return false;
+        manifest_version_ = version;
+        return true;
+    }
+    uint32_t manifest_version() const { return manifest_version_; }
     const std::string &root_path() const { return root_path_; }
 
     /* Validates the key, creates the namespace directory and returns the
@@ -178,6 +193,8 @@ private:
     std::string root_path_;
     uint32_t max_context_ = 0u;
     uint64_t recurrent_state_bytes_ = 0u;
+    uint64_t speculative_state_bytes_ = 0u;
+    uint32_t manifest_version_ = 1u;
 };
 
 }  // namespace qwen38

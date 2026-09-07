@@ -22,6 +22,13 @@ extern "C" {
 
 #define AXIOM_QWEN38_FLASHINFER_TEMPORAL8_ABI_VERSION 2u
 
+/* Conservative temporary-storage requirement for the fixed temporal-M8
+ * specialization.  FlashInfer chooses at most ceil(kv_len / 256) KV chunks;
+ * each chunk stores BF16 partial output plus FP32 LSE.  The result is zero for
+ * an invalid length (< 8).  Keeping this calculation beside the launcher
+ * prevents callers from under-allocating non-page-aligned contexts. */
+uint64_t axiom_qwen38_flashinfer_temporal8_workspace_bytes(uint32_t kv_len_host);
+
 /* `kv_len_host` configures the generated launch. It must be >= 8. When
  * `kv_len_device` is non-NULL, the kernel reads its U32 value for its actual
  * causal boundary; the caller must ensure it is in [8, kv_len_host].

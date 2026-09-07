@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGETS=("$ROOT/include" "$ROOT/src" "$ROOT/tests" "$ROOT/tools" "$ROOT/Makefile")
+TARGETS=("$ROOT/include" "$ROOT/src" "$ROOT/tests" "$ROOT/tools" "$ROOT/mk" "$ROOT/Makefile")
 status=0
 
 scan() {

@@ -1,4 +1,4 @@
-/* Native resident loader for the Qwen3.8 BF16 MTP sidecar. */
+/* Native resident loader for the Qwen3.8 BF16 MTP block. */
 
 #include <cstddef>
 #include <cstdint>
@@ -12,7 +12,9 @@
 
 namespace {
 
-constexpr char kMtpFile[] = "model_mtp.safetensors";
+constexpr char kMtpSidecarFile[] = "model_mtp.safetensors";
+constexpr char kModelShardPrefix[] = "model-";
+constexpr char kSafetensorsSuffix[] = ".safetensors";
 constexpr uint64_t kUploadChunkBytes = 16ull * 1024ull * 1024ull;
 
 struct mtp_tensor_spec {
@@ -85,6 +87,27 @@ bool tensor_index_valid(axiom_qwen38_mtp_tensor tensor) {
            static_cast<uint32_t>(tensor) < AXIOM_QWEN38_MTP_REQUIRED_TENSOR_COUNT;
 }
 
+bool has_suffix(const char *value, const char *suffix) {
+    if (!value || !suffix) return false;
+    const size_t value_length = std::strlen(value);
+    const size_t suffix_length = std::strlen(suffix);
+    return value_length >= suffix_length &&
+           std::memcmp(value + value_length - suffix_length, suffix, suffix_length) == 0;
+}
+
+/* axiom_model_open() records only the basename of regular .safetensors files
+ * discovered inside the opened model directory.  Restrict MTP tensors to the
+ * historical dedicated sidecar or a normal Hugging Face model shard. */
+bool mtp_tensor_file_allowed(const char *file) {
+    if (!file || !file[0] || std::strchr(file, '/') || std::strchr(file, '\\')) return false;
+    if (std::strcmp(file, kMtpSidecarFile) == 0) return true;
+    const size_t prefix_length = sizeof(kModelShardPrefix) - 1u;
+    const size_t suffix_length = sizeof(kSafetensorsSuffix) - 1u;
+    const size_t file_length = std::strlen(file);
+    return std::strncmp(file, kModelShardPrefix, prefix_length) == 0 &&
+           file_length > prefix_length + suffix_length && has_suffix(file, kSafetensorsSuffix);
+}
+
 int expected_bytes(const mtp_tensor_spec &spec, uint64_t *out) {
     if (!out) return AXIOM_ERR_INVALID_ARGUMENT;
     uint64_t elements = 1u;
@@ -122,7 +145,7 @@ int inspect_tensor(
     info.abi_version = AXIOM_ABI_VERSION;
     int rc = axiom_model_tensor_info_get(model, spec.name, &info);
     if (rc != AXIOM_OK) return rc;
-    if (std::strcmp(info.file, kMtpFile) != 0 ||
+    if (!mtp_tensor_file_allowed(info.file) ||
         info.dtype != AXIOM_TENSOR_DTYPE_BF16 ||
         info.rank != spec.rank) {
         return AXIOM_ERR_INVALID_ARGUMENT;
@@ -209,10 +232,22 @@ extern "C" int axiom_qwen38_mtp_load(
     if (rc != AXIOM_OK) return rc;
 
     axiom_tensor_info tensor_infos[AXIOM_QWEN38_MTP_REQUIRED_TENSOR_COUNT]{};
+    char source_file[sizeof(tensor_infos[0].file)]{};
     uint64_t checkpoint_bytes = 0u;
     for (uint32_t index = 0u; index < AXIOM_QWEN38_MTP_REQUIRED_TENSOR_COUNT; ++index) {
         rc = inspect_tensor(model, kTensorSpecs[index], &tensor_infos[index]);
         if (rc != AXIOM_OK) return rc;
+        if (index == 0u) {
+            const size_t source_length = std::strlen(tensor_infos[index].file);
+            if (source_length == 0u || source_length >= sizeof(source_file)) {
+                return AXIOM_ERR_INVALID_ARGUMENT;
+            }
+            std::memcpy(source_file, tensor_infos[index].file, source_length + 1u);
+        } else if (std::strcmp(source_file, tensor_infos[index].file) != 0) {
+            /* The currently supported Qwen3.8 MTP block is an atomic payload:
+             * do not assemble it silently from unrelated checkpoint files. */
+            return AXIOM_ERR_INVALID_ARGUMENT;
+        }
         if (!checked_add(checkpoint_bytes, tensor_infos[index].byte_count, &checkpoint_bytes)) {
             return AXIOM_ERR_BUDGET;
         }

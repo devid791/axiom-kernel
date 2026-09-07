@@ -40,6 +40,11 @@ extern "C" {
 #define AXIOM_QWEN38_DSPARK_MASK_TOKEN_ID 248077u
 #define AXIOM_QWEN38_DSPARK_MARKOV_RANK 256u
 #define AXIOM_QWEN38_DSPARK_CONFIDENCE_FEATURES 5376u
+#define AXIOM_QWEN38_DSPARK_ROPE_THETA 10000000.0f
+#define AXIOM_QWEN38_DSPARK_YARN_FACTOR 32.0f
+#define AXIOM_QWEN38_DSPARK_YARN_ORIGINAL_CONTEXT 8192.0f
+#define AXIOM_QWEN38_DSPARK_YARN_BETA_FAST 32.0f
+#define AXIOM_QWEN38_DSPARK_YARN_BETA_SLOW 1.0f
 #define AXIOM_QWEN38_DSPARK_GLOBAL_TENSOR_COUNT 7u
 #define AXIOM_QWEN38_DSPARK_LAYER_TENSOR_COUNT 11u
 #define AXIOM_QWEN38_DSPARK_TENSOR_COUNT 62u
@@ -113,8 +118,11 @@ typedef struct {
 /* Overall contract for a native DSpark executor. All activation pointers in
  * the request types below are CUDA F32 column-major buffers. DSpark uses
  * conventional Qwen3 RMSNorm scale weights (no +1 zero-centering) and the
- * Qwen3.8 1M YaRN RoPE profile: theta=1e7, factor=4, native context=262144,
- * beta_fast=32, beta_slow=1. */
+ * The released Qwen3.8-27B-DSpark checkpoint has its own YaRN profile.  It is
+ * not the target model's 1M override: theta=1e7, factor=32, original context
+ * 8192, beta_fast=32, beta_slow=1.  Treating the target and draft RoPE
+ * profiles as interchangeable changes every draft attention layer and lowers
+ * acceptance while target verification can still hide the error. */
 typedef struct {
     uint32_t abi_version;
     uint32_t scalar_dtype;

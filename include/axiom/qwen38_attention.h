@@ -21,9 +21,24 @@ extern "C" {
 #define AXIOM_QWEN38_ATTENTION_KV_HEADS 4u
 #define AXIOM_QWEN38_ATTENTION_HEAD_DIM 256u
 #define AXIOM_QWEN38_ATTENTION_ROPE_DIM 64u
+#define AXIOM_QWEN38_TARGET_ROPE_THETA 10000000.0f
+#define AXIOM_QWEN38_TARGET_YARN_FACTOR 4.0f
+#define AXIOM_QWEN38_TARGET_YARN_ORIGINAL_CONTEXT 262144.0f
+#define AXIOM_QWEN38_TARGET_YARN_BETA_FAST 32.0f
+#define AXIOM_QWEN38_TARGET_YARN_BETA_SLOW 1.0f
+#define AXIOM_QWEN38_TARGET_YARN_MSCALE 1.138629436111989f
 #define AXIOM_QWEN38_ATTENTION_KV_FP8_PARITY_ABI_VERSION 1u
 #define AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS 256u
 #define AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES 524288u
+
+/* RoPE geometry is immutable for the lifetime of one loaded target.  A
+ * context budget never changes this profile: native 262K and YaRN4 1M must
+ * use separate model/cache namespaces. */
+typedef enum axiom_qwen38_rope_profile {
+    AXIOM_QWEN38_ROPE_PROFILE_INVALID = 0,
+    AXIOM_QWEN38_ROPE_PROFILE_NATIVE_262K = 1,
+    AXIOM_QWEN38_ROPE_PROFILE_YARN4_1M = 2,
+} axiom_qwen38_rope_profile;
 
 typedef struct axiom_qwen38_attention_layer axiom_qwen38_attention_layer;
 typedef struct axiom_qwen38_kv_tier axiom_qwen38_kv_tier;
@@ -58,6 +73,8 @@ void axiom_qwen38_attention_layer_destroy(axiom_qwen38_attention_layer *layer);
 int axiom_qwen38_attention_layer_reset(axiom_qwen38_attention_layer *layer);
 uint32_t axiom_qwen38_attention_layer_position(const axiom_qwen38_attention_layer *layer);
 uint64_t axiom_qwen38_attention_layer_device_bytes(const axiom_qwen38_attention_layer *layer);
+axiom_qwen38_rope_profile axiom_qwen38_attention_layer_rope_profile(
+        const axiom_qwen38_attention_layer *layer);
 /* Restore a position after page import. For the paged provider this also
  * rebuilds the logical-to-hot-page map and leaves the current page clean. */
 int axiom_qwen38_attention_layer_restore_position(
@@ -83,6 +100,31 @@ int axiom_qwen38_attention_layer_kv_page_import(
         uint32_t logical_page,
         const void *host_page,
         uint64_t host_page_bytes);
+
+/* Qualification-only synchronous export of the four internal attention
+ * boundaries. Host buffers use column-major [column_count,24*256] F32. This
+ * API is intentionally outside graph replay and permits an active host
+ * temporal transaction only when it uses the default stream. */
+int axiom_qwen38_attention_layer_validation_export(
+        const axiom_qwen38_attention_layer *layer,
+        uint32_t first_column,
+        uint32_t column_count,
+        float *host_q,
+        float *host_gate,
+        float *host_attention,
+        float *host_gated_attention,
+        uint64_t host_elements);
+
+/* Qualification-only byte-exact export of the paged provider and its
+ * contiguous temporal-hot mirror for one logical page.  A non-streaming
+ * layer has only one canonical resident view, which is returned in both
+ * outputs so the common temporal validator remains usable offline. */
+int axiom_qwen38_attention_layer_validation_kv_views_export(
+        const axiom_qwen38_attention_layer *layer,
+        uint32_t logical_page,
+        void *host_paged,
+        void *host_temporal_hot,
+        uint64_t host_page_bytes);
 /* Bind the target layer to the durable tier. With AXIOM_QWEN38_KV_STREAMING=1
  * this enables the real page provider: current-page K/V stays on device,
  * completed pages are flushed and cold pages are read before online attention. */
@@ -97,6 +139,16 @@ int axiom_qwen38_attention_layer_kv_fp8_parity_enable(
 int axiom_qwen38_attention_layer_kv_fp8_parity_get(
         const axiom_qwen38_attention_layer *layer,
         axiom_qwen38_attention_kv_fp8_parity *out);
+
+/* Capture-time selector for the device temporal backend. It is rejected
+ * while a speculative transaction is active; already instantiated CUDA
+ * graphs retain the kernels captured under the selected value. */
+int axiom_qwen38_attention_layer_device_temporal_exact_set(
+        axiom_qwen38_attention_layer *layer,
+        int enabled);
+int axiom_qwen38_attention_layer_device_temporal_exact_can_set(
+        const axiom_qwen38_attention_layer *layer,
+        int enabled);
 
 /* Scalar compatibility path; `stream` must be NULL. */
 int axiom_qwen38_attention_layer_forward_f32_device(

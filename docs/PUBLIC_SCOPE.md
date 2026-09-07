@@ -1,5 +1,15 @@
 # Public release scope
 
+The v0.5 update includes the subsequent production-reference kernel changes
+through `d29b033c6c1593ed31ae6c4e15431a1d11ca4ed1`, plus the separate native
+Flash-Next backend at `a4aeda07b332471cb8aed1320b231c03521f01b2`.
+Public changes are merged onto the sanitized tree, not copied with internal
+history. HTTP daemons, deployment profiles, credentials and activation-control
+code remain outside the public boundary. The later unqualified HTTP width2,
+persistence-overlap and adaptive-proposal candidate is not included as a
+production feature. Public build qualification does not imply a new GPU
+inference performance result.
+
 This repository is a sanitized public source snapshot. The resident-graph ABI
 update is derived from reviewed source tree
 `aa4aa9ff708d3476d3959945e70a8cac1a50647b`, with qualification evidence
@@ -17,7 +27,7 @@ Included:
   independently from any one model backend;
 - native Qwen3.8 decoder, NVFP4/FP8/BF16 primitives, DSpark/M8 execution,
   vision, optional media decoding and paged/persistent KV components;
-- DSpark layout ABI v2, device-owned graph termination, exact committed-token
+- DSpark layout ABI v3, device-owned graph termination, exact committed-token
   history and resident target-session ownership renewal;
 - generic engine contracts, reasoning profiles and swarm scheduler;
 - crash-safe TTL/LRU persistent-session cleanup and stateful-resume helpers;

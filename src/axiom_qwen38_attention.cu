@@ -1,5 +1,15 @@
 /* Native resident full-attention mixer for unsloth/Qwen3.8-27B-NVFP4. */
 
+#ifndef AXIOM_EXACT_KV_L2_HINT
+#define AXIOM_EXACT_KV_L2_HINT 1
+#endif
+#ifndef AXIOM_EXACT_SHARED_VALUES
+#define AXIOM_EXACT_SHARED_VALUES 1
+#endif
+#ifndef AXIOM_EXACT_VALUE_STAGE_TOKENS
+#define AXIOM_EXACT_VALUE_STAGE_TOKENS 128u
+#endif
+
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -37,6 +47,14 @@ constexpr uint32_t kGqaHeads = kHeads / kKvHeads;
 constexpr uint32_t kAttentionSplitK = 8u;
 constexpr uint32_t kAttentionTileTokens = 16u;
 constexpr uint32_t kAttentionThreads = kGqaHeads * 32u;
+/* Bit-exact temporal attention keeps only one score tile resident.  Eight
+ * warps score eight cache tokens per CTA; the following kernel consumes that
+ * tile in chronological order and persists only the online-softmax state. */
+constexpr uint32_t kExactAttentionTileTokens = 256u;
+constexpr uint32_t kExactScoreWarps = 8u;
+constexpr uint32_t kExactScoreThreads = kExactScoreWarps * 32u;
+constexpr uint32_t kExactScoreTokenGroups =
+        (kExactAttentionTileTokens + kExactScoreWarps - 1u) / kExactScoreWarps;
 /* Keep the operator-configured hottest logical pages resident per target
  * layer. The current page is one of these slots; older pages continue to use
  * the durable NVMe tier. The DSpark/M8 window is independently selected by a
@@ -50,15 +68,15 @@ constexpr uint32_t kMaxTemporalHotTokens =
 constexpr uint32_t kMaxStreamHotPages = 256u;
 constexpr uint32_t kKvParityMaxContext = 64u;
 constexpr float kEps = 1.0e-6f;
-constexpr float kRopeTheta = 1.0e7f;
+constexpr float kRopeTheta = AXIOM_QWEN38_TARGET_ROPE_THETA;
 /* Qwen3.8 1M extension profile from the SGLang/Qwen3.5 serving recipe.
  * The checkpoint is native to 262,144 tokens; factor=4 extends it to roughly
  * 1M. Keep the target-side blend identical to DSpark so Q/K use one geometry. */
-constexpr float kYarnFactor = 4.0f;
-constexpr float kYarnOriginalContext = 262144.0f;
-constexpr float kYarnBetaFast = 32.0f;
-constexpr float kYarnBetaSlow = 1.0f;
-constexpr float kYarnMscale = 1.138629436111989f; /* 1 + 0.1 * ln(4). */
+constexpr float kYarnFactor = AXIOM_QWEN38_TARGET_YARN_FACTOR;
+constexpr float kYarnOriginalContext = AXIOM_QWEN38_TARGET_YARN_ORIGINAL_CONTEXT;
+constexpr float kYarnBetaFast = AXIOM_QWEN38_TARGET_YARN_BETA_FAST;
+constexpr float kYarnBetaSlow = AXIOM_QWEN38_TARGET_YARN_BETA_SLOW;
+constexpr float kYarnMscale = AXIOM_QWEN38_TARGET_YARN_MSCALE;
 /* RadixArk Qwen3.8 D256 target has no calibrated K/V scale tensors. */
 constexpr float kKvFp8Scale = 1.0f;
 constexpr float kKvFp8Descale = 1.0f;
@@ -72,6 +90,9 @@ static_assert(kQDim == 6144u && kKvDim == 1024u && kQGateDim == 12288u,
               "Qwen3.8 attention geometry changed");
 static_assert(kGqaHeads == 6u && kAttentionThreads == 192u,
               "Qwen3.8 GQA geometry changed");
+static_assert(kExactScoreThreads == kThreads &&
+              kExactAttentionTileTokens % kExactScoreWarps == 0u,
+              "exact temporal attention tile geometry changed");
 
 __device__ __forceinline__ float qwen38_yarn_inv_frequency(const uint32_t pair) {
     const float dim = static_cast<float>(kRopeDim);
@@ -228,15 +249,9 @@ __device__ __forceinline__ uint8_t qwen38_kv_encode_e4m3fn_scale1(float value) {
 __device__ __forceinline__ float qwen38_kv_decode_e4m3fn_scale1(uint8_t code) {
     const uint32_t magnitude = static_cast<uint32_t>(code) & 0x7fu;
     if (magnitude == 0x7fu) return nanf("");
-    const uint32_t exponent = (static_cast<uint32_t>(code) >> 3u) & 0x0fu;
-    const uint32_t mantissa = static_cast<uint32_t>(code) & 0x07u;
-    const uint32_t sign = (static_cast<uint32_t>(code) & 0x80u) << 24u;
-    if (exponent == 0u) {
-        const float value = ldexpf(static_cast<float>(mantissa), -9);
-        return sign != 0u ? -value * kKvFp8Descale : value * kKvFp8Descale;
-    }
-    const uint32_t fp32 = sign | ((exponent + 120u) << 23u) | (mantissa << 20u);
-    return __uint_as_float(fp32) * kKvFp8Descale;
+    // Every finite E4M3 value is exactly representable in half and float.
+    return __half2float(static_cast<__half>(
+            __nv_cvt_fp8_to_halfraw(code, __NV_E4M3))) * kKvFp8Descale;
 }
 
 __device__ __forceinline__ void qwen38_kv_record_fp8_parity(
@@ -695,11 +710,10 @@ __global__ void qwen38_attention_merge_gqa_splitk8_kernel(
     }
 }
 
-/* Scalar and host-M8 validation must retain one chronological reduction
- * order so the temporal transaction can prove exact parity against eight
- * sequential forward_token calls. Device graph decode uses the tiled path
- * above (or FlashInfer); this compact reference kernel is deliberately kept
- * off that hot path. */
+/* Scalar and host-M8 validation retain one chronological reduction order so
+ * the temporal transaction can prove exact parity against eight sequential
+ * forward_token calls.  Device graph decode uses the exact tiled producer /
+ * consumer below; this compact kernel remains the explicit rollback oracle. */
 template <bool kTemporal>
 __global__ void qwen38_attention_core_fp8_reference_kernel(
         const float *__restrict__ q,
@@ -756,6 +770,436 @@ __global__ void qwen38_attention_core_fp8_reference_kernel(
     }
     out[q_base + dim] = qwen38_attention_round_bf16(
             denominator > 0.0f ? accumulator / denominator : 0.0f);
+}
+
+/* Exact temporal score producer.  One CTA owns one (row, query-head) and
+ * eight cache tokens.  A warp owns one token; lane N owns dimensions
+ * N+32*k.  The register tree below is deliberately the same tree formed by
+ * the reference CTA's shared-memory strides 128, 64 and 32.  Shuffles then
+ * reproduce strides 16, 8, 4, 2 and 1.  Explicit round-to-nearest multiply
+ * and add intrinsics prevent contraction or reassociation from changing the
+ * F32 score produced by the reference kernel. */
+__global__ void qwen38_attention_temporal_exact_score_kernel(
+        const float *__restrict__ q,
+        const uint8_t *__restrict__ k_cache,
+        float *__restrict__ scores,
+        uint32_t tile_begin,
+        const uint32_t *__restrict__ base_position_device,
+        uint32_t context_limit,
+        bool full_scores = false) {
+    const uint32_t query_head = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (query_head >= kHeads || row >= kBatch || threadIdx.x >= kExactScoreThreads) return;
+
+    const uint64_t q_base =
+            (static_cast<uint64_t>(row) * kHeads + query_head) * kHeadDim;
+    __shared__ float query_values[kHeadDim];
+    query_values[threadIdx.x] = q[q_base + threadIdx.x];
+    __syncthreads();
+
+    const uint32_t base_position = base_position_device[0];
+    if (base_position > context_limit || kBatch > context_limit - base_position) return;
+    const uint32_t cache_tokens = base_position + row + 1u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    for (uint32_t tile_token = blockIdx.z * kExactScoreWarps + warp;
+         tile_token < (full_scores ? cache_tokens : kExactAttentionTileTokens);
+         tile_token += gridDim.z * kExactScoreWarps) {
+    const uint32_t token = tile_begin + tile_token;
+    if (token >= cache_tokens) break;
+
+    const uint32_t kv_head = query_head / kGqaHeads;
+    const uint64_t cache_base =
+            (static_cast<uint64_t>(token) * kKvHeads + kv_head) * kHeadDim;
+#if AXIOM_EXACT_KV_L2_HINT && __CUDA_ARCH__ >= 800
+    if (lane == 0u) {
+        asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(k_cache + cache_base));
+        asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(k_cache + cache_base + 128u));
+    }
+#endif
+    float products[kHeadDim / 32u];
+#pragma unroll
+    for (uint32_t part = 0u; part < kHeadDim / 32u; ++part) {
+        const uint32_t dim = lane + part * 32u;
+        products[part] = __fmul_rn(
+                query_values[dim],
+                qwen38_kv_decode_e4m3fn_scale1(k_cache[cache_base + dim]));
+    }
+
+    const float stride128_0 = __fadd_rn(products[0], products[4]);
+    const float stride128_1 = __fadd_rn(products[1], products[5]);
+    const float stride128_2 = __fadd_rn(products[2], products[6]);
+    const float stride128_3 = __fadd_rn(products[3], products[7]);
+    const float stride64_0 = __fadd_rn(stride128_0, stride128_2);
+    const float stride64_1 = __fadd_rn(stride128_1, stride128_3);
+    float dot = __fadd_rn(stride64_0, stride64_1);
+    constexpr uint32_t kWarpMask = 0xffffffffu;
+#pragma unroll
+    for (uint32_t offset = 16u; offset != 0u; offset >>= 1u) {
+        dot = __fadd_rn(dot, __shfl_down_sync(kWarpMask, dot, offset));
+    }
+    if (lane == 0u) {
+        const uint64_t state_index = static_cast<uint64_t>(row) * kHeads + query_head;
+        scores[state_index * (full_scores ? context_limit : kExactAttentionTileTokens) + tile_token] =
+                __fmul_rn(dot, rsqrtf(static_cast<float>(kHeadDim)));
+    }
+    }
+}
+
+/* The consumer preserves the reference kernel's token chronology.  Every
+ * thread owns one value dimension and independently repeats the identical
+ * maximum/denominator recurrence.  Thread zero persists the common scalar
+ * state, while `out` holds the per-dimension accumulator between fixed-size
+ * tiles.  The final tile alone materializes the BF16 public boundary. */
+__global__ void qwen38_attention_temporal_exact_accumulate_kernel(
+        const uint8_t *__restrict__ v_cache,
+        const float *__restrict__ scores,
+        float *__restrict__ maxima,
+        float *__restrict__ denominators,
+        float *__restrict__ out,
+        uint32_t tile_begin,
+        const uint32_t *__restrict__ base_position_device,
+        uint32_t context_limit) {
+    const uint32_t query_head = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    const uint32_t dim = threadIdx.x;
+    if (query_head >= kHeads || row >= kBatch || dim >= kHeadDim) return;
+
+    const uint32_t base_position = base_position_device[0];
+    if (base_position > context_limit || kBatch > context_limit - base_position) return;
+    const uint32_t cache_tokens = base_position + row + 1u;
+    if (tile_begin >= cache_tokens) return;
+    const uint32_t tile_end = min(
+            cache_tokens, tile_begin + kExactAttentionTileTokens);
+    const uint32_t kv_head = query_head / kGqaHeads;
+    const uint64_t state_index = static_cast<uint64_t>(row) * kHeads + query_head;
+    const uint64_t q_base = state_index * kHeadDim;
+
+    float maximum = tile_begin == 0u
+            ? -3.4028234663852886e+38F : maxima[state_index];
+    float denominator = tile_begin == 0u ? 0.0f : denominators[state_index];
+    float accumulator = tile_begin == 0u ? 0.0f : out[q_base + dim];
+    for (uint32_t token = tile_begin; token < tile_end; ++token) {
+        const float score = scores[
+                state_index * kExactAttentionTileTokens + (token - tile_begin)];
+        const float next_maximum = fmaxf(maximum, score);
+        const float correction = __expf(maximum - next_maximum);
+        const float weight = __expf(score - next_maximum);
+        denominator = denominator * correction + weight;
+        const uint64_t cache_index =
+                (static_cast<uint64_t>(token) * kKvHeads + kv_head) * kHeadDim + dim;
+        accumulator = accumulator * correction +
+                weight * qwen38_kv_decode_e4m3fn_scale1(v_cache[cache_index]);
+        maximum = next_maximum;
+    }
+    if (dim == 0u) {
+        maxima[state_index] = maximum;
+        denominators[state_index] = denominator;
+    }
+    out[q_base + dim] = tile_end == cache_tokens
+            ? qwen38_attention_round_bf16(
+                    denominator > 0.0f ? accumulator / denominator : 0.0f)
+            : accumulator;
+}
+
+/* Fused exact temporal tile.  One CTA owns one (row, query-head): eight
+ * warps score eight tokens at a time with the same reduction tree as the
+ * reference kernel, thread zero produces the common online-softmax
+ * coefficients in chronological order, and one thread per value dimension
+ * applies those coefficients.  All inter-thread exchange remains F32 in
+ * shared memory and tiles remain serialized by the launch stream.
+ * Experimental OverlapDenominator requires 288 threads: warp eight's lane
+ * zero runs the same denominator recurrence alongside the value sweep.
+ * The default specialization remains the 256-thread serving reference. */
+template<bool OverlapDenominator = false>
+__global__ void qwen38_attention_temporal_exact_fused_kernel(
+        const float *__restrict__ q,
+        const uint8_t *__restrict__ k_cache,
+        const uint8_t *__restrict__ v_cache,
+        float *__restrict__ maxima,
+        float *__restrict__ denominators,
+        float *__restrict__ out,
+        uint32_t tile_begin,
+        const uint32_t *__restrict__ base_position_device,
+        uint32_t context_limit,
+        bool persistent_tiles,
+        const float *precomputed_scores = nullptr) {
+    const uint32_t query_head = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    const uint32_t dim = threadIdx.x;
+    if (query_head >= kHeads || row >= kBatch ||
+        dim >= kHeadDim + (OverlapDenominator ? 32u : 0u)) return;
+
+    const uint32_t base_position = base_position_device[0];
+    if (base_position > context_limit || kBatch > context_limit - base_position) return;
+    const uint32_t cache_tokens = base_position + row + 1u;
+    if (tile_begin >= cache_tokens) return;
+    const uint32_t kv_head = query_head / kGqaHeads;
+    const uint64_t state_index = static_cast<uint64_t>(row) * kHeads + query_head;
+    const uint64_t q_base = state_index * kHeadDim;
+
+    __shared__ float query_values[kHeadDim];
+    __shared__ float corrections[kExactAttentionTileTokens];
+    __shared__ float weights[kExactAttentionTileTokens];
+    __shared__ float common_denominator;
+    __shared__ float warp_maxima[kExactScoreWarps];
+#if AXIOM_EXACT_SHARED_VALUES
+    constexpr uint32_t stage_tokens = AXIOM_EXACT_VALUE_STAGE_TOKENS;
+    static_assert(stage_tokens > 0u && stage_tokens <= 128u, "Invalid shared KV tile");
+    __shared__ __align__(16) uint8_t staged_values[stage_tokens * kHeadDim];
+#endif
+    if (dim < kHeadDim) query_values[dim] = q[q_base + dim];
+    __syncthreads();
+
+    const uint32_t warp = dim >> 5u;
+    const uint32_t lane = dim & 31u;
+    constexpr uint32_t kWarpMask = 0xffffffffu;
+    // Each CTA owns one row/head throughout all tiles. Preserve the exact
+    // chronological softmax and F32 tile boundaries of the multi-launch path.
+    for (; tile_begin < cache_tokens; tile_begin += kExactAttentionTileTokens) {
+    const uint32_t tile_end = min(cache_tokens, tile_begin + kExactAttentionTileTokens);
+    const uint32_t tile_tokens = tile_end - tile_begin;
+    if (precomputed_scores) {
+        if (dim < tile_tokens) corrections[dim] = precomputed_scores[state_index * context_limit + tile_begin + dim];
+    } else {
+    for (uint32_t group = 0u;
+         group < kExactScoreTokenGroups; ++group) {
+        const uint32_t local_token = group * kExactScoreWarps + warp;
+        if (warp < kExactScoreWarps && local_token < tile_tokens) {
+            const uint32_t token = tile_begin + local_token;
+            const uint64_t cache_base =
+                    (static_cast<uint64_t>(token) * kKvHeads + kv_head) * kHeadDim;
+            float products[kHeadDim / 32u];
+#pragma unroll
+            for (uint32_t part = 0u; part < kHeadDim / 32u; ++part) {
+                const uint32_t product_dim = lane + part * 32u;
+                products[part] = __fmul_rn(
+                        query_values[product_dim],
+                        qwen38_kv_decode_e4m3fn_scale1(
+                                k_cache[cache_base + product_dim]));
+            }
+            const float stride128_0 = __fadd_rn(products[0], products[4]);
+            const float stride128_1 = __fadd_rn(products[1], products[5]);
+            const float stride128_2 = __fadd_rn(products[2], products[6]);
+            const float stride128_3 = __fadd_rn(products[3], products[7]);
+            const float stride64_0 = __fadd_rn(stride128_0, stride128_2);
+            const float stride64_1 = __fadd_rn(stride128_1, stride128_3);
+            float dot = __fadd_rn(stride64_0, stride64_1);
+#pragma unroll
+            for (uint32_t offset = 16u; offset != 0u; offset >>= 1u) {
+                dot = __fadd_rn(dot, __shfl_down_sync(kWarpMask, dot, offset));
+            }
+            if (lane == 0u) {
+                corrections[local_token] = __fmul_rn(
+                        dot, rsqrtf(static_cast<float>(kHeadDim)));
+            }
+        }
+    }
+    }
+    __syncthreads();
+
+    // Prefix maxima do not sum/reassociate scores. Compute the identical
+    // chronological maxima in parallel, then preserve the serial FMA sum.
+    const float score = dim < tile_tokens ? corrections[dim] : -3.4028234663852886e+38F;
+    float prefix_max = score;
+#pragma unroll
+    for (uint32_t offset = 1u; offset < 32u; offset <<= 1u) {
+        const float previous = __shfl_up_sync(kWarpMask, prefix_max, offset);
+        if (lane >= offset) prefix_max = fmaxf(previous, prefix_max);
+    }
+    if (lane == 31u && warp < kExactScoreWarps) warp_maxima[warp] = prefix_max;
+    __syncthreads();
+    if (dim == 0u) {
+        float carry = tile_begin == 0u ? -3.4028234663852886e+38F : maxima[state_index];
+#pragma unroll
+        for (uint32_t w = 0u; w < kExactScoreWarps; ++w) {
+            const float next = fmaxf(carry, warp_maxima[w]);
+            warp_maxima[w] = carry;
+            carry = next;
+        }
+        maxima[state_index] = carry;
+    }
+    __syncthreads();
+    const float preceding = __shfl_up_sync(kWarpMask, prefix_max, 1u);
+    const float warp_carry = warp < kExactScoreWarps ? warp_maxima[warp] : 0.0f;
+    const float previous_max = lane == 0u ? warp_carry : fmaxf(warp_carry, preceding);
+    if (dim < tile_tokens) {
+        const float next_max = fmaxf(previous_max, score);
+        corrections[dim] = __expf(previous_max - next_max);
+        weights[dim] = __expf(score - next_max);
+    }
+    __syncthreads();
+    if constexpr (!OverlapDenominator) {
+    if (dim == 0u) {
+        float denominator = tile_begin == 0u ? 0.0f : denominators[state_index];
+        for (uint32_t local_token = 0u; local_token < tile_tokens; ++local_token)
+            denominator = denominator * corrections[local_token] + weights[local_token];
+        denominators[state_index] = denominator;
+        common_denominator = denominator;
+    }
+    __syncthreads();
+    }
+
+    float denominator = 0.0f;
+    if constexpr (OverlapDenominator) {
+        if (dim == kHeadDim)
+            denominator = tile_begin == 0u ? 0.0f : denominators[state_index];
+    }
+    float accumulator = tile_begin == 0u || dim >= kHeadDim ? 0.0f : out[q_base + dim];
+#if AXIOM_EXACT_SHARED_VALUES
+    for (uint32_t first = 0u; first < tile_tokens; first += stage_tokens) {
+        const uint32_t count = min(stage_tokens, tile_tokens - first);
+        constexpr uint32_t vectors_per_token = kHeadDim / 16u;
+        for (uint32_t i = dim; dim < kHeadDim && i < count * vectors_per_token; i += kHeadDim) {
+            const uint32_t token = tile_begin + first + i / vectors_per_token;
+            const uint64_t offset =
+                (static_cast<uint64_t>(token) * kKvHeads + kv_head) * kHeadDim +
+                (i % vectors_per_token) * 16u;
+#if AXIOM_EXACT_KV_L2_HINT && __CUDA_ARCH__ >= 800
+            if ((i & 7u) == 0u)
+                asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(v_cache + offset));
+#endif
+#if defined(AXIOM_EXACT_ASYNC_VALUES) && __CUDA_ARCH__ >= 800
+            const unsigned shared_address = static_cast<unsigned>(__cvta_generic_to_shared(staged_values + i * 16u));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::
+                "r"(shared_address), "l"(v_cache + offset) : "memory");
+#else
+            reinterpret_cast<uint4 *>(staged_values)[i] =
+                *reinterpret_cast<const uint4 *>(v_cache + offset);
+#endif
+        }
+#if defined(AXIOM_EXACT_ASYNC_VALUES) && __CUDA_ARCH__ >= 800
+        asm volatile("cp.async.commit_group;" ::: "memory");
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+#endif
+        __syncthreads();
+        if (dim < kHeadDim) for (uint32_t i = 0u; i < count; ++i) {
+            accumulator = accumulator * corrections[first + i] +
+                weights[first + i] * qwen38_kv_decode_e4m3fn_scale1(staged_values[i * kHeadDim + dim]);
+        }
+        if constexpr (OverlapDenominator) {
+            if (dim == kHeadDim) {
+                for (uint32_t i = 0u; i < count; ++i)
+                    denominator = denominator * corrections[first + i] + weights[first + i];
+                if (first + count == tile_tokens) {
+                    denominators[state_index] = denominator;
+                    common_denominator = denominator;
+                }
+            }
+        }
+        __syncthreads();
+    }
+#else
+#if !AXIOM_EXACT_SHARED_VALUES
+    // All threads still reach the candidate's denominator publication barrier.
+#endif
+    if (dim < kHeadDim) {
+#if defined(AXIOM_EXACT_VALUE_UNROLL4)
+#pragma unroll 4
+#endif
+    for (uint32_t local_token = 0u;
+         local_token < tile_tokens; ++local_token) {
+        const uint32_t token = tile_begin + local_token;
+        const uint64_t cache_index =
+                (static_cast<uint64_t>(token) * kKvHeads + kv_head) * kHeadDim + dim;
+#if AXIOM_EXACT_KV_L2_HINT && __CUDA_ARCH__ >= 800
+        if ((dim & 127u) == 0u && token + 32u < cache_tokens) {
+            const uint8_t *future = v_cache + cache_index + 32u * kKvHeads * kHeadDim;
+            asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(future));
+        }
+#endif
+        accumulator = accumulator * corrections[local_token] +
+                weights[local_token] *
+                        qwen38_kv_decode_e4m3fn_scale1(v_cache[cache_index]);
+    }
+    }
+    if constexpr (OverlapDenominator) {
+        if (dim == kHeadDim) {
+            for (uint32_t i = 0u; i < tile_tokens; ++i)
+                denominator = denominator * corrections[i] + weights[i];
+            denominators[state_index] = denominator;
+            common_denominator = denominator;
+        }
+        __syncthreads();
+    }
+#endif
+    if (dim < kHeadDim) out[q_base + dim] = tile_end == cache_tokens
+            ? qwen38_attention_round_bf16(
+                    common_denominator > 0.0f
+                            ? accumulator / common_denominator : 0.0f)
+            : accumulator;
+    if (!persistent_tiles) break;
+    __syncthreads();
+    }
+}
+
+int qwen38_attention_temporal_exact_tiled_enqueue(
+        const float *q,
+        const uint8_t *k_cache,
+        const uint8_t *v_cache,
+        float *scores,
+        float *maxima,
+        float *denominators,
+        float *out,
+        const uint32_t *base_position_device,
+        uint32_t context_limit,
+        uint32_t configured_temporal_window,
+        bool fused,
+        cudaStream_t stream) {
+    if (!q || !k_cache || !v_cache || !scores || !maxima || !denominators || !out ||
+        !base_position_device || context_limit == 0u || configured_temporal_window == 0u ||
+        context_limit > configured_temporal_window ||
+        configured_temporal_window > kMaxTemporalHotTokens) {
+        return AXIOM_ERR_BUDGET;
+    }
+    const uint32_t tile_count = context_limit / kExactAttentionTileTokens +
+            (context_limit % kExactAttentionTileTokens != 0u ? 1u : 0u);
+    if (fused && env_enabled("AXIOM_QWEN38_EXACT_PERSISTENT_TILES")) {
+        const bool parallel_scores = env_enabled("AXIOM_QWEN38_EXACT_PARALLEL_SCORES");
+        if (parallel_scores) {
+            qwen38_attention_temporal_exact_score_kernel<<<
+                    dim3(kHeads, kBatch, 4u), kExactScoreThreads, 0, stream>>>(
+                    q, k_cache, scores, 0u, base_position_device, context_limit, true);
+            const cudaError_t status = cudaGetLastError();
+            if (status != cudaSuccess) return cuda_status(status);
+        }
+        if (parallel_scores && env_enabled("AXIOM_QWEN38_EXACT_OVERLAP_DENOMINATOR")) {
+            qwen38_attention_temporal_exact_fused_kernel<true><<<
+                    dim3(kHeads, kBatch), kHeadDim + 32u, 0, stream>>>(
+                    q, k_cache, v_cache, maxima, denominators, out, 0u,
+                    base_position_device, context_limit, true, scores);
+        } else {
+        qwen38_attention_temporal_exact_fused_kernel<<<
+                dim3(kHeads, kBatch), kHeadDim, 0, stream>>>(
+                q, k_cache, v_cache, maxima, denominators, out, 0u,
+                base_position_device, context_limit, true, parallel_scores ? scores : nullptr);
+        }
+        return cuda_status(cudaGetLastError());
+    }
+    for (uint32_t tile = 0u; tile < tile_count; ++tile) {
+        const uint32_t tile_begin = tile * kExactAttentionTileTokens;
+        if (fused) {
+            qwen38_attention_temporal_exact_fused_kernel<<<
+                    dim3(kHeads, kBatch), kHeadDim, 0, stream>>>(
+                    q, k_cache, v_cache, maxima, denominators, out, tile_begin,
+                    base_position_device, context_limit, false);
+        } else {
+            qwen38_attention_temporal_exact_score_kernel<<<
+                    dim3(kHeads, kBatch, kExactScoreTokenGroups),
+                    kExactScoreThreads, 0, stream>>>(
+                    q, k_cache, scores, tile_begin,
+                    base_position_device, context_limit);
+            cudaError_t status = cudaGetLastError();
+            if (status != cudaSuccess) return cuda_status(status);
+            qwen38_attention_temporal_exact_accumulate_kernel<<<
+                    dim3(kHeads, kBatch), kHeadDim, 0, stream>>>(
+                    v_cache, scores, maxima, denominators, out, tile_begin,
+                    base_position_device, context_limit);
+        }
+        const cudaError_t status = cudaGetLastError();
+        if (status != cudaSuccess) return cuda_status(status);
+    }
+    return AXIOM_OK;
 }
 
 /* The shadow path exists only for the short-context numerical gate. It keeps
@@ -1240,6 +1684,21 @@ struct axiom_qwen38_attention_layer {
     bool flashinfer_ready = false;
     bool flashinfer_split_kv = false;
     uint64_t flashinfer_workspace_bytes = 0u;
+    /* Lossless is the production default. The former FlashInfer/split-K M8
+     * verifier changes the floating-point reduction order and can alter later
+     * greedy tokens even when the first row-local top-1 agrees. It remains
+     * available only through an explicit qualification override. */
+    bool device_temporal_exact = true;
+    /* Explicit rollback for the previous one-CTA-per-row/head chronological
+     * implementation.  It is never selected as an allocation or launch-error
+     * fallback for the tiled exact path. */
+    bool device_temporal_exact_reference = false;
+    /* Exact fused tile is default; disabling it is an explicit, bit-exact
+     * rollback to the qualified producer/consumer tiled implementation. */
+    bool device_temporal_exact_fused = true;
+    /* Capture-time fast graph must use Axiom's validated native split-K,
+     * never silently route through the numerically different FlashInfer path. */
+    bool device_temporal_force_native_splitk = false;
 
     axiom_qwen38_fp8_linear *q_proj = nullptr;
     axiom_qwen38_fp8_linear *k_proj = nullptr;
@@ -1260,6 +1719,9 @@ struct axiom_qwen38_attention_layer {
     axiom_device_buffer *attention_split_values = nullptr;
     axiom_device_buffer *attention_split_maxima = nullptr;
     axiom_device_buffer *attention_split_denominators = nullptr;
+    axiom_device_buffer *attention_exact_scores = nullptr;
+    axiom_device_buffer *attention_exact_maxima = nullptr;
+    axiom_device_buffer *attention_exact_denominators = nullptr;
     axiom_device_buffer *flashinfer_q_bf16 = nullptr;
     axiom_device_buffer *flashinfer_attention_bf16 = nullptr;
     axiom_device_buffer *flashinfer_kv_length_device = nullptr;
@@ -1398,6 +1860,9 @@ extern "C" void axiom_qwen38_attention_layer_destroy(axiom_qwen38_attention_laye
     axiom_device_buffer_destroy(layer->flashinfer_kv_length_device);
     axiom_device_buffer_destroy(layer->flashinfer_attention_bf16);
     axiom_device_buffer_destroy(layer->flashinfer_q_bf16);
+    axiom_device_buffer_destroy(layer->attention_exact_denominators);
+    axiom_device_buffer_destroy(layer->attention_exact_maxima);
+    axiom_device_buffer_destroy(layer->attention_exact_scores);
     axiom_device_buffer_destroy(layer->attention_split_denominators);
     axiom_device_buffer_destroy(layer->attention_split_maxima);
     axiom_device_buffer_destroy(layer->attention_split_values);
@@ -1447,6 +1912,21 @@ extern "C" int axiom_qwen38_attention_layer_load(
             !env_disabled("AXIOM_QWEN38_ATTENTION_SHARED_FP8_INPUT");
     layer->parallel_projection_streams =
             !env_disabled("AXIOM_QWEN38_PARALLEL_PROJECTIONS");
+    layer->device_temporal_exact =
+            !env_disabled("AXIOM_QWEN38_DEVICE_TEMPORAL_EXACT");
+    layer->device_temporal_exact_reference =
+            env_enabled("AXIOM_QWEN38_DEVICE_TEMPORAL_EXACT_REFERENCE");
+    layer->device_temporal_exact_fused =
+            !env_disabled("AXIOM_QWEN38_DEVICE_TEMPORAL_EXACT_FUSED");
+    if (layer->device_temporal_exact_reference && !layer->device_temporal_exact) {
+        axiom_qwen38_attention_layer_destroy(layer);
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    if (layer->device_temporal_exact && !layer->device_temporal_exact_reference &&
+        layer->temporal_hot_tokens == 0u) {
+        axiom_qwen38_attention_layer_destroy(layer);
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
     if (layer->parallel_projection_streams) {
         cudaError_t status = cudaStreamCreateWithFlags(
                 &layer->k_projection_stream, cudaStreamNonBlocking);
@@ -1535,6 +2015,12 @@ extern "C" int axiom_qwen38_attention_layer_load(
     uint64_t split_values_bytes = 0u;
     uint64_t split_stats = 0u;
     uint64_t split_stats_bytes = 0u;
+    uint64_t exact_score_elements = 0u;
+    uint64_t exact_score_bytes = 0u;
+    uint64_t exact_stats_elements = 0u;
+    uint64_t exact_stats_bytes = 0u;
+    const bool use_exact_tiled = layer->device_temporal_exact &&
+            !layer->device_temporal_exact_reference;
     layer->cache_columns = (!env_disabled("AXIOM_QWEN38_COMPACT_KV") && max_context > 8192u)
             ? 1u : kBatch;
     const uint64_t resident_cache_context = layer->streaming_kv
@@ -1548,7 +2034,14 @@ extern "C" int axiom_qwen38_attention_layer_load(
         !checked_mul(split_values, kHeadDim, &split_values) ||
         !checked_mul(split_values, sizeof(float), &split_values_bytes) ||
         !checked_mul(static_cast<uint64_t>(kBatch) * kHeads, kAttentionSplitK, &split_stats) ||
-        !checked_mul(split_stats, sizeof(float), &split_stats_bytes)) {
+        !checked_mul(split_stats, sizeof(float), &split_stats_bytes) ||
+        !checked_mul(static_cast<uint64_t>(kBatch), kHeads, &exact_stats_elements) ||
+        !checked_mul(exact_stats_elements,
+                     env_enabled("AXIOM_QWEN38_EXACT_PARALLEL_SCORES")
+                         ? std::max(kExactAttentionTileTokens, std::min(max_context, layer->temporal_hot_tokens))
+                         : kExactAttentionTileTokens, &exact_score_elements) ||
+        !checked_mul(exact_score_elements, sizeof(float), &exact_score_bytes) ||
+        !checked_mul(exact_stats_elements, sizeof(float), &exact_stats_bytes)) {
         axiom_qwen38_attention_layer_destroy(layer);
         return AXIOM_ERR_BUDGET;
     }
@@ -1571,6 +2064,20 @@ extern "C" int axiom_qwen38_attention_layer_load(
             return rc;
         }
     }
+    if (use_exact_tiled) {
+        const std::pair<uint64_t, axiom_device_buffer **> exact_allocations[] = {
+            {exact_score_bytes, &layer->attention_exact_scores},
+            {exact_stats_bytes, &layer->attention_exact_maxima},
+            {exact_stats_bytes, &layer->attention_exact_denominators},
+        };
+        for (const auto &allocation : exact_allocations) {
+            rc = axiom_device_buffer_create(runtime, allocation.second, allocation.first);
+            if (rc != AXIOM_OK) {
+                axiom_qwen38_attention_layer_destroy(layer);
+                return rc;
+            }
+        }
+    }
     if (!layer->streaming_kv || layer->streaming_temporal_hot) {
         const std::pair<uint64_t, axiom_device_buffer **> resident_allocations[] = {
             {q_batch_bf16, &layer->flashinfer_q_bf16},
@@ -1589,10 +2096,12 @@ extern "C" int axiom_qwen38_attention_layer_load(
             resident_cache_context <= layer->temporal_hot_tokens &&
             !env_disabled("AXIOM_QWEN38_FLASHINFER_SPLIT_KV")) {
             layer->flashinfer_workspace_bytes =
-                    (resident_cache_context /
-                     AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS) *
-                    static_cast<uint64_t>(kBatch) * kHeads *
-                    (kHeadDim * sizeof(uint16_t) + sizeof(float));
+                    axiom_qwen38_flashinfer_temporal8_workspace_bytes(
+                            static_cast<uint32_t>(resident_cache_context));
+            if (layer->flashinfer_workspace_bytes == 0u) {
+                axiom_qwen38_attention_layer_destroy(layer);
+                return AXIOM_ERR_INVALID_ARGUMENT;
+            }
             rc = axiom_device_buffer_create(
                     runtime, &layer->flashinfer_split_kv_workspace,
                     layer->flashinfer_workspace_bytes);
@@ -1710,6 +2219,9 @@ extern "C" int axiom_qwen38_attention_layer_load(
         static_cast<uint64_t>(kHidden + kHeadDim + kHeadDim) * sizeof(float),
         hidden_batch, q_gate_batch, q_batch, q_batch, kv_batch, kv_batch,
         q_batch, q_batch, split_values_bytes, split_stats_bytes, split_stats_bytes,
+        use_exact_tiled ? exact_score_bytes : 0u,
+        use_exact_tiled ? exact_stats_bytes : 0u,
+        use_exact_tiled ? exact_stats_bytes : 0u,
         (!layer->streaming_kv && !layer->streaming_temporal_hot) ? 0u : q_batch_bf16,
         (!layer->streaming_kv && !layer->streaming_temporal_hot) ? 0u : q_batch_bf16,
         (!layer->streaming_kv && !layer->streaming_temporal_hot) ? 0u : sizeof(uint32_t),
@@ -1946,6 +2458,79 @@ int stream_flush_current_page(axiom_qwen38_attention_layer *layer) {
             layer->stream_current_page, layer->stream_host_page);
     if (rc == AXIOM_OK) layer->stream_page_dirty = false;
     return rc;
+}
+
+int stream_materialize_temporal_prefix(
+        axiom_qwen38_attention_layer *layer,
+        const uint32_t base_position,
+        const uint32_t token_count,
+        cudaStream_t stream) {
+    if (!layer || !layer->streaming_kv || !layer->streaming_temporal_hot ||
+        !layer->k_cache || !layer->v_cache || token_count == 0u ||
+        base_position > layer->temporal_hot_tokens ||
+        token_count > layer->temporal_hot_tokens - base_position) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
+    void *hot_k = nullptr;
+    void *hot_v = nullptr;
+    int rc = buffer_pointer(layer->k_cache, &hot_k);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->v_cache, &hot_v);
+    if (rc != AXIOM_OK) return rc;
+    for (uint32_t offset = 0u; offset < token_count; ++offset) {
+        const uint32_t position = base_position + offset;
+        const uint32_t logical_page =
+                position / AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+        if (logical_page != layer->stream_current_page) {
+            if (logical_page != layer->stream_current_page + 1u) {
+                return AXIOM_ERR_RUNTIME;
+            }
+            cudaError_t status = cudaStreamSynchronize(stream);
+            if (status != cudaSuccess) return cuda_status(status);
+            rc = stream_flush_current_page(layer);
+            if (rc != AXIOM_OK) return rc;
+            const uint32_t slot = logical_page % layer->stream_hot_pages;
+            layer->stream_current_page = logical_page;
+            layer->stream_current_page_device = layer->stream_hot_page_device[slot];
+            void *new_page = nullptr;
+            rc = buffer_pointer(layer->stream_current_page_device, &new_page);
+            if (rc != AXIOM_OK) return rc;
+            if (layer->stream_hot_page_ids[slot] != logical_page) {
+                status = cudaMemsetAsync(
+                        new_page, 0, AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES, stream);
+                if (status != cudaSuccess) return cuda_status(status);
+                layer->stream_hot_page_ids[slot] = logical_page;
+            }
+            layer->stream_page_dirty = false;
+        }
+        const uint32_t slot = logical_page % layer->stream_hot_pages;
+        if (layer->stream_hot_page_ids[slot] != logical_page ||
+            layer->stream_current_page_device != layer->stream_hot_page_device[slot]) {
+            return AXIOM_ERR_RUNTIME;
+        }
+        void *page = nullptr;
+        rc = buffer_pointer(layer->stream_current_page_device, &page);
+        if (rc != AXIOM_OK) return rc;
+        const size_t row_bytes = static_cast<size_t>(kKvDim);
+        const size_t source_offset = static_cast<size_t>(position) * kKvDim;
+        const size_t destination_offset = static_cast<size_t>(
+                position % AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS) * kKvDim;
+        cudaError_t status = cudaMemcpyAsync(
+                static_cast<uint8_t *>(page) + destination_offset,
+                static_cast<const uint8_t *>(hot_k) + source_offset,
+                row_bytes, cudaMemcpyDeviceToDevice, stream);
+        if (status == cudaSuccess) {
+            status = cudaMemcpyAsync(
+                    static_cast<uint8_t *>(page) +
+                            AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES / 2u + destination_offset,
+                    static_cast<const uint8_t *>(hot_v) + source_offset,
+                    row_bytes, cudaMemcpyDeviceToDevice, stream);
+        }
+        if (status != cudaSuccess) return cuda_status(status);
+        layer->stream_page_dirty = true;
+    }
+    const cudaError_t status = cudaStreamSynchronize(stream);
+    return status == cudaSuccess ? AXIOM_OK : cuda_status(status);
 }
 
 int stream_read_page(
@@ -2216,12 +2801,45 @@ extern "C" int axiom_qwen38_attention_layer_kv_tier_flush(
     return stream_flush_current_page(layer);
 }
 
+extern "C" int axiom_qwen38_attention_layer_device_temporal_exact_can_set(
+        const axiom_qwen38_attention_layer *layer,
+        int enabled) {
+    if (!layer || layer->spec_active || (enabled != 0 && enabled != 1)) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    if (enabled != 0 && !layer->device_temporal_exact_reference &&
+        (!layer->attention_exact_scores || !layer->attention_exact_maxima ||
+         !layer->attention_exact_denominators)) {
+        return AXIOM_ERR_UNSUPPORTED_BACKEND;
+    }
+    return AXIOM_OK;
+}
+
+extern "C" int axiom_qwen38_attention_layer_device_temporal_exact_set(
+        axiom_qwen38_attention_layer *layer,
+        int enabled) {
+    const int rc = axiom_qwen38_attention_layer_device_temporal_exact_can_set(
+            layer, enabled);
+    if (rc != AXIOM_OK) return rc;
+    layer->device_temporal_exact = enabled != 0;
+    layer->device_temporal_force_native_splitk = enabled == 0;
+    return AXIOM_OK;
+}
+
 extern "C" uint32_t axiom_qwen38_attention_layer_position(const axiom_qwen38_attention_layer *layer) {
     return layer ? layer->position : 0u;
 }
 
 extern "C" uint64_t axiom_qwen38_attention_layer_device_bytes(const axiom_qwen38_attention_layer *layer) {
     return layer ? layer->device_bytes : 0u;
+}
+
+extern "C" axiom_qwen38_rope_profile axiom_qwen38_attention_layer_rope_profile(
+        const axiom_qwen38_attention_layer *layer) {
+    if (!layer) return AXIOM_QWEN38_ROPE_PROFILE_INVALID;
+    return layer->yarn_enabled
+            ? AXIOM_QWEN38_ROPE_PROFILE_YARN4_1M
+            : AXIOM_QWEN38_ROPE_PROFILE_NATIVE_262K;
 }
 
 extern "C" int axiom_qwen38_attention_layer_restore_position(
@@ -2380,6 +2998,106 @@ extern "C" int axiom_qwen38_attention_layer_kv_page_export(
                 static_cast<uint8_t *>(host_page) +
                         AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES / 2u,
                 static_cast<const uint8_t *>(v_cache) + device_offset,
+                valid_bytes, cudaMemcpyDeviceToHost);
+    }
+    return cuda_status(status);
+}
+
+extern "C" int axiom_qwen38_attention_layer_validation_export(
+        const axiom_qwen38_attention_layer *layer,
+        const uint32_t first_column,
+        const uint32_t column_count,
+        float *host_q,
+        float *host_gate,
+        float *host_attention,
+        float *host_gated_attention,
+        const uint64_t host_elements) {
+    const uint64_t required_elements = static_cast<uint64_t>(column_count) * kQDim;
+    if (!layer || !host_q || !host_gate || !host_attention || !host_gated_attention ||
+        column_count == 0u || first_column >= kBatch ||
+        column_count > kBatch - first_column || host_elements != required_elements ||
+        (layer->spec_active && layer->spec_stream != nullptr)) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    void *q = nullptr;
+    void *gate = nullptr;
+    void *attention = nullptr;
+    void *gated_attention = nullptr;
+    int rc = buffer_pointer(layer->q, &q);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->gate, &gate);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->attention, &attention);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->gated_attention, &gated_attention);
+    if (rc != AXIOM_OK) return rc;
+    if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
+    const size_t source_offset = static_cast<size_t>(first_column) * kQDim * sizeof(float);
+    const size_t bytes = static_cast<size_t>(required_elements) * sizeof(float);
+    const void *sources[] = {
+        static_cast<const uint8_t *>(q) + source_offset,
+        static_cast<const uint8_t *>(gate) + source_offset,
+        static_cast<const uint8_t *>(attention) + source_offset,
+        static_cast<const uint8_t *>(gated_attention) + source_offset,
+    };
+    void *destinations[] = {host_q, host_gate, host_attention, host_gated_attention};
+    for (uint32_t index = 0u; index < 4u; ++index) {
+        const cudaError_t status = cudaMemcpy(
+                destinations[index], sources[index], bytes, cudaMemcpyDeviceToHost);
+        if (status != cudaSuccess) return cuda_status(status);
+    }
+    return AXIOM_OK;
+}
+
+extern "C" int axiom_qwen38_attention_layer_validation_kv_views_export(
+        const axiom_qwen38_attention_layer *layer,
+        const uint32_t logical_page,
+        void *host_paged,
+        void *host_temporal_hot,
+        const uint64_t host_page_bytes) {
+    if (!layer || !host_paged || !host_temporal_hot ||
+        host_page_bytes != AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    if (!layer->streaming_kv || !layer->streaming_temporal_hot) {
+        const int export_rc = axiom_qwen38_attention_layer_kv_page_export(
+                layer, logical_page, host_paged, host_page_bytes);
+        if (export_rc != AXIOM_OK) return export_rc;
+        std::memcpy(host_temporal_hot, host_paged, static_cast<size_t>(host_page_bytes));
+        return AXIOM_OK;
+    }
+    if (logical_page >= layer->stream_hot_pages ||
+        layer->stream_hot_page_ids[logical_page % layer->stream_hot_pages] != logical_page) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    const uint64_t page_start = static_cast<uint64_t>(logical_page) *
+            AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+    if (page_start >= layer->temporal_hot_tokens) return AXIOM_ERR_INVALID_ARGUMENT;
+    void *paged = nullptr;
+    void *hot_k = nullptr;
+    void *hot_v = nullptr;
+    int rc = buffer_pointer(
+            layer->stream_hot_page_device[logical_page % layer->stream_hot_pages], &paged);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->k_cache, &hot_k);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->v_cache, &hot_v);
+    if (rc != AXIOM_OK) return rc;
+    if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
+    cudaError_t status = cudaMemcpy(
+            host_paged, paged, AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES,
+            cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) return cuda_status(status);
+    std::memset(host_temporal_hot, 0, static_cast<size_t>(host_page_bytes));
+    const uint64_t valid_tokens = std::min<uint64_t>(
+            AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS,
+            layer->temporal_hot_tokens - page_start);
+    const size_t valid_bytes = static_cast<size_t>(valid_tokens * kKvDim);
+    const size_t source_offset = static_cast<size_t>(page_start * kKvDim);
+    status = cudaMemcpy(
+            host_temporal_hot,
+            static_cast<const uint8_t *>(hot_k) + source_offset,
+            valid_bytes, cudaMemcpyDeviceToHost);
+    if (status == cudaSuccess) {
+        status = cudaMemcpy(
+                static_cast<uint8_t *>(host_temporal_hot) +
+                        AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES / 2u,
+                static_cast<const uint8_t *>(hot_v) + source_offset,
                 valid_bytes, cudaMemcpyDeviceToHost);
     }
     return cuda_status(status);
@@ -2908,6 +3626,7 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device(
      * order; production decode reaches the FlashInfer specialization through
      * the device-position / CUDA-graph entry point below. */
     if (layer->spec_device_position && layer->flashinfer_ready &&
+        !layer->device_temporal_force_native_splitk &&
         !layer->kv_fp8_parity_enabled) {
         rc = flashinfer_convert_q_to_bf16(
                 static_cast<const float *>(q), static_cast<uint16_t *>(flashinfer_q_bf16),
@@ -2972,6 +3691,12 @@ extern "C" int axiom_qwen38_attention_layer_spec_begin_device(
         (layer->streaming_kv && !layer->streaming_temporal_hot)) {
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
+    const uint32_t cache_context = layer->streaming_temporal_hot
+            ? layer->temporal_hot_tokens : layer->max_context;
+    if (layer->device_temporal_exact && !layer->device_temporal_exact_reference &&
+        cache_context > layer->temporal_hot_tokens) {
+        return AXIOM_ERR_BUDGET;
+    }
     layer->spec_base_position = 0u;
     layer->spec_active = true;
     layer->spec_forwarded = false;
@@ -2994,6 +3719,13 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device_positio
     }
     const uint32_t cache_context = layer->streaming_temporal_hot
             ? layer->temporal_hot_tokens : layer->max_context;
+    if (layer->device_temporal_exact && !layer->device_temporal_exact_reference &&
+        cache_context > layer->temporal_hot_tokens) {
+        /* The graph shape is bounded by the configured speculative hot
+         * window.  Larger contexts require the explicit reference rollback;
+         * never route them silently to FlashInfer or split-K. */
+        return AXIOM_ERR_BUDGET;
+    }
     if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
     void *input_norm_weight = nullptr;
@@ -3015,6 +3747,9 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device_positio
     void *split_values = nullptr;
     void *split_maxima = nullptr;
     void *split_denominators = nullptr;
+    void *exact_scores = nullptr;
+    void *exact_maxima = nullptr;
+    void *exact_denominators = nullptr;
     void *attention_reference = nullptr;
     void *flashinfer_q_bf16 = nullptr;
     void *flashinfer_attention_bf16 = nullptr;
@@ -3044,6 +3779,16 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device_positio
     if (rc == AXIOM_OK) rc = buffer_pointer(layer->attention_split_maxima, &split_maxima);
     if (rc == AXIOM_OK) {
         rc = buffer_pointer(layer->attention_split_denominators, &split_denominators);
+    }
+    if (rc == AXIOM_OK && layer->device_temporal_exact &&
+        !layer->device_temporal_exact_reference) {
+        rc = buffer_pointer(layer->attention_exact_scores, &exact_scores);
+        if (rc == AXIOM_OK) {
+            rc = buffer_pointer(layer->attention_exact_maxima, &exact_maxima);
+        }
+        if (rc == AXIOM_OK) {
+            rc = buffer_pointer(layer->attention_exact_denominators, &exact_denominators);
+        }
     }
     if (rc == AXIOM_OK && layer->kv_fp8_parity_enabled) {
         rc = buffer_pointer(layer->attention_reference, &attention_reference);
@@ -3084,7 +3829,28 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device_positio
             static_cast<float *>(v_cache_f32), 0u, base_position_device, cache_context,
             layer->yarn_enabled, static_cast<uint32_t *>(parity_metrics));
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-    if (layer->flashinfer_ready && !layer->kv_fp8_parity_enabled) {
+    if (layer->device_temporal_exact) {
+        if (layer->device_temporal_exact_reference) {
+            qwen38_attention_core_fp8_reference_kernel<true><<<
+                    dim3(kHeads, kBatch), kHeadDim,
+                    static_cast<size_t>(kHeadDim) * sizeof(float), cuda_stream>>>(
+                    static_cast<const float *>(q), static_cast<const uint8_t *>(k_cache),
+                    static_cast<const uint8_t *>(v_cache), static_cast<float *>(attention),
+                    0u, layer->cache_columns, 0u, base_position_device, cache_context);
+            if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        } else {
+            rc = qwen38_attention_temporal_exact_tiled_enqueue(
+                    static_cast<const float *>(q), static_cast<const uint8_t *>(k_cache),
+                    static_cast<const uint8_t *>(v_cache), static_cast<float *>(exact_scores),
+                    static_cast<float *>(exact_maxima),
+                    static_cast<float *>(exact_denominators), static_cast<float *>(attention),
+                    base_position_device, cache_context, layer->temporal_hot_tokens,
+                    layer->device_temporal_exact_fused, cuda_stream);
+            if (rc != AXIOM_OK) return rc;
+        }
+    } else if (layer->flashinfer_ready &&
+               !layer->device_temporal_force_native_splitk &&
+               !layer->kv_fp8_parity_enabled) {
         qwen38_attention_temporal8_kv_length_kernel<<<1u, 1u, 0, cuda_stream>>>(
                 static_cast<uint32_t *>(flashinfer_kv_length_device), base_position_device);
         if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
@@ -3195,6 +3961,12 @@ extern "C" int axiom_qwen38_attention_layer_spec_commit_prefix(
         layer->spec_base_position > layer->max_context ||
         consumed_tokens > layer->max_context - layer->spec_base_position) {
         return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    if (layer->streaming_kv) {
+        const int materialize_rc = stream_materialize_temporal_prefix(
+                layer, layer->spec_base_position, consumed_tokens,
+                static_cast<cudaStream_t>(stream));
+        if (materialize_rc != AXIOM_OK) return materialize_rc;
     }
     layer->position = layer->spec_base_position + consumed_tokens;
     layer->spec_base_position = layer->position;

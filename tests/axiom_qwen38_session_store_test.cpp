@@ -3,6 +3,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <cstring>
+#include <openssl/evp.h>
 #include <fcntl.h>
 #include <limits>
 #include <set>
@@ -16,6 +20,34 @@ bool expect(bool condition, const char *message) {
     if (condition) return true;
     std::fprintf(stderr, "qwen38-session-store-test: %s\n", message);
     return false;
+}
+
+// Independent, contiguous on-disk oracle. Production seals three disjoint
+// vectors, so this catches offsets/order mistakes and proves the v1 wire hash.
+bool verify_wire(const std::string &path, uint32_t version) {
+    std::ifstream input(path, std::ios::binary);
+    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(input)), {});
+    if (bytes.size() < 4096u) return false;
+    uint32_t actual_version = 0u;
+    std::memcpy(&actual_version, bytes.data() + 8u, sizeof(actual_version));
+    if (actual_version != version) return false;
+    uint64_t stored = 0u;
+    std::memcpy(&stored, bytes.data() + 56u, sizeof(stored));
+    std::memset(bytes.data() + 56u, 0, sizeof(stored));
+    if (version == 1u) {
+        uint64_t hash = 1469598103934665603ull;
+        for (unsigned char byte : bytes) { hash ^= byte; hash *= 1099511628211ull; }
+        return stored == hash;
+    }
+    // Fixed public v2 disk layout: reserved digest starts after speculative_bytes.
+    constexpr size_t digest_offset = 64u + 33u + 128u + 1536u + 32u + 4u;
+    unsigned char expected[32], actual[EVP_MAX_MD_SIZE];
+    std::memcpy(expected, bytes.data() + digest_offset, sizeof(expected));
+    std::memset(bytes.data() + digest_offset, 0, sizeof(expected));
+    unsigned int digest_bytes = 0;
+    return stored == 0u && EVP_Digest(bytes.data(), bytes.size(), actual,
+            &digest_bytes, EVP_sha256(), nullptr) == 1 && digest_bytes == 32u &&
+            std::memcmp(expected, actual, 32u) == 0;
 }
 
 bool create_empty_file(const std::string &path) {
@@ -99,13 +131,20 @@ void replace_validated_tier_with_hardlink(
 
 }  // namespace
 
-int main() {
+int main(int argc, char **argv) {
+    const uint32_t writer_version = argc == 2 && std::string(argv[1]) == "--v2" ? 2u : 1u;
+    if (argc > 2 || (argc == 2 && writer_version != 2u)) return 2;
     char directory_template[] = "/tmp/axiom-qwen38-session-test-XXXXXX";
     char *directory = ::mkdtemp(directory_template);
     if (!expect(directory != nullptr, "mkdtemp failed")) return 1;
     const std::string base = std::string(directory) + "/kv-tier.bin";
+    constexpr uint64_t kSpeculativeStateBytes = 24u;
 
-    axiom::qwen38::qwen38_persistent_session_store store(base, 4096u, 32u);
+    axiom::qwen38::qwen38_persistent_session_store store(
+            base, 4096u, 32u, kSpeculativeStateBytes);
+    if (!expect(store.set_manifest_version(writer_version), "writer version rejected") ||
+        !expect(!store.set_manifest_version(3u), "unknown writer version accepted") ||
+        !expect(store.manifest_version() == writer_version, "invalid setter changed version")) return 1;
     axiom::qwen38::qwen38_session_key key;
     key.session_id = "session-alpha";
     key.model_id = "qwen3.8-27b-nvfp4";
@@ -127,7 +166,43 @@ int main() {
     manifest.profile = key.profile;
     manifest.token_ids = {11u, 22u, 33u, 44u};
     manifest.recurrent_state.resize(32u, 0x5au);
+    manifest.speculative_state.resize(kSpeculativeStateBytes, 0x3cu);
     ok = ok && store.save(key, paths, manifest, &error) == AXIOM_OK;
+    ok = ok && expect(verify_wire(paths.manifest_path, writer_version),
+                      "manifest did not match independent on-disk checksum oracle");
+
+    // Both readers accept legacy files, independent of their chosen writer.
+    for (uint32_t version : {1u, 2u, 1u, writer_version}) {
+        store.set_manifest_version(version);
+        ok = ok && store.save(key, paths, manifest, &error) == AXIOM_OK;
+        ok = ok && expect(verify_wire(paths.manifest_path, version), "cross-version wire mismatch");
+        axiom::qwen38::qwen38_session_manifest roundtrip;
+        axiom::qwen38::qwen38_session_paths roundtrip_paths;
+        bool roundtrip_exists = false;
+        ok = ok && store.load(key, &roundtrip, &roundtrip_paths, &roundtrip_exists, &error) == AXIOM_OK;
+        ok = ok && expect(roundtrip_exists && roundtrip.token_ids == manifest.token_ids &&
+                         roundtrip.recurrent_state == manifest.recurrent_state &&
+                         roundtrip.speculative_state == manifest.speculative_state,
+                         "cross-version payload mismatch");
+    }
+    // Header identity, checksum, reserved tail and each payload region must all
+    // be covered by integrity checks; no partial object may escape on failure.
+    for (size_t offset : {size_t(8),size_t(12),size_t(28),size_t(48),size_t(56),size_t(1797),size_t(4000),
+                          size_t(4096),size_t(4112),size_t(4144)}) {
+        const int fd = ::open(paths.manifest_path.c_str(), O_RDWR | O_CLOEXEC);
+        unsigned char byte = 0;
+        bool changed = fd >= 0 && ::pread(fd, &byte, 1, offset) == 1;
+        byte ^= 0x80;
+        changed = changed && ::pwrite(fd, &byte, 1, offset) == 1;
+        if (fd >= 0) ::close(fd);
+        ok = ok && expect(changed, "corruption fixture write failed");
+        axiom::qwen38::qwen38_session_manifest rejected;
+        axiom::qwen38::qwen38_session_paths rejected_paths;
+        bool rejected_exists = false;
+        ok = ok && expect(store.load(key, &rejected, &rejected_paths, &rejected_exists, &error) == AXIOM_ERR_IO &&
+                          !rejected_exists && rejected.token_ids.empty(), "corruption escaped validation");
+        ok = ok && store.save(key, paths, manifest, &error) == AXIOM_OK;
+    }
 
     axiom::qwen38::qwen38_session_manifest loaded;
     axiom::qwen38::qwen38_session_paths loaded_paths;
@@ -137,15 +212,19 @@ int main() {
     ok = ok && expect(loaded.generation == 7u && loaded.committed_tokens == 3u,
                       "manifest scalar fields did not round-trip");
     ok = ok && expect(loaded.token_ids == manifest.token_ids &&
-                              loaded.recurrent_state == manifest.recurrent_state,
+                              loaded.recurrent_state == manifest.recurrent_state &&
+                              loaded.speculative_state == manifest.speculative_state,
                       "manifest payload did not round-trip");
     ok = ok && expect(loaded_paths.tier_path == paths.tier_path,
                       "generation-specific tier path changed");
+    ok = ok && expect(paths.transaction_path == paths.tier_path + ".txn",
+                      "generation transaction path is not deterministic");
 
     /* A new store instance models a process restart; no in-memory state is
      * allowed to make this load pass. */
     axiom::qwen38::qwen38_persistent_session_store restarted_store(
-            base, 4096u, 32u);
+            base, 4096u, 32u, kSpeculativeStateBytes);
+    restarted_store.set_manifest_version(writer_version);
     axiom::qwen38::qwen38_session_manifest restarted;
     axiom::qwen38::qwen38_session_paths restarted_paths;
     bool restarted_exists = false;
@@ -154,8 +233,59 @@ int main() {
     ok = ok && expect(restarted_exists && restarted.generation == manifest.generation,
                       "manifest did not survive a store restart");
     ok = ok && expect(restarted.token_ids == manifest.token_ids &&
-                              restarted.recurrent_state == manifest.recurrent_state,
+                              restarted.recurrent_state == manifest.recurrent_state &&
+                              restarted.speculative_state == manifest.speculative_state,
                       "restart restore payload did not round-trip");
+
+    /* A zero-byte speculative payload remains the legacy DSpark contract.
+     * Exercise the explicit four-argument configure path so older manifests
+     * remain loadable without synthesizing controller state. */
+    const std::string legacy_base = std::string(directory) + "/legacy-zero.bin";
+    {
+        axiom::qwen38::qwen38_persistent_session_store empty_store(
+                std::string(directory) + "/empty.bin", 4096u, 0u, 0u);
+        auto empty_key = key;
+        empty_key.session_id = "session-empty";
+        axiom::qwen38::qwen38_session_paths empty_paths;
+        ok = ok && empty_store.prepare(empty_key, 1u, &empty_paths, &error) == AXIOM_OK;
+        auto empty = manifest;
+        empty.generation = 1u;
+        empty.committed_tokens = 0u;
+        empty.token_ids.clear();
+        empty.recurrent_state.clear();
+        empty.speculative_state.clear();
+        empty.session_id = empty_key.session_id;
+        empty.namespace_id = axiom::qwen38::qwen38_persistent_session_store::namespace_id(empty_key);
+        empty.namespace_text = axiom::qwen38::qwen38_persistent_session_store::namespace_text(empty_key);
+        for (uint32_t version : {1u, 2u}) {
+            empty_store.set_manifest_version(version);
+            ok = ok && empty_store.save(empty_key, empty_paths, empty, &error) == AXIOM_OK;
+            ok = ok && expect(verify_wire(empty_paths.manifest_path, version), "empty wire checksum failed");
+            bool empty_exists = false;
+            axiom::qwen38::qwen38_session_manifest restored_empty;
+            ok = ok && empty_store.load(empty_key, &restored_empty, &empty_paths,
+                                       &empty_exists, &error) == AXIOM_OK;
+            ok = ok && expect(empty_exists && restored_empty.token_ids.empty() &&
+                             restored_empty.recurrent_state.empty(), "empty roundtrip failed");
+        }
+    }
+    axiom::qwen38::qwen38_persistent_session_store legacy_store;
+    legacy_store.configure(legacy_base, 4096u, 32u, 0u);
+    auto legacy_key = key;
+    legacy_key.session_id = "session-legacy-zero";
+    axiom::qwen38::qwen38_session_paths legacy_paths;
+    ok = ok && expect(create_lifecycle_fixture(
+                              &legacy_store, legacy_key, 1u, 100,
+                              &legacy_paths, &error),
+                      "could not create zero-byte speculative-state fixture");
+    axiom::qwen38::qwen38_session_manifest legacy_loaded;
+    axiom::qwen38::qwen38_session_paths legacy_loaded_paths;
+    bool legacy_exists = false;
+    ok = ok && legacy_store.load(
+            legacy_key, &legacy_loaded, &legacy_loaded_paths,
+            &legacy_exists, &error) == AXIOM_OK;
+    ok = ok && expect(legacy_exists && legacy_loaded.speculative_state.empty(),
+                      "zero-byte speculative state lost legacy compatibility");
 
     std::vector<uint32_t> resume_prompt;
     bool resume_usable = false;
@@ -201,6 +331,10 @@ int main() {
                       "could not create generation 5 GC fixture");
     ok = ok && expect(create_empty_file(generation6.tier_path),
                       "could not create generation 6 GC fixture");
+    ok = ok && expect(create_empty_file(generation6.transaction_path),
+                      "could not create generation 6 transaction GC fixture");
+    ok = ok && expect(create_empty_file(generation5.transaction_path + ".tmp"),
+                      "could not create generation 5 temporary transaction GC fixture");
     ok = ok && expect(create_empty_file(paths.tier_path),
                       "could not create committed generation GC fixture");
     ok = ok && expect(create_empty_file(generation8.tier_path),
@@ -211,10 +345,12 @@ int main() {
     uint64_t removed_files = 0u;
     ok = ok && store.prune_obsolete_generations(
             key, paths, &removed_files, &error) == AXIOM_OK;
-    ok = ok && expect(removed_files == 2u,
+    ok = ok && expect(removed_files == 4u,
                       "GC did not report exactly the obsolete generations");
     ok = ok && expect(::access(generation5.tier_path.c_str(), F_OK) != 0 &&
-                              ::access(generation6.tier_path.c_str(), F_OK) != 0,
+                              ::access(generation6.tier_path.c_str(), F_OK) != 0 &&
+                              ::access(generation6.transaction_path.c_str(), F_OK) != 0 &&
+                              ::access((generation5.transaction_path + ".tmp").c_str(), F_OK) != 0,
                       "GC retained an obsolete generation");
     ok = ok && expect(::access(paths.tier_path.c_str(), F_OK) == 0 &&
                               ::access(generation8.tier_path.c_str(), F_OK) == 0 &&
@@ -477,19 +613,54 @@ int main() {
                               ::access(tombstone_path.c_str(), F_OK) != 0,
                       "lifecycle GC did not finish a crash tombstone");
 
-    const int corrupt_fd = ::open(paths.manifest_path.c_str(), O_WRONLY | O_CLOEXEC);
+    const int corrupt_fd = ::open(paths.manifest_path.c_str(), O_RDWR | O_CLOEXEC);
     if (ok) ok = expect(corrupt_fd >= 0, "could not open manifest for corruption gate");
     if (ok) {
+        struct stat manifest_status{};
+        ok = expect(::fstat(corrupt_fd, &manifest_status) == 0 &&
+                            manifest_status.st_size >
+                                    static_cast<off_t>(manifest.speculative_state.size()),
+                    "could not locate speculative payload for corruption gate");
+    }
+    if (ok) {
         const uint8_t corrupt_byte = 0xffu;
-        ok = expect(::pwrite(corrupt_fd, &corrupt_byte, sizeof(corrupt_byte), 4096) == 1,
-                    "could not corrupt manifest payload");
+        struct stat manifest_status{};
+        ok = expect(::fstat(corrupt_fd, &manifest_status) == 0 &&
+                            ::pwrite(corrupt_fd, &corrupt_byte,
+                                     sizeof(corrupt_byte),
+                                     manifest_status.st_size - 1) == 1,
+                    "could not corrupt speculative manifest payload");
     }
     if (corrupt_fd >= 0) ::close(corrupt_fd);
     bool corrupt_exists = false;
     const int corrupt_rc = restarted_store.load(
             key, &loaded, &loaded_paths, &corrupt_exists, &error);
     ok = ok && expect(corrupt_rc == AXIOM_ERR_IO,
-                      "corrupt manifest was not rejected fail-closed");
+                      "corrupt speculative payload was not rejected fail-closed");
+
+    if (ok) {
+        ok = expect(store.save(key, paths, manifest, &error) == AXIOM_OK,
+                    "could not restore manifest before truncation gate");
+    }
+    int truncated_fd = -1;
+    if (ok) {
+        truncated_fd = ::open(paths.manifest_path.c_str(), O_WRONLY | O_CLOEXEC);
+        ok = expect(truncated_fd >= 0,
+                    "could not open manifest for truncation gate");
+    }
+    if (ok) {
+        struct stat manifest_status{};
+        ok = expect(::fstat(truncated_fd, &manifest_status) == 0 &&
+                            manifest_status.st_size > 0 &&
+                            ::ftruncate(truncated_fd, manifest_status.st_size - 1) == 0,
+                    "could not truncate speculative manifest payload");
+    }
+    if (truncated_fd >= 0) ::close(truncated_fd);
+    bool truncated_exists = false;
+    const int truncated_rc = restarted_store.load(
+            key, &loaded, &loaded_paths, &truncated_exists, &error);
+    ok = ok && expect(truncated_rc == AXIOM_ERR_IO,
+                      "truncated speculative payload was not rejected fail-closed");
 
     std::error_code cleanup_error;
     std::filesystem::remove_all(directory, cleanup_error);

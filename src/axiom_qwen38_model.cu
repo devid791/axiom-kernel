@@ -37,6 +37,10 @@ constexpr uint32_t kThreads = 256u;
 constexpr uint32_t kTop1Blocks = 256u;
 constexpr uint32_t kTargetTapCount = AXIOM_QWEN38_MODEL_DSPARK_TARGET_TAP_COUNT;
 constexpr uint32_t kTemporalWidth = AXIOM_QWEN38_MODEL_DSPARK_TEMPORAL_VERIFY_WIDTH;
+constexpr uint32_t kEarlyTraceLayers = 4u;
+constexpr uint32_t kAttentionDiagnosticStages = 4u;
+constexpr uint32_t kAttentionQDim =
+        AXIOM_QWEN38_ATTENTION_HEADS * AXIOM_QWEN38_ATTENTION_HEAD_DIM;
 constexpr uint32_t kTargetAttentionLayers = 16u;
 constexpr float kEps = 1.0e-6f;
 constexpr uint64_t kEmbeddingBytes =
@@ -47,6 +51,13 @@ constexpr uint32_t kTargetTapLayerIds[kTargetTapCount] = {4u, 16u, 28u, 40u, 52u
 using qwen38_top1_result = axiom_qwen38_model_dspark_device_top1_result;
 
 static_assert(sizeof(qwen38_top1_result) == 12u, "top-1 result ABI must stay compact");
+static_assert(
+        offsetof(axiom_qwen38_model_dspark_device_hidden_view,
+                 target_last_hidden_device) == 40u,
+        "device hidden view pointer offset is part of ABI v1");
+static_assert(
+        sizeof(axiom_qwen38_model_dspark_device_hidden_view) == 48u,
+        "device hidden view size is part of ABI v1");
 
 int cuda_status(cudaError_t status) {
     if (status == cudaSuccess) return AXIOM_OK;
@@ -187,25 +198,47 @@ __global__ void qwen38_add_bf16_rmsnorm8_kernel(
     float *residual_column = residual + static_cast<uint64_t>(column) * kHidden;
     const float *addend_column = addend + static_cast<uint64_t>(column) * kHidden;
     float *norm_column = norm + static_cast<uint64_t>(column) * kHidden;
+    static_assert(kHidden % kThreads == 0u, "RMSNorm requires complete per-thread chunks");
+    static_assert(kThreads == 256u, "Exact reduction requires the existing 256-thread block");
+    constexpr uint32_t kValuesPerThread = kHidden / kThreads;
+    // Unrolled constant indices allow 20 FP32 input/merged values to stay in
+    // registers across normalization; no extra BF16 rounding is introduced.
+    float values[kValuesPerThread];
     __shared__ float sums[kThreads];
     float sum = 0.0f;
-    for (uint32_t feature = tid; feature < kHidden; feature += blockDim.x) {
+#pragma unroll
+    for (uint32_t slot = 0u; slot < kValuesPerThread; ++slot) {
+        const uint32_t feature = tid + slot * kThreads;
         const float lhs = qwen38_round_bf16(residual_column[feature]);
         const float rhs = qwen38_round_bf16(addend_column[feature]);
         const float merged = qwen38_round_bf16(lhs + rhs);
         residual_column[feature] = merged;
+        values[slot] = merged;
         sum = fmaf(merged, merged, sum);
     }
     sums[tid] = sum;
     __syncthreads();
-    for (uint32_t stride = blockDim.x / 2u; stride != 0u; stride >>= 1u) {
+    // Preserve the descending FP32 tree: shared 128/64/32, warp 16..1.
+    for (uint32_t stride = kThreads / 2u; stride >= 32u; stride >>= 1u) {
         if (tid < stride) sums[tid] += sums[tid + stride];
         __syncthreads();
     }
+    if (tid < 32u) {
+        float total = sums[tid];
+#pragma unroll
+        for (uint32_t stride = 16u; stride != 0u; stride >>= 1u) {
+            const float other = __shfl_down_sync(0xffffffffu, total, stride);
+            if (tid < stride) total = __fadd_rn(total, other);
+        }
+        if (tid == 0u) sums[0] = total;
+    }
+    __syncthreads();
     const float inverse = rsqrtf(sums[0] / static_cast<float>(kHidden) + kEps);
-    for (uint32_t feature = tid; feature < kHidden; feature += blockDim.x) {
+#pragma unroll
+    for (uint32_t slot = 0u; slot < kValuesPerThread; ++slot) {
+        const uint32_t feature = tid + slot * kThreads;
         norm_column[feature] = qwen38_round_bf16(
-                residual_column[feature] * inverse * weight[feature]);
+                values[slot] * inverse * weight[feature]);
     }
 }
 
@@ -218,21 +251,43 @@ __global__ void qwen38_rmsnorm_bf16_8_kernel(
     if (column >= kBatch) return;
     const float *input_column = input + static_cast<uint64_t>(column) * kHidden;
     float *out_column = out + static_cast<uint64_t>(column) * kHidden;
+    static_assert(kHidden % kThreads == 0u, "RMSNorm requires complete per-thread chunks");
+    static_assert(kThreads == 256u, "Exact reduction requires the existing 256-thread block");
+    constexpr uint32_t kValuesPerThread = kHidden / kThreads;
+    // Unrolled constant indices allow 20 FP32 input/merged values to stay in
+    // registers across normalization; no extra BF16 rounding is introduced.
+    float values[kValuesPerThread];
     __shared__ float sums[kThreads];
     float sum = 0.0f;
-    for (uint32_t feature = tid; feature < kHidden; feature += blockDim.x) {
-        sum = fmaf(input_column[feature], input_column[feature], sum);
+#pragma unroll
+    for (uint32_t slot = 0u; slot < kValuesPerThread; ++slot) {
+        const uint32_t feature = tid + slot * kThreads;
+        values[slot] = input_column[feature];
+        sum = fmaf(values[slot], values[slot], sum);
     }
     sums[tid] = sum;
     __syncthreads();
-    for (uint32_t stride = blockDim.x / 2u; stride != 0u; stride >>= 1u) {
+    // Preserve the descending FP32 tree: shared 128/64/32, warp 16..1.
+    for (uint32_t stride = kThreads / 2u; stride >= 32u; stride >>= 1u) {
         if (tid < stride) sums[tid] += sums[tid + stride];
         __syncthreads();
     }
+    if (tid < 32u) {
+        float total = sums[tid];
+#pragma unroll
+        for (uint32_t stride = 16u; stride != 0u; stride >>= 1u) {
+            const float other = __shfl_down_sync(0xffffffffu, total, stride);
+            if (tid < stride) total = __fadd_rn(total, other);
+        }
+        if (tid == 0u) sums[0] = total;
+    }
+    __syncthreads();
     const float inverse = rsqrtf(sums[0] / static_cast<float>(kHidden) + kEps);
-    for (uint32_t feature = tid; feature < kHidden; feature += blockDim.x) {
+#pragma unroll
+    for (uint32_t slot = 0u; slot < kValuesPerThread; ++slot) {
+        const uint32_t feature = tid + slot * kThreads;
         out_column[feature] = qwen38_round_bf16(
-                input_column[feature] * inverse * weight[feature]);
+                values[slot] * inverse * weight[feature]);
     }
 }
 
@@ -582,6 +637,8 @@ struct axiom_qwen38_model {
     int device = -1;
     uint32_t max_context = 0u;
     uint32_t position = 0u;
+    axiom_qwen38_rope_profile rope_profile =
+            AXIOM_QWEN38_ROPE_PROFILE_INVALID;
     uint64_t device_bytes = 0u;
     axiom_runtime *runtime = nullptr;
     axiom_model *checkpoint = nullptr;
@@ -608,6 +665,8 @@ struct axiom_qwen38_model {
      * explicit scalar-versus-temporal parity gate. */
     axiom_device_buffer *temporal_taps = nullptr;
     axiom_device_buffer *validation_taps = nullptr;
+    axiom_device_buffer *validation_early_scalar = nullptr;
+    axiom_device_buffer *validation_early_temporal = nullptr;
     axiom_device_buffer *prefill_taps = nullptr;
     axiom_device_buffer *dspark_callback_hidden = nullptr;
     axiom_device_buffer *dspark_callback_logits = nullptr;
@@ -619,6 +678,7 @@ struct axiom_qwen38_model {
     bool suppress_history_mutation = false;
     bool scalar_tap_capture_active = false;
     uint32_t scalar_tap_capture_time = 0u;
+    bool validation_early_capture_active = false;
     bool temporal_m8_validated = false;
     bool device_position_authoritative = false;
 };
@@ -662,6 +722,8 @@ extern "C" void axiom_qwen38_model_destroy(axiom_qwen38_model *model) {
     axiom_device_buffer_destroy(model->final_norm_weight);
     axiom_device_buffer_destroy(model->validation_taps);
     axiom_device_buffer_destroy(model->temporal_taps);
+    axiom_device_buffer_destroy(model->validation_early_scalar);
+    axiom_device_buffer_destroy(model->validation_early_temporal);
     axiom_device_buffer_destroy(model->prefill_taps);
     axiom_device_buffer_destroy(model->dspark_callback_logits);
     axiom_device_buffer_destroy(model->dspark_callback_hidden);
@@ -726,6 +788,22 @@ extern "C" int axiom_qwen38_model_create(
                 rc = axiom_qwen38_attention_layer_load(
                         model->checkpoint, model->runtime, device, layer, max_context,
                         &model->layers[layer].attention);
+                if (rc == AXIOM_OK) {
+                    const axiom_qwen38_rope_profile profile =
+                            axiom_qwen38_attention_layer_rope_profile(
+                                    model->layers[layer].attention);
+                    if (profile == AXIOM_QWEN38_ROPE_PROFILE_INVALID ||
+                        (model->rope_profile != AXIOM_QWEN38_ROPE_PROFILE_INVALID &&
+                         model->rope_profile != profile) ||
+                        (profile == AXIOM_QWEN38_ROPE_PROFILE_NATIVE_262K &&
+                         max_context > 262144u) ||
+                        (profile == AXIOM_QWEN38_ROPE_PROFILE_YARN4_1M &&
+                         max_context > 1048576u)) {
+                        rc = AXIOM_ERR_INVALID_ARGUMENT;
+                    } else {
+                        model->rope_profile = profile;
+                    }
+                }
             } else {
                 rc = axiom_qwen38_gdn_layer_load(
                         model->checkpoint, model->runtime, device, layer, &model->layers[layer].gdn);
@@ -765,6 +843,8 @@ extern "C" int axiom_qwen38_model_create(
     const uint64_t hidden_batch_bytes = static_cast<uint64_t>(kHidden) * kBatch * sizeof(float);
     const uint64_t temporal_taps_bytes =
             static_cast<uint64_t>(kTargetTapCount) * kHidden * kBatch * sizeof(float);
+    const uint64_t validation_early_bytes =
+            static_cast<uint64_t>(kEarlyTraceLayers) * kHidden * kBatch * sizeof(float);
     const uint64_t prefill_taps_bytes =
             static_cast<uint64_t>(kTargetTapCount) * kHidden * sizeof(float);
     const uint64_t logits_batch_bytes = static_cast<uint64_t>(kVocab) * kBatch * sizeof(float);
@@ -806,6 +886,14 @@ extern "C" int axiom_qwen38_model_create(
         rc = axiom_device_buffer_create(model->runtime, &model->validation_taps, temporal_taps_bytes);
     }
     if (rc == AXIOM_OK) {
+        rc = axiom_device_buffer_create(
+                model->runtime, &model->validation_early_scalar, validation_early_bytes);
+    }
+    if (rc == AXIOM_OK) {
+        rc = axiom_device_buffer_create(
+                model->runtime, &model->validation_early_temporal, validation_early_bytes);
+    }
+    if (rc == AXIOM_OK) {
         rc = axiom_device_buffer_create(model->runtime, &model->prefill_taps, prefill_taps_bytes);
     }
     if (rc == AXIOM_OK) {
@@ -834,7 +922,8 @@ extern "C" int axiom_qwen38_model_create(
         static_cast<uint64_t>(kBatch) * kTop1Blocks * sizeof(qwen38_top1_result),
         static_cast<uint64_t>(kBatch) * sizeof(uint32_t),
         static_cast<uint64_t>(kBatch) * sizeof(float),
-        temporal_taps_bytes, temporal_taps_bytes, prefill_taps_bytes,
+        temporal_taps_bytes, temporal_taps_bytes,
+        validation_early_bytes, validation_early_bytes, prefill_taps_bytes,
         hidden_batch_bytes, logits_batch_bytes,
     };
     for (uint64_t amount : direct) {
@@ -899,8 +988,41 @@ extern "C" uint32_t axiom_qwen38_model_position(const axiom_qwen38_model *model)
     return model ? model->position : 0u;
 }
 
+extern "C" int axiom_qwen38_model_device(const axiom_qwen38_model *model) {
+    return model ? model->device : -1;
+}
+
+extern "C" int axiom_qwen38_model_dspark_device_temporal_exact_set(
+        axiom_qwen38_model *model,
+        int enabled) {
+    if (!model || model->active_transaction ||
+        model->device_position_authoritative ||
+        (enabled != 0 && enabled != 1)) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    int rc = AXIOM_OK;
+    for (uint32_t layer = 0u; layer < kLayers && rc == AXIOM_OK; ++layer) {
+        if (model->layers[layer].attention) {
+            rc = axiom_qwen38_attention_layer_device_temporal_exact_can_set(
+                    model->layers[layer].attention, enabled);
+        }
+    }
+    for (uint32_t layer = 0u; layer < kLayers && rc == AXIOM_OK; ++layer) {
+        if (model->layers[layer].attention) {
+            rc = axiom_qwen38_attention_layer_device_temporal_exact_set(
+                    model->layers[layer].attention, enabled);
+        }
+    }
+    return rc;
+}
+
 extern "C" uint64_t axiom_qwen38_model_device_bytes(const axiom_qwen38_model *model) {
     return model ? model->device_bytes : 0u;
+}
+
+extern "C" axiom_qwen38_rope_profile axiom_qwen38_model_rope_profile(
+        const axiom_qwen38_model *model) {
+    return model ? model->rope_profile : AXIOM_QWEN38_ROPE_PROFILE_INVALID;
 }
 
 extern "C" uint64_t axiom_qwen38_model_recurrent_state_bytes(void) {
@@ -1171,6 +1293,7 @@ int qwen38_model_forward_batch8_internal(
     void *top1_results = nullptr;
     void *top1_partials = nullptr;
     void *scalar_capture_taps = nullptr;
+    void *validation_early_scalar = nullptr;
     int rc = embedding_override_device ? AXIOM_OK : buffer_pointer(model->embedding, &embedding);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->token_ids, &token_ids_device);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->hidden, &hidden);
@@ -1183,6 +1306,9 @@ int qwen38_model_forward_batch8_internal(
     if (rc == AXIOM_OK) rc = buffer_pointer(model->top1_partials, &top1_partials);
     if (rc == AXIOM_OK && model->scalar_tap_capture_active) {
         rc = buffer_pointer(model->validation_taps, &scalar_capture_taps);
+    }
+    if (rc == AXIOM_OK && model->validation_early_capture_active) {
+        rc = buffer_pointer(model->validation_early_scalar, &validation_early_scalar);
     }
     if (rc != AXIOM_OK) return rc;
     if (cudaSetDevice(model->device) != cudaSuccess) return AXIOM_ERR_CUDA;
@@ -1203,17 +1329,6 @@ int qwen38_model_forward_batch8_internal(
     const uint64_t hidden_count = static_cast<uint64_t>(kHidden) * kBatch;
     const uint32_t grid = static_cast<uint32_t>((hidden_count + kThreads - 1u) / kThreads);
     for (uint32_t layer = 0u; layer < kLayers; ++layer) {
-        /* SGLang/SpecForge capture target feature id N at the input of
-         * decoder layer N (the committed residual after layer N-1).  The
-         * DSpark checkpoint was trained against that exact convention. */
-        const int tap_index = target_tap_index(layer);
-        if (tap_index >= 0 && model->scalar_tap_capture_active) {
-            qwen38_capture_tap_column_kernel<<<
-                    (kHidden + kThreads - 1u) / kThreads, kThreads>>>(
-                    static_cast<const float *>(hidden), static_cast<float *>(scalar_capture_taps),
-                    static_cast<uint32_t>(tap_index), model->scalar_tap_capture_time);
-            if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-        }
         if (model->layers[layer].attention) {
             rc = axiom_qwen38_attention_layer_forward_f32_device(
                     model->layers[layer].attention, static_cast<const float *>(hidden),
@@ -1237,6 +1352,26 @@ int qwen38_model_forward_batch8_internal(
         qwen38_add_bf16_inplace_kernel<<<grid, kThreads>>>(
                 static_cast<float *>(hidden), static_cast<const float *>(mlp), hidden_count);
         if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        /* DSpark/SpecForge defines target feature id N as HF
+         * hidden_states[N + 1]: the committed residual after decoder layer N.
+         * Capture after the complete attention+MLP block, consistently with
+         * the checkpoint's training feature contract. */
+        const int tap_index = target_tap_index(layer);
+        if (tap_index >= 0 && model->scalar_tap_capture_active) {
+            qwen38_capture_tap_column_kernel<<<
+                    (kHidden + kThreads - 1u) / kThreads, kThreads>>>(
+                    static_cast<const float *>(hidden), static_cast<float *>(scalar_capture_taps),
+                    static_cast<uint32_t>(tap_index), model->scalar_tap_capture_time);
+            if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        }
+        if (model->validation_early_capture_active && layer < kEarlyTraceLayers) {
+            qwen38_capture_tap_column_kernel<<<
+                    (kHidden + kThreads - 1u) / kThreads, kThreads>>>(
+                    static_cast<const float *>(hidden),
+                    static_cast<float *>(validation_early_scalar), layer,
+                    model->scalar_tap_capture_time);
+            if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        }
     }
     void *final_weight = nullptr;
     rc = buffer_pointer(model->final_norm_weight, &final_weight);
@@ -1696,6 +1831,7 @@ int model_transaction_verify_block8_enqueue(
     void *top1_results = nullptr;
     void *top1_partials = nullptr;
     void *temporal_taps = nullptr;
+    void *validation_early_temporal = nullptr;
     int rc = embedding_override_device ? AXIOM_OK : buffer_pointer(model->embedding, &embedding);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->hidden, &hidden);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->mixer, &mixer);
@@ -1706,6 +1842,9 @@ int model_transaction_verify_block8_enqueue(
     if (rc == AXIOM_OK) rc = buffer_pointer(model->top1_results, &top1_results);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->top1_partials, &top1_partials);
     if (rc == AXIOM_OK) rc = buffer_pointer(model->temporal_taps, &temporal_taps);
+    if (rc == AXIOM_OK && model->validation_early_capture_active) {
+        rc = buffer_pointer(model->validation_early_temporal, &validation_early_temporal);
+    }
     if (rc != AXIOM_OK) return rc;
     if (cudaSetDevice(model->device) != cudaSuccess) return AXIOM_ERR_CUDA;
     if (embedding_override_device) {
@@ -1722,15 +1861,6 @@ int model_transaction_verify_block8_enqueue(
     const uint32_t hidden_grid =
             static_cast<uint32_t>((hidden_count + kThreads - 1u) / kThreads);
     for (uint32_t layer = 0u; layer < kLayers; ++layer) {
-        /* Match SGLang's Qwen3.8 auxiliary-hidden convention: feature layer
-         * id N is the residual entering layer N, not the output of layer N. */
-        const int tap_index = target_tap_index(layer);
-        if (tap_index >= 0) {
-            qwen38_capture_tap8_kernel<<<hidden_grid, kThreads, 0, cuda_stream>>>(
-                    static_cast<const float *>(hidden), static_cast<float *>(temporal_taps),
-                    static_cast<uint32_t>(tap_index));
-            if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-        }
         if (model->layers[layer].attention) {
             rc = axiom_qwen38_attention_layer_forward_temporal8_f32_device(
                     model->layers[layer].attention, static_cast<const float *>(hidden),
@@ -1757,6 +1887,21 @@ int model_transaction_verify_block8_enqueue(
         qwen38_add_bf16_inplace_kernel<<<hidden_grid, kThreads, 0, cuda_stream>>>(
                 static_cast<float *>(hidden), static_cast<const float *>(mlp), hidden_count);
         if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        /* The DSpark target feature contract is HF hidden_states[layer + 1],
+         * i.e. the residual after the complete decoder block. */
+        const int tap_index = target_tap_index(layer);
+        if (tap_index >= 0) {
+            qwen38_capture_tap8_kernel<<<hidden_grid, kThreads, 0, cuda_stream>>>(
+                    static_cast<const float *>(hidden), static_cast<float *>(temporal_taps),
+                    static_cast<uint32_t>(tap_index));
+            if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        }
+        if (model->validation_early_capture_active && layer < kEarlyTraceLayers) {
+            qwen38_capture_tap8_kernel<<<hidden_grid, kThreads, 0, cuda_stream>>>(
+                    static_cast<const float *>(hidden),
+                    static_cast<float *>(validation_early_temporal), layer);
+            if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        }
     }
     void *final_weight = nullptr;
     rc = buffer_pointer(model->final_norm_weight, &final_weight);
@@ -1854,13 +1999,6 @@ int model_device_transaction_verify_block8_enqueue(
     const uint32_t hidden_grid =
             static_cast<uint32_t>((hidden_count + kThreads - 1u) / kThreads);
     for (uint32_t layer = 0u; layer < kLayers; ++layer) {
-        const int tap_index = target_tap_index(layer);
-        if (tap_index >= 0) {
-            qwen38_capture_tap8_kernel<<<hidden_grid, kThreads, 0, cuda_stream>>>(
-                    static_cast<const float *>(hidden), static_cast<float *>(temporal_taps),
-                    static_cast<uint32_t>(tap_index));
-            if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-        }
         if (model->layers[layer].attention) {
             rc = axiom_qwen38_attention_layer_forward_temporal8_f32_device_position(
                     model->layers[layer].attention, static_cast<const float *>(hidden),
@@ -1887,6 +2025,13 @@ int model_device_transaction_verify_block8_enqueue(
         qwen38_add_bf16_inplace_kernel<<<hidden_grid, kThreads, 0, cuda_stream>>>(
                 static_cast<float *>(hidden), static_cast<const float *>(mlp), hidden_count);
         if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        const int tap_index = target_tap_index(layer);
+        if (tap_index >= 0) {
+            qwen38_capture_tap8_kernel<<<hidden_grid, kThreads, 0, cuda_stream>>>(
+                    static_cast<const float *>(hidden), static_cast<float *>(temporal_taps),
+                    static_cast<uint32_t>(tap_index));
+            if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        }
     }
     void *final_weight = nullptr;
     rc = buffer_pointer(model->final_norm_weight, &final_weight);
@@ -2043,6 +2188,44 @@ extern "C" int axiom_qwen38_model_transaction_prefill_token(
     return AXIOM_OK;
 }
 
+extern "C" int axiom_qwen38_model_transaction_dspark_capture_view_get(
+        const axiom_qwen38_model_transaction *transaction,
+        axiom_qwen38_model_dspark_capture_view *out) {
+    const uint32_t requested_abi = out ? out->abi_version : 0u;
+    if (out) {
+        *out = {};
+        out->abi_version = AXIOM_QWEN38_MODEL_DSPARK_CAPTURE_ABI_VERSION;
+    }
+    if (!transaction || !out ||
+        requested_abi != AXIOM_QWEN38_MODEL_DSPARK_CAPTURE_ABI_VERSION ||
+        !transaction->model || !transaction->forwarded || transaction->stream != nullptr ||
+        transaction->device_only ||
+        transaction->model->active_transaction != transaction) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    axiom_qwen38_model *model = transaction->model;
+    void *temporal_taps = nullptr;
+    void *final_hidden = nullptr;
+    int rc = buffer_pointer(model->temporal_taps, &temporal_taps);
+    if (rc == AXIOM_OK) rc = buffer_pointer(model->final_hidden, &final_hidden);
+    if (rc != AXIOM_OK || !temporal_taps || !final_hidden) {
+        return rc == AXIOM_OK ? AXIOM_ERR_RUNTIME : rc;
+    }
+    out->semantics_version = AXIOM_QWEN38_MODEL_DSPARK_CAPTURE_SEMANTICS_VERSION;
+    out->token_start_position = transaction->snapshot_position;
+    out->tokens = kTemporalWidth;
+    out->target_tap_count = kTargetTapCount;
+    out->hidden_size = kHidden;
+    out->layout = AXIOM_QWEN38_MODEL_DSPARK_CAPTURE_LAYOUT_TAP_TIME_HIDDEN;
+    out->storage = AXIOM_QWEN38_MODEL_DSPARK_CAPTURE_STORAGE_F32_BF16_MATERIALIZED;
+    for (uint32_t index = 0u; index < kTargetTapCount; ++index) {
+        out->target_layer_ids[index] = kTargetTapLayerIds[index];
+    }
+    out->target_aux_hidden = static_cast<const float *>(temporal_taps);
+    out->target_last_hidden = static_cast<const float *>(final_hidden);
+    return AXIOM_OK;
+}
+
 extern "C" int axiom_qwen38_model_transaction_prefill_embedding(
         axiom_qwen38_model_transaction *transaction,
         uint32_t token_id,
@@ -2187,6 +2370,11 @@ extern "C" int axiom_qwen38_model_dspark_device_transaction_begin(
         model->scalar_tap_capture_active) {
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const cudaError_t capture_rc = cudaStreamIsCapturing(
+            static_cast<cudaStream_t>(stream), &capture_status);
+    if (capture_rc != cudaSuccess) return cuda_status(capture_rc);
+    const bool capture_only = capture_status != cudaStreamCaptureStatusNone;
     axiom_qwen38_model_transaction *transaction =
             new (std::nothrow) axiom_qwen38_model_transaction();
     if (!transaction) return AXIOM_ERR_BUDGET;
@@ -2202,9 +2390,12 @@ extern "C" int axiom_qwen38_model_dspark_device_transaction_begin(
     transaction->stream = static_cast<cudaStream_t>(stream);
     transaction->device_only = true;
     model->active_transaction = transaction;
-    /* The controller owns the authoritative position/history from here. */
-    model->device_position_authoritative = true;
-    model->committed_history_valid = false;
+    /* Capture records device work but must not invalidate the live host
+     * prefix until a replay session actually takes ownership. */
+    if (!capture_only) {
+        model->device_position_authoritative = true;
+        model->committed_history_valid = false;
+    }
     return AXIOM_OK;
 }
 
@@ -2227,6 +2418,46 @@ extern "C" int axiom_qwen38_model_dspark_device_transaction_verify(
     return model_device_transaction_verify_block8_enqueue(
             model->active_transaction, verify_tokens_device, anchor_position_device,
             static_cast<cudaStream_t>(stream), out);
+}
+
+extern "C" int axiom_qwen38_model_dspark_device_transaction_hidden_view_get(
+        const axiom_qwen38_model *model,
+        axiom_qwen38_model_dspark_device_hidden_view *out) {
+    if (!out) return AXIOM_ERR_INVALID_ARGUMENT;
+    const uint32_t requested_abi = out->abi_version;
+    const uint32_t requested_size = out->struct_size;
+    if (requested_abi != AXIOM_QWEN38_MODEL_DSPARK_DEVICE_HIDDEN_VIEW_ABI_VERSION ||
+        requested_size != sizeof(*out)) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+
+    std::memset(out, 0, sizeof(*out));
+    out->abi_version = requested_abi;
+    out->struct_size = static_cast<uint32_t>(sizeof(*out));
+
+    if (!model || !model->active_transaction ||
+        !model->active_transaction->device_only ||
+        !model->active_transaction->forwarded ||
+        model->active_transaction->model != model) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+
+    void *final_hidden = nullptr;
+    const int rc = buffer_pointer(model->final_hidden, &final_hidden);
+    if (rc != AXIOM_OK || !final_hidden) {
+        return rc == AXIOM_OK ? AXIOM_ERR_RUNTIME : rc;
+    }
+
+    out->semantics_version =
+            AXIOM_QWEN38_MODEL_DSPARK_DEVICE_HIDDEN_SEMANTICS_VERSION;
+    out->temporal_tokens = kTemporalWidth;
+    out->hidden_size = kHidden;
+    out->token_stride_elements = kHidden;
+    out->layout = AXIOM_QWEN38_MODEL_DSPARK_DEVICE_HIDDEN_LAYOUT_TOKEN_HIDDEN;
+    out->storage =
+            AXIOM_QWEN38_MODEL_DSPARK_DEVICE_HIDDEN_STORAGE_F32_BF16_MATERIALIZED;
+    out->target_last_hidden_device = static_cast<const float *>(final_hidden);
+    return AXIOM_OK;
 }
 
 extern "C" int axiom_qwen38_model_dspark_device_transaction_commit(
@@ -2459,14 +2690,111 @@ extern "C" int axiom_qwen38_model_dspark_temporal8_validate(
     out->tested_tokens = kTemporalWidth;
     model->temporal_m8_validated = false;
 
+    /* Capture the eight newly written E4M3 K/V rows from both execution
+     * paths.  They can straddle at most two 256-token pages.  Comparing only
+     * the committed prefix cannot detect corruption in these probe rows. */
+    const uint32_t probe_first_page =
+            original_position / AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+    const uint32_t probe_last_page =
+            (original_position + kTemporalWidth - 1u) /
+            AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+    const uint32_t probe_page_count = probe_last_page - probe_first_page + 1u;
+    const uint32_t validation_view_page_count = probe_last_page + 1u;
+
+    /* Preserve the latest committed attention page before scalar replay.  The
+     * validator already snapshots logical history and GDN state; this extra
+     * byte-exact evidence distinguishes recurrent drift from E4M3 KV drift at
+     * nonzero positions without allocating the full context cache. */
+    constexpr uint32_t kAttentionLayerCount = kLayers / 4u;
+    std::vector<uint8_t> temporal_attention_pages;
+    std::vector<uint8_t> scalar_probe_attention_pages;
+    std::vector<uint8_t> temporal_probe_attention_pages;
+    std::vector<uint8_t> scalar_paged_attention_view;
+    std::vector<uint8_t> scalar_temporal_hot_attention_view;
+    const uint32_t attention_page = original_position == 0u
+            ? 0u : (original_position - 1u) / AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+    if (original_position != 0u) {
+        try {
+            temporal_attention_pages.resize(
+                    static_cast<size_t>(kAttentionLayerCount) *
+                    AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES);
+        } catch (...) {
+            return AXIOM_ERR_BUDGET;
+        }
+        for (uint32_t attention_index = 0u;
+             attention_index < kAttentionLayerCount; ++attention_index) {
+            const uint32_t layer_index = attention_index * 4u + 3u;
+            const int export_rc = axiom_qwen38_attention_layer_kv_page_export(
+                    model->layers[layer_index].attention, attention_page,
+                    temporal_attention_pages.data() +
+                            static_cast<size_t>(attention_index) *
+                            AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES,
+                    AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES);
+            if (export_rc != AXIOM_OK) return export_rc;
+        }
+    }
+    try {
+        const size_t probe_bytes = static_cast<size_t>(kAttentionLayerCount) *
+                probe_page_count * AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES;
+        scalar_probe_attention_pages.resize(probe_bytes);
+        temporal_probe_attention_pages.resize(probe_bytes);
+        const size_t view_bytes = static_cast<size_t>(validation_view_page_count) *
+                AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES;
+        scalar_paged_attention_view.resize(view_bytes);
+        scalar_temporal_hot_attention_view.resize(view_bytes);
+    } catch (...) {
+        return AXIOM_ERR_BUDGET;
+    }
+    const auto probe_page_ptr = [probe_page_count](
+            std::vector<uint8_t> &pages,
+            const uint32_t attention_index,
+            const uint32_t page_offset) -> uint8_t * {
+        return pages.data() +
+                (static_cast<size_t>(attention_index) * probe_page_count + page_offset) *
+                AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES;
+    };
+    const auto export_probe_pages = [&](std::vector<uint8_t> &pages) -> int {
+        for (uint32_t attention_index = 0u;
+             attention_index < kAttentionLayerCount; ++attention_index) {
+            const uint32_t layer_index = attention_index * 4u + 3u;
+            for (uint32_t page_offset = 0u;
+                 page_offset < probe_page_count; ++page_offset) {
+                const int export_rc = axiom_qwen38_attention_layer_kv_page_export(
+                        model->layers[layer_index].attention,
+                        probe_first_page + page_offset,
+                        probe_page_ptr(pages, attention_index, page_offset),
+                        AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES);
+                if (export_rc != AXIOM_OK) return export_rc;
+            }
+        }
+        return AXIOM_OK;
+    };
+
     uint32_t scalar_tokens[kTemporalWidth]{};
     float scalar_logits[kTemporalWidth]{};
     uint32_t repeated[kBatch]{};
     uint32_t scalar_outputs[kBatch]{};
     float scalar_output_logits[kBatch]{};
+    std::vector<float> scalar_attention_diagnostics;
+    std::vector<float> temporal_attention_diagnostics;
+    try {
+        const size_t diagnostic_elements = static_cast<size_t>(
+                kAttentionDiagnosticStages) * kTemporalWidth * kAttentionQDim;
+        scalar_attention_diagnostics.resize(diagnostic_elements);
+        temporal_attention_diagnostics.resize(diagnostic_elements);
+    } catch (...) {
+        return AXIOM_ERR_BUDGET;
+    }
+    const auto diagnostic_stage_ptr = [](std::vector<float> &values,
+                                         const uint32_t stage,
+                                         const uint32_t row) -> float * {
+        return values.data() +
+                (static_cast<size_t>(stage) * kTemporalWidth + row) * kAttentionQDim;
+    };
     const bool old_suppress = model->suppress_history_mutation;
     model->suppress_history_mutation = true;
     model->scalar_tap_capture_active = true;
+    model->validation_early_capture_active = true;
     int rc = AXIOM_OK;
     for (uint32_t time = 0u; time < kTemporalWidth && rc == AXIOM_OK; ++time) {
         model->scalar_tap_capture_time = time;
@@ -2476,11 +2804,32 @@ extern "C" int axiom_qwen38_model_dspark_temporal8_validate(
         if (rc == AXIOM_OK) {
             scalar_tokens[time] = scalar_outputs[0];
             scalar_logits[time] = scalar_output_logits[0];
+            rc = axiom_qwen38_attention_layer_validation_export(
+                    model->layers[3u].attention, 0u, 1u,
+                    diagnostic_stage_ptr(scalar_attention_diagnostics, 0u, time),
+                    diagnostic_stage_ptr(scalar_attention_diagnostics, 1u, time),
+                    diagnostic_stage_ptr(scalar_attention_diagnostics, 2u, time),
+                    diagnostic_stage_ptr(scalar_attention_diagnostics, 3u, time),
+                    kAttentionQDim);
         }
     }
     model->scalar_tap_capture_active = false;
+    model->validation_early_capture_active = false;
     model->scalar_tap_capture_time = 0u;
     model->suppress_history_mutation = old_suppress;
+    if (rc == AXIOM_OK) {
+        rc = export_probe_pages(scalar_probe_attention_pages);
+    }
+    for (uint32_t page = 0u;
+         page < validation_view_page_count && rc == AXIOM_OK; ++page) {
+        rc = axiom_qwen38_attention_layer_validation_kv_views_export(
+                model->layers[3u].attention, page,
+                scalar_paged_attention_view.data() +
+                        static_cast<size_t>(page) * AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES,
+                scalar_temporal_hot_attention_view.data() +
+                        static_cast<size_t>(page) * AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES,
+                AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES);
+    }
     if (rc != AXIOM_OK) {
         (void)model_restore_history_snapshot(model, original_history);
         return rc;
@@ -2488,16 +2837,84 @@ extern "C" int axiom_qwen38_model_dspark_temporal8_validate(
     rc = model_restore_history_snapshot(model, original_history);
     if (rc != AXIOM_OK) return rc;
 
+    uint64_t attention_kv_mismatches[kAttentionLayerCount]{};
+    uint32_t attention_kv_first_token[kAttentionLayerCount]{};
+    uint32_t attention_kv_first_byte[kAttentionLayerCount]{};
+    uint8_t attention_kv_first_temporal[kAttentionLayerCount]{};
+    uint8_t attention_kv_first_scalar[kAttentionLayerCount]{};
+    if (original_position != 0u) {
+        std::vector<uint8_t> scalar_page;
+        try {
+            scalar_page.resize(AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES);
+        } catch (...) {
+            return AXIOM_ERR_BUDGET;
+        }
+        constexpr uint32_t kKvBytesPerToken =
+                AXIOM_QWEN38_ATTENTION_KV_HEADS * AXIOM_QWEN38_ATTENTION_HEAD_DIM;
+        constexpr uint32_t kHalfPageBytes =
+                AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES / 2u;
+        const uint32_t page_start =
+                attention_page * AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+        const uint32_t valid_tokens = original_position - page_start;
+        for (uint32_t attention_index = 0u;
+             attention_index < kAttentionLayerCount; ++attention_index) {
+            const uint32_t layer_index = attention_index * 4u + 3u;
+            rc = axiom_qwen38_attention_layer_kv_page_export(
+                    model->layers[layer_index].attention, attention_page,
+                    scalar_page.data(), scalar_page.size());
+            if (rc != AXIOM_OK) return rc;
+            const uint8_t *temporal_page = temporal_attention_pages.data() +
+                    static_cast<size_t>(attention_index) *
+                    AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES;
+            bool first = true;
+            for (uint32_t token = 0u; token < valid_tokens; ++token) {
+                for (uint32_t byte = 0u; byte < kKvBytesPerToken; ++byte) {
+                    const uint32_t k_offset = token * kKvBytesPerToken + byte;
+                    const uint32_t v_offset = kHalfPageBytes + k_offset;
+                    const uint32_t offsets[2] = {k_offset, v_offset};
+                    for (uint32_t offset : offsets) {
+                        if (temporal_page[offset] == scalar_page[offset]) continue;
+                        ++attention_kv_mismatches[attention_index];
+                        if (first) {
+                            first = false;
+                            attention_kv_first_token[attention_index] = page_start + token;
+                            attention_kv_first_byte[attention_index] =
+                                    offset >= kHalfPageBytes
+                                    ? kKvBytesPerToken + byte : byte;
+                            attention_kv_first_temporal[attention_index] = temporal_page[offset];
+                            attention_kv_first_scalar[attention_index] = scalar_page[offset];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     axiom_qwen38_model_transaction *transaction = nullptr;
     axiom_qwen38_model_dspark_verify_block8_result temporal{};
     temporal.abi_version = AXIOM_QWEN38_MODEL_DSPARK_ABI_VERSION;
+    model->validation_early_capture_active = true;
     rc = axiom_qwen38_model_transaction_begin(model, &transaction);
     if (rc == AXIOM_OK) {
         rc = axiom_qwen38_model_transaction_verify_block8(
                 transaction, input_tokens, nullptr, &temporal);
     }
+    if (rc == AXIOM_OK) {
+        rc = axiom_qwen38_attention_layer_validation_export(
+                model->layers[3u].attention, 0u, kTemporalWidth,
+                diagnostic_stage_ptr(temporal_attention_diagnostics, 0u, 0u),
+                diagnostic_stage_ptr(temporal_attention_diagnostics, 1u, 0u),
+                diagnostic_stage_ptr(temporal_attention_diagnostics, 2u, 0u),
+                diagnostic_stage_ptr(temporal_attention_diagnostics, 3u, 0u),
+                static_cast<uint64_t>(kTemporalWidth) * kAttentionQDim);
+    }
+    if (rc == AXIOM_OK) {
+        rc = export_probe_pages(temporal_probe_attention_pages);
+    }
     std::vector<float> scalar_tap_values;
     std::vector<float> temporal_tap_values;
+    std::vector<float> scalar_early_values;
+    std::vector<float> temporal_early_values;
     if (rc == AXIOM_OK) {
         const uint64_t tap_elements =
                 static_cast<uint64_t>(kTargetTapCount) * kTemporalWidth * kHidden;
@@ -2507,6 +2924,10 @@ extern "C" int axiom_qwen38_model_dspark_temporal8_validate(
             try {
                 scalar_tap_values.resize(static_cast<size_t>(tap_elements));
                 temporal_tap_values.resize(static_cast<size_t>(tap_elements));
+                const size_t early_elements = static_cast<size_t>(
+                        kEarlyTraceLayers) * kTemporalWidth * kHidden;
+                scalar_early_values.resize(early_elements);
+                temporal_early_values.resize(early_elements);
             } catch (...) {
                 rc = AXIOM_ERR_BUDGET;
             }
@@ -2514,8 +2935,16 @@ extern "C" int axiom_qwen38_model_dspark_temporal8_validate(
         if (rc == AXIOM_OK) {
             void *scalar_taps = nullptr;
             void *temporal_taps = nullptr;
+            void *scalar_early = nullptr;
+            void *temporal_early = nullptr;
             rc = buffer_pointer(model->validation_taps, &scalar_taps);
             if (rc == AXIOM_OK) rc = buffer_pointer(model->temporal_taps, &temporal_taps);
+            if (rc == AXIOM_OK) {
+                rc = buffer_pointer(model->validation_early_scalar, &scalar_early);
+            }
+            if (rc == AXIOM_OK) {
+                rc = buffer_pointer(model->validation_early_temporal, &temporal_early);
+            }
             if (rc == AXIOM_OK && cudaSetDevice(model->device) != cudaSuccess) rc = AXIOM_ERR_CUDA;
             cudaError_t status = cudaSuccess;
             if (rc == AXIOM_OK) {
@@ -2526,6 +2955,14 @@ extern "C" int axiom_qwen38_model_dspark_temporal8_validate(
                 status = cudaMemcpy(temporal_tap_values.data(), temporal_taps,
                         temporal_tap_values.size() * sizeof(float), cudaMemcpyDeviceToHost);
             }
+            if (rc == AXIOM_OK && status == cudaSuccess) {
+                status = cudaMemcpy(scalar_early_values.data(), scalar_early,
+                        scalar_early_values.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            }
+            if (rc == AXIOM_OK && status == cudaSuccess) {
+                status = cudaMemcpy(temporal_early_values.data(), temporal_early,
+                        temporal_early_values.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            }
             if (rc == AXIOM_OK && status != cudaSuccess) rc = cuda_status(status);
         }
     }
@@ -2534,30 +2971,169 @@ extern "C" int axiom_qwen38_model_dspark_temporal8_validate(
         transaction = nullptr;
         if (rc == AXIOM_OK && abort_rc != AXIOM_OK) rc = abort_rc;
     }
+    model->validation_early_capture_active = false;
     if (rc != AXIOM_OK) {
         (void)model_restore_history_snapshot(model, original_history);
         return rc;
     }
 
+    constexpr uint32_t kProbeKvBytesPerToken =
+            AXIOM_QWEN38_ATTENTION_KV_HEADS * AXIOM_QWEN38_ATTENTION_HEAD_DIM;
+    constexpr uint32_t kProbeHalfPageBytes =
+            AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES / 2u;
+    uint64_t probe_attention_kv_mismatches[kAttentionLayerCount]{};
+    uint32_t probe_attention_kv_first_row[kAttentionLayerCount]{};
+    uint32_t probe_attention_kv_first_byte[kAttentionLayerCount]{};
+    uint8_t probe_attention_kv_first_scalar[kAttentionLayerCount]{};
+    uint8_t probe_attention_kv_first_temporal[kAttentionLayerCount]{};
+    uint64_t probe_attention_kv_total_mismatches = 0u;
+    for (uint32_t attention_index = 0u;
+         attention_index < kAttentionLayerCount; ++attention_index) {
+        bool first = true;
+        for (uint32_t row = 0u; row < kTemporalWidth; ++row) {
+            const uint32_t logical_token = original_position + row;
+            const uint32_t logical_page =
+                    logical_token / AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+            const uint32_t page_offset = logical_page - probe_first_page;
+            const uint32_t token_offset =
+                    logical_token % AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+            const uint8_t *scalar_page = probe_page_ptr(
+                    scalar_probe_attention_pages, attention_index, page_offset);
+            const uint8_t *temporal_page = probe_page_ptr(
+                    temporal_probe_attention_pages, attention_index, page_offset);
+            for (uint32_t byte = 0u; byte < kProbeKvBytesPerToken; ++byte) {
+                const uint32_t k_offset = token_offset * kProbeKvBytesPerToken + byte;
+                const uint32_t v_offset = kProbeHalfPageBytes + k_offset;
+                const uint32_t offsets[2] = {k_offset, v_offset};
+                for (uint32_t offset : offsets) {
+                    if (scalar_page[offset] == temporal_page[offset]) continue;
+                    ++probe_attention_kv_mismatches[attention_index];
+                    ++probe_attention_kv_total_mismatches;
+                    if (first) {
+                        first = false;
+                        probe_attention_kv_first_row[attention_index] = row;
+                        probe_attention_kv_first_byte[attention_index] =
+                                offset >= kProbeHalfPageBytes
+                                ? kProbeKvBytesPerToken + byte : byte;
+                        probe_attention_kv_first_scalar[attention_index] = scalar_page[offset];
+                        probe_attention_kv_first_temporal[attention_index] = temporal_page[offset];
+                    }
+                }
+            }
+        }
+    }
+    uint64_t scalar_kv_view_mismatches = 0u;
+    uint32_t scalar_kv_view_first_token = 0u;
+    uint32_t scalar_kv_view_first_byte = 0u;
+    uint8_t scalar_kv_view_first_paged = 0u;
+    uint8_t scalar_kv_view_first_temporal_hot = 0u;
+    bool scalar_kv_view_first = true;
+    const uint32_t scalar_kv_view_tokens = original_position + kTemporalWidth;
+    for (uint32_t token = 0u; token < scalar_kv_view_tokens; ++token) {
+        const uint32_t page = token / AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+        const uint32_t token_offset = token % AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+        const uint8_t *paged = scalar_paged_attention_view.data() +
+                static_cast<size_t>(page) * AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES;
+        const uint8_t *temporal_hot = scalar_temporal_hot_attention_view.data() +
+                static_cast<size_t>(page) * AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES;
+        for (uint32_t byte = 0u; byte < kProbeKvBytesPerToken; ++byte) {
+            const uint32_t k_offset = token_offset * kProbeKvBytesPerToken + byte;
+            const uint32_t v_offset = kProbeHalfPageBytes + k_offset;
+            const uint32_t offsets[2] = {k_offset, v_offset};
+            for (uint32_t offset : offsets) {
+                if (paged[offset] == temporal_hot[offset]) continue;
+                ++scalar_kv_view_mismatches;
+                if (scalar_kv_view_first) {
+                    scalar_kv_view_first = false;
+                    scalar_kv_view_first_token = token;
+                    scalar_kv_view_first_byte = offset >= kProbeHalfPageBytes
+                            ? kProbeKvBytesPerToken + byte : byte;
+                    scalar_kv_view_first_paged = paged[offset];
+                    scalar_kv_view_first_temporal_hot = temporal_hot[offset];
+                }
+            }
+        }
+    }
+
     bool tokens_match = true;
+    uint32_t first_token_mismatch = kTemporalWidth;
     float max_logit_error = 0.0f;
+    uint32_t max_logit_error_time = 0u;
     for (uint32_t time = 0u; time < kTemporalWidth; ++time) {
-        tokens_match &= temporal.target_token_ids[time] == scalar_tokens[time];
+        const bool token_match = temporal.target_token_ids[time] == scalar_tokens[time];
+        if (!token_match && first_token_mismatch == kTemporalWidth) {
+            first_token_mismatch = time;
+        }
+        tokens_match &= token_match;
         const float error = std::fabs(temporal.target_logits[time] - scalar_logits[time]);
         if (!std::isfinite(error)) {
             max_logit_error = std::numeric_limits<float>::infinity();
-        } else {
+            max_logit_error_time = time;
+        } else if (error > max_logit_error) {
             max_logit_error = std::max(max_logit_error, error);
+            max_logit_error_time = time;
         }
     }
     float max_tap_error = 0.0f;
+    float max_tap_error_by_tap[kTargetTapCount]{};
+    uint32_t max_tap_error_time[kTargetTapCount]{};
+    uint32_t max_tap_error_hidden[kTargetTapCount]{};
     for (size_t index = 0u; index < scalar_tap_values.size(); ++index) {
         const float error = std::fabs(temporal_tap_values[index] - scalar_tap_values[index]);
+        const uint32_t tap = static_cast<uint32_t>(
+                index / (static_cast<size_t>(kTemporalWidth) * kHidden));
+        const size_t within_tap = index % (static_cast<size_t>(kTemporalWidth) * kHidden);
+        const uint32_t time = static_cast<uint32_t>(within_tap / kHidden);
+        const uint32_t hidden = static_cast<uint32_t>(within_tap % kHidden);
         if (!std::isfinite(error)) {
             max_tap_error = std::numeric_limits<float>::infinity();
+            max_tap_error_by_tap[tap] = std::numeric_limits<float>::infinity();
+            max_tap_error_time[tap] = time;
+            max_tap_error_hidden[tap] = hidden;
             break;
         }
         max_tap_error = std::max(max_tap_error, error);
+        if (error > max_tap_error_by_tap[tap]) {
+            max_tap_error_by_tap[tap] = error;
+            max_tap_error_time[tap] = time;
+            max_tap_error_hidden[tap] = hidden;
+        }
+    }
+    float max_early_error[kEarlyTraceLayers]{};
+    uint32_t max_early_error_time[kEarlyTraceLayers]{};
+    uint32_t max_early_error_hidden[kEarlyTraceLayers]{};
+    for (size_t index = 0u; index < scalar_early_values.size(); ++index) {
+        const uint32_t layer = static_cast<uint32_t>(
+                index / (static_cast<size_t>(kTemporalWidth) * kHidden));
+        const size_t within_layer =
+                index % (static_cast<size_t>(kTemporalWidth) * kHidden);
+        const uint32_t time = static_cast<uint32_t>(within_layer / kHidden);
+        const uint32_t hidden = static_cast<uint32_t>(within_layer % kHidden);
+        const float error = std::fabs(
+                temporal_early_values[index] - scalar_early_values[index]);
+        if (!std::isfinite(error) || error > max_early_error[layer]) {
+            max_early_error[layer] = error;
+            max_early_error_time[layer] = time;
+            max_early_error_hidden[layer] = hidden;
+        }
+    }
+    float max_attention_diagnostic_error[kAttentionDiagnosticStages]{};
+    uint32_t max_attention_diagnostic_row[kAttentionDiagnosticStages]{};
+    uint32_t max_attention_diagnostic_dim[kAttentionDiagnosticStages]{};
+    for (size_t index = 0u; index < scalar_attention_diagnostics.size(); ++index) {
+        const uint32_t stage = static_cast<uint32_t>(
+                index / (static_cast<size_t>(kTemporalWidth) * kAttentionQDim));
+        const size_t within_stage =
+                index % (static_cast<size_t>(kTemporalWidth) * kAttentionQDim);
+        const uint32_t row = static_cast<uint32_t>(within_stage / kAttentionQDim);
+        const uint32_t dim = static_cast<uint32_t>(within_stage % kAttentionQDim);
+        const float error = std::fabs(
+                temporal_attention_diagnostics[index] - scalar_attention_diagnostics[index]);
+        if (!std::isfinite(error) || error > max_attention_diagnostic_error[stage]) {
+            max_attention_diagnostic_error[stage] = error;
+            max_attention_diagnostic_row[stage] = row;
+            max_attention_diagnostic_dim[stage] = dim;
+        }
     }
     float max_tap_bf16_materialization_error = 0.0f;
     const auto accumulate_tap_bf16_materialization_error = [&](const std::vector<float> &tap_values) {
@@ -2580,6 +3156,290 @@ extern "C" int axiom_qwen38_model_dspark_temporal8_validate(
     out->max_tap_bf16_materialization_abs_error = max_tap_bf16_materialization_error;
     if (!tokens_match || max_logit_error > absolute_tolerance ||
         max_tap_error > absolute_tolerance || max_tap_bf16_materialization_error != 0.0f) {
+        std::fprintf(
+                stderr,
+                "axiom-qwen38-model: temporal8 mismatch position=%u first_token_row=%u "
+                "scalar_token=%u temporal_token=%u max_logit_row=%u "
+                "scalar_logit=%.9g temporal_logit=%.9g\n",
+                original_position, first_token_mismatch,
+                first_token_mismatch < kTemporalWidth
+                        ? scalar_tokens[first_token_mismatch] : 0u,
+                first_token_mismatch < kTemporalWidth
+                        ? temporal.target_token_ids[first_token_mismatch] : 0u,
+                max_logit_error_time,
+                static_cast<double>(scalar_logits[max_logit_error_time]),
+                static_cast<double>(temporal.target_logits[max_logit_error_time]));
+        for (uint32_t tap = 0u; tap < kTargetTapCount; ++tap) {
+            const size_t tap_index =
+                    (static_cast<size_t>(tap) * kTemporalWidth +
+                     max_tap_error_time[tap]) * kHidden +
+                    max_tap_error_hidden[tap];
+            std::fprintf(
+                    stderr,
+                    "axiom-qwen38-model: temporal8 tap=%u layer=%u max_error=%.9g "
+                    "row=%u hidden=%u scalar=%.9g temporal=%.9g\n",
+                    tap, kTargetTapLayerIds[tap],
+                    static_cast<double>(max_tap_error_by_tap[tap]),
+                    max_tap_error_time[tap], max_tap_error_hidden[tap],
+                    static_cast<double>(scalar_tap_values[tap_index]),
+                    static_cast<double>(temporal_tap_values[tap_index]));
+        }
+        for (uint32_t layer = 0u; layer < kEarlyTraceLayers; ++layer) {
+            const size_t early_index =
+                    (static_cast<size_t>(layer) * kTemporalWidth +
+                     max_early_error_time[layer]) * kHidden +
+                    max_early_error_hidden[layer];
+            std::fprintf(
+                    stderr,
+                    "axiom-qwen38-model: temporal8 early_layer=%u max_error=%.9g "
+                    "row=%u hidden=%u scalar=%.9g temporal=%.9g\n",
+                    layer, static_cast<double>(max_early_error[layer]),
+                    max_early_error_time[layer], max_early_error_hidden[layer],
+                    static_cast<double>(scalar_early_values[early_index]),
+                    static_cast<double>(temporal_early_values[early_index]));
+        }
+        constexpr const char *kAttentionDiagnosticStageNames[kAttentionDiagnosticStages] = {
+            "q_norm_rope", "gate", "attention", "gated_attention",
+        };
+        for (uint32_t stage = 0u; stage < kAttentionDiagnosticStages; ++stage) {
+            const size_t diagnostic_index =
+                    (static_cast<size_t>(stage) * kTemporalWidth +
+                     max_attention_diagnostic_row[stage]) * kAttentionQDim +
+                    max_attention_diagnostic_dim[stage];
+            std::fprintf(
+                    stderr,
+                    "axiom-qwen38-model: temporal8 layer=3 stage=%s max_error=%.9g "
+                    "row=%u dim=%u scalar=%.9g temporal=%.9g\n",
+                    kAttentionDiagnosticStageNames[stage],
+                    static_cast<double>(max_attention_diagnostic_error[stage]),
+                    max_attention_diagnostic_row[stage],
+                    max_attention_diagnostic_dim[stage],
+                    static_cast<double>(scalar_attention_diagnostics[diagnostic_index]),
+                    static_cast<double>(temporal_attention_diagnostics[diagnostic_index]));
+        }
+        std::fprintf(
+                stderr,
+                "axiom-qwen38-model: temporal8 layer=3 scalar_kv_views_mismatches=%llu "
+                "first_token=%u first_byte=%u paged_code=%u temporal_hot_code=%u\n",
+                static_cast<unsigned long long>(scalar_kv_view_mismatches),
+                scalar_kv_view_first_token, scalar_kv_view_first_byte,
+                static_cast<unsigned>(scalar_kv_view_first_paged),
+                static_cast<unsigned>(scalar_kv_view_first_temporal_hot));
+        for (uint32_t attention_index = 0u;
+             attention_index < kAttentionLayerCount; ++attention_index) {
+            if (attention_kv_mismatches[attention_index] == 0u) continue;
+            std::fprintf(
+                    stderr,
+                    "axiom-qwen38-model: temporal8 attention_layer=%u "
+                    "kv_mismatches=%llu first_token=%u first_byte=%u "
+                    "scalar_code=%u temporal_code=%u\n",
+                    attention_index * 4u + 3u,
+                    static_cast<unsigned long long>(
+                            attention_kv_mismatches[attention_index]),
+                    attention_kv_first_token[attention_index],
+                    attention_kv_first_byte[attention_index],
+                    static_cast<unsigned>(attention_kv_first_scalar[attention_index]),
+                    static_cast<unsigned>(attention_kv_first_temporal[attention_index]));
+        }
+        std::fprintf(
+                stderr,
+                "axiom-qwen38-model: temporal8 probe_kv_total_mismatches=%llu "
+                "position=%u rows=%u\n",
+                static_cast<unsigned long long>(probe_attention_kv_total_mismatches),
+                original_position, kTemporalWidth);
+        for (uint32_t attention_index = 0u;
+             attention_index < kAttentionLayerCount; ++attention_index) {
+            if (probe_attention_kv_mismatches[attention_index] == 0u) continue;
+            std::fprintf(
+                    stderr,
+                    "axiom-qwen38-model: temporal8 probe_attention_layer=%u "
+                    "kv_mismatches=%llu first_row=%u first_byte=%u "
+                    "scalar_code=%u temporal_code=%u\n",
+                    attention_index * 4u + 3u,
+                    static_cast<unsigned long long>(
+                            probe_attention_kv_mismatches[attention_index]),
+                    probe_attention_kv_first_row[attention_index],
+                    probe_attention_kv_first_byte[attention_index],
+                    static_cast<unsigned>(probe_attention_kv_first_scalar[attention_index]),
+                    static_cast<unsigned>(probe_attention_kv_first_temporal[attention_index]));
+        }
+        return AXIOM_OK;
+    }
+
+    /* The host temporal verifier above is the lossless reference for the M8
+     * target.  Exercise the device-position implementation directly, outside
+     * the speculative controller and outside CUDA graph capture, against the
+     * same immutable history.  This qualification-only gate prevents a
+     * controller speedup from masking target-token drift and distinguishes a
+     * model device-path defect from graph replay/acceptance bookkeeping. */
+    uint32_t device_tokens[kTemporalWidth]{};
+    float device_logits[kTemporalWidth]{};
+    std::vector<float> device_tap_values;
+    std::vector<float> device_attention_diagnostics;
+    try {
+        device_tap_values.resize(temporal_tap_values.size());
+        device_attention_diagnostics.resize(temporal_attention_diagnostics.size());
+    } catch (...) {
+        return AXIOM_ERR_BUDGET;
+    }
+    axiom_device_buffer *device_anchor_buffer = nullptr;
+    void *device_anchor = nullptr;
+    void *device_verify_tokens = nullptr;
+    bool device_transaction_active = false;
+    int device_rc = axiom_device_buffer_create(
+            model->runtime, &device_anchor_buffer, sizeof(uint32_t));
+    if (device_rc == AXIOM_OK) {
+        device_rc = axiom_device_buffer_upload(
+                device_anchor_buffer, 0u, &original_position, sizeof(original_position));
+    }
+    if (device_rc == AXIOM_OK) {
+        device_rc = buffer_pointer(device_anchor_buffer, &device_anchor);
+    }
+    if (device_rc == AXIOM_OK) {
+        device_rc = buffer_pointer(model->token_ids, &device_verify_tokens);
+    }
+    if (device_rc == AXIOM_OK && cudaSetDevice(model->device) != cudaSuccess) {
+        device_rc = AXIOM_ERR_CUDA;
+    }
+    if (device_rc == AXIOM_OK) {
+        device_rc = cuda_status(cudaMemcpy(
+                device_verify_tokens, input_tokens, sizeof(device_tokens),
+                cudaMemcpyHostToDevice));
+    }
+    if (device_rc == AXIOM_OK) {
+        device_rc = axiom_qwen38_model_dspark_device_transaction_begin(
+                model, static_cast<const uint32_t *>(device_anchor), nullptr);
+        device_transaction_active = device_rc == AXIOM_OK;
+    }
+    axiom_qwen38_model_dspark_device_target_verify_view device_view{};
+    device_view.abi_version = AXIOM_QWEN38_MODEL_DSPARK_ABI_VERSION;
+    if (device_rc == AXIOM_OK) {
+        device_rc = axiom_qwen38_model_dspark_device_transaction_verify(
+                model, static_cast<const uint32_t *>(device_verify_tokens),
+                static_cast<const uint32_t *>(device_anchor), kTemporalWidth,
+                nullptr, &device_view);
+    }
+    if (device_rc == AXIOM_OK) {
+        device_rc = cuda_status(cudaMemcpy(
+                device_tokens, device_view.target_token_ids_device,
+                sizeof(device_tokens), cudaMemcpyDeviceToHost));
+    }
+    if (device_rc == AXIOM_OK) {
+        device_rc = cuda_status(cudaMemcpy(
+                device_logits, device_view.target_logits_device,
+                sizeof(device_logits), cudaMemcpyDeviceToHost));
+    }
+    if (device_rc == AXIOM_OK) {
+        device_rc = cuda_status(cudaMemcpy(
+                device_tap_values.data(), device_view.target_taps_device,
+                device_tap_values.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+    if (device_rc == AXIOM_OK) {
+        device_rc = axiom_qwen38_attention_layer_validation_export(
+                model->layers[3u].attention, 0u, kTemporalWidth,
+                diagnostic_stage_ptr(device_attention_diagnostics, 0u, 0u),
+                diagnostic_stage_ptr(device_attention_diagnostics, 1u, 0u),
+                diagnostic_stage_ptr(device_attention_diagnostics, 2u, 0u),
+                diagnostic_stage_ptr(device_attention_diagnostics, 3u, 0u),
+                static_cast<uint64_t>(kTemporalWidth) * kAttentionQDim);
+    }
+    if (device_transaction_active) {
+        const int abort_rc = axiom_qwen38_model_dspark_device_transaction_abort(model, nullptr);
+        device_transaction_active = false;
+        if (device_rc == AXIOM_OK && abort_rc != AXIOM_OK) device_rc = abort_rc;
+    }
+    axiom_device_buffer_destroy(device_anchor_buffer);
+    device_anchor_buffer = nullptr;
+
+    /* Device transactions deliberately invalidate host ownership.  The gate
+     * must return the model to its exact pre-probe state on both success and
+     * failure before exposing any diagnostic result to the caller. */
+    model->device_position_authoritative = false;
+    model->committed_history_valid = true;
+    const int device_restore_rc = model_restore_history_snapshot(model, original_history);
+    if (device_rc == AXIOM_OK && device_restore_rc != AXIOM_OK) {
+        device_rc = device_restore_rc;
+    }
+    if (device_rc != AXIOM_OK || model->position != original_position) {
+        return device_rc == AXIOM_OK ? AXIOM_ERR_CUDA : device_rc;
+    }
+
+    bool device_tokens_match = true;
+    uint32_t device_first_token_mismatch = kTemporalWidth;
+    float device_max_logit_error = 0.0f;
+    uint32_t device_max_logit_error_row = 0u;
+    for (uint32_t row = 0u; row < kTemporalWidth; ++row) {
+        if (device_tokens[row] != temporal.target_token_ids[row] &&
+            device_first_token_mismatch == kTemporalWidth) {
+            device_first_token_mismatch = row;
+        }
+        device_tokens_match &= device_tokens[row] == temporal.target_token_ids[row];
+        const float error = std::fabs(device_logits[row] - temporal.target_logits[row]);
+        if (!std::isfinite(error) || error > device_max_logit_error) {
+            device_max_logit_error = error;
+            device_max_logit_error_row = row;
+        }
+    }
+    float device_max_tap_error = 0.0f;
+    uint32_t device_max_tap = 0u;
+    uint32_t device_max_tap_row = 0u;
+    uint32_t device_max_tap_hidden = 0u;
+    for (size_t index = 0u; index < device_tap_values.size(); ++index) {
+        const float error = std::fabs(device_tap_values[index] - temporal_tap_values[index]);
+        if (!std::isfinite(error) || error > device_max_tap_error) {
+            device_max_tap_error = error;
+            device_max_tap = static_cast<uint32_t>(
+                    index / (static_cast<size_t>(kTemporalWidth) * kHidden));
+            const size_t within_tap = index % (static_cast<size_t>(kTemporalWidth) * kHidden);
+            device_max_tap_row = static_cast<uint32_t>(within_tap / kHidden);
+            device_max_tap_hidden = static_cast<uint32_t>(within_tap % kHidden);
+        }
+    }
+    float device_attention_error[kAttentionDiagnosticStages]{};
+    uint32_t device_attention_row[kAttentionDiagnosticStages]{};
+    uint32_t device_attention_dim[kAttentionDiagnosticStages]{};
+    for (size_t index = 0u; index < device_attention_diagnostics.size(); ++index) {
+        const uint32_t stage = static_cast<uint32_t>(
+                index / (static_cast<size_t>(kTemporalWidth) * kAttentionQDim));
+        const size_t within_stage =
+                index % (static_cast<size_t>(kTemporalWidth) * kAttentionQDim);
+        const uint32_t row = static_cast<uint32_t>(within_stage / kAttentionQDim);
+        const uint32_t dim = static_cast<uint32_t>(within_stage % kAttentionQDim);
+        const float error = std::fabs(
+                device_attention_diagnostics[index] - temporal_attention_diagnostics[index]);
+        if (!std::isfinite(error) || error > device_attention_error[stage]) {
+            device_attention_error[stage] = error;
+            device_attention_row[stage] = row;
+            device_attention_dim[stage] = dim;
+        }
+    }
+    if (!device_tokens_match || device_max_logit_error > absolute_tolerance ||
+        device_max_tap_error > absolute_tolerance) {
+        std::fprintf(
+                stderr,
+                "axiom-qwen38-model: device-temporal8 mismatch position=%u "
+                "first_token_row=%u host_token=%u device_token=%u "
+                "max_logit_error=%.9g row=%u max_tap_error=%.9g tap=%u row=%u hidden=%u\n",
+                original_position, device_first_token_mismatch,
+                device_first_token_mismatch < kTemporalWidth
+                        ? temporal.target_token_ids[device_first_token_mismatch] : 0u,
+                device_first_token_mismatch < kTemporalWidth
+                        ? device_tokens[device_first_token_mismatch] : 0u,
+                static_cast<double>(device_max_logit_error), device_max_logit_error_row,
+                static_cast<double>(device_max_tap_error), device_max_tap,
+                device_max_tap_row, device_max_tap_hidden);
+        constexpr const char *kAttentionDiagnosticStageNames[kAttentionDiagnosticStages] = {
+            "q_norm_rope", "gate", "attention", "gated_attention",
+        };
+        for (uint32_t stage = 0u; stage < kAttentionDiagnosticStages; ++stage) {
+            std::fprintf(
+                    stderr,
+                    "axiom-qwen38-model: device-temporal8 layer=3 stage=%s "
+                    "max_error=%.9g row=%u dim=%u\n",
+                    kAttentionDiagnosticStageNames[stage],
+                    static_cast<double>(device_attention_error[stage]),
+                    device_attention_row[stage], device_attention_dim[stage]);
+        }
         return AXIOM_OK;
     }
 

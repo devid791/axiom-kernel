@@ -1,0 +1,29 @@
+{
+  "schema": "axiom-public-performance-record-v1",
+  "measurement_date": "2026-09-05",
+  "published_date": "2026-09-07",
+  "evidence_type": "historical-private-post-restart-http-fixture",
+  "model": "qwen3.8-27b-nvfp4",
+  "checkpoint_variant": "normal-not-uncensored",
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "gpu_count": 1,
+  "host_type": "dedicated-physical",
+  "backend": "native-DSpark-speculative-graph",
+  "sampling": "greedy-no-thinking",
+  "prompt_tokens": 1002,
+  "completion_tokens": 256,
+  "decode_metric_tokens": 255,
+  "decode_metric": "graph-emitted tokens after initial anchor divided by native decode seconds",
+  "decode_tokens_per_second": [409.1117241266142, 409.4104379554007, 409.32379769617864],
+  "median_decode_tokens_per_second": 409.32379769617864,
+  "all_outputs_match_golden": true,
+  "output_text_sha256": "b0d7b6f4bad084c8bdba57559fccbbb3b4acef5d085274123c829aa0eb793b5b",
+  "historical_serving_gates": {
+    "strict_sse": "pass",
+    "tool_continuation": "pass",
+    "speculative_path": "pass",
+    "exact_prefix_session_restore": "pass"
+  },
+  "reproduction_boundary": "Private HTTP daemon, weights and deployment configuration are not distributed. Original build used an authoritative source snapshot beyond its recorded commit. Public build hashes are separate; publication did not rerun GPU inference.",
+  "not_claimed": ["409 tok/s end-to-end", "409 tok/s for every workload", "409 tok/s for uncensored", "409 tok/s for Flash-Next"]
+}

@@ -10,6 +10,7 @@
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cublasLt.h>
+#include "axiom_qwen38_tune_candidates.h"
 
 #include <atomic>
 #include <cmath>
@@ -32,6 +33,7 @@ constexpr uint32_t kGroup = 16u;
 constexpr uint8_t kE4m3Epsilon = 0x20u;
 constexpr uint8_t kE4m3MaxFinite = 0x7eu;
 constexpr size_t kLtWorkspaceBytes = 8u * 1024u * 1024u;
+constexpr size_t kGateupWorkspace64Bytes = 64u * 1024u * 1024u;
 constexpr uint32_t kAutotuneCompareThreads = 256u;
 
 struct MatmulPlan {
@@ -66,6 +68,21 @@ struct ProjectionHostData {
     float weight_global = 0.0f;
     float alpha = 0.0f;
 };
+
+bool nvfp4_rightsize_workspace_enabled() {
+    const char *value = std::getenv("AXIOM_QWEN38_RIGHTSIZE_NVFP4_WORKSPACE");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+// Include every selected M1..M8 plan, including cache hits and untuned shapes.
+// Unloaded projections have zero-initialized plans and contribute no bytes.
+size_t selected_projection_workspace_bytes(const Projection &projection) {
+    size_t bytes = 0u;
+    for (const MatmulPlan &plan : projection.plans) {
+        if (plan.algo.workspaceSize > bytes) bytes = plan.algo.workspaceSize;
+    }
+    return bytes;
+}
 
 bool valid_scale(float value) {
     return std::isfinite(value) && value > 0.0f;
@@ -411,11 +428,13 @@ struct AlgoCacheKey {
     uint32_t rows = 0u;
     uint32_t cols = 0u;
     uint32_t columns = 0u;
+    bool diagnostic_gateup_tile487 = false;
 
     bool operator<(const AlgoCacheKey &other) const {
         if (rows != other.rows) return rows < other.rows;
         if (cols != other.cols) return cols < other.cols;
-        return columns < other.columns;
+        if (columns != other.columns) return columns < other.columns;
+        return diagnostic_gateup_tile487 < other.diagnostic_gateup_tile487;
     }
 };
 
@@ -527,9 +546,71 @@ cublasStatus_t select_projection_algorithm(
     if (!handle || !projection || !plan || !preference || columns == 0u) {
         return CUBLAS_STATUS_INVALID_VALUE;
     }
+    /* The native MTP draft invokes the shared NVFP4 LM head at M1 seven
+     * times per speculative cycle.  Qualify M1 as well as the target M8
+     * shape: candidate acceptance is still guarded by bitwise output
+     * comparison, while the geometry cache keeps this a load-time-only cost. */
     const bool tune = nvfp4_autotune_enabled() &&
-            columns == AXIOM_QWEN38_NVFP4_TC_BATCH;
-    const AlgoCacheKey key{projection->rows, projection->cols, columns};
+            (columns == 1u || columns == AXIOM_QWEN38_NVFP4_TC_BATCH);
+    const char *diagnostic_value =
+            std::getenv("AXIOM_QWEN38_DIAGNOSTIC_GATEUP_TILE487");
+    const bool diagnostic_requested = diagnostic_value &&
+            std::strcmp(diagnostic_value, "1") == 0;
+    // The diagnostic applies only to M34816 N8 K5120; other shapes are unchanged.
+    const bool diagnostic_gateup_tile487 = diagnostic_requested &&
+            projection->rows == 34816u && projection->cols == 5120u &&
+            columns == 8u;
+    if (diagnostic_requested) {
+        const char *required_cap_tiles =
+                std::getenv("AXIOM_QWEN38_AUTOTUNE_GATEUP_CAP_TILES");
+        if (!nvfp4_autotune_enabled() || !required_cap_tiles ||
+            std::strcmp(required_cap_tiles, "1") != 0) {
+            std::fprintf(stderr, "axiom-qwen38-nvfp4: diagnostic-gateup-tile487 "
+                         "requires autotune and AXIOM_QWEN38_AUTOTUNE_GATEUP_CAP_TILES=1; "
+                         "failing closed\n");
+            return CUBLAS_STATUS_INVALID_VALUE;
+        }
+    }
+    const char *cap_tiles_value = tune
+            ? std::getenv("AXIOM_QWEN38_AUTOTUNE_GATEUP_CAP_TILES") : nullptr;
+    const bool gateup_cap_tiles = cap_tiles_value &&
+            std::strcmp(cap_tiles_value, "1") == 0 &&
+            projection->rows == 34816u && projection->cols == 5120u &&
+            columns == 8u;
+    if (gateup_cap_tiles) {
+        // Reject mixed experiments before cache lookup or workspace selection.
+        const char *conflicts[] = {
+            "AXIOM_QWEN38_AUTOTUNE_EXPANDED_POOL",
+            "AXIOM_QWEN38_AUTOTUNE_GATEUP_WORKSPACE64",
+            "AXIOM_QWEN38_AUTOTUNE_GATEUP_STAGES",
+            "AXIOM_QWEN38_AUTOTUNE_GATEUP_SWIZZLE",
+        };
+        for (const char *name : conflicts) {
+            const char *value = std::getenv(name);
+            if (value && std::strcmp(value, "1") == 0) {
+                std::fprintf(stderr, "axiom-qwen38-nvfp4: gateup-cap-tiles "
+                             "cannot combine with %s=1\n", name);
+                return CUBLAS_STATUS_INVALID_VALUE;
+            }
+        }
+    }
+    const char *workspace64_value = tune
+            ? std::getenv("AXIOM_QWEN38_AUTOTUNE_GATEUP_WORKSPACE64") : nullptr;
+    const bool gateup_workspace64 = workspace64_value &&
+            std::strcmp(workspace64_value, "1") == 0 &&
+            projection->rows == 34816u && projection->cols == 5120u &&
+            columns == 8u;
+    if (gateup_workspace64 && !nvfp4_rightsize_workspace_enabled()) {
+        std::fprintf(stderr,
+                     "axiom-qwen38-nvfp4: gateup-workspace64 requires "
+                     "AXIOM_QWEN38_RIGHTSIZE_NVFP4_WORKSPACE=1\n");
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    const size_t workspace_limit = gateup_workspace64
+            ? kGateupWorkspace64Bytes : kLtWorkspaceBytes;
+    // Tuning flags (including the workspace cap) are immutable for the process.
+    const AlgoCacheKey key{projection->rows, projection->cols, columns,
+                           diagnostic_gateup_tile487};
     if (tune) {
         AlgoCacheGuard guard;
         const auto cached = g_algo_cache.find(key);
@@ -540,7 +621,34 @@ cublasStatus_t select_projection_algorithm(
     }
 
     constexpr int kMaxCandidates = 32;
-    cublasLtMatmulHeuristicResult_t candidates[kMaxCandidates]{};
+    const char *expanded_pool_value = tune
+            ? std::getenv("AXIOM_QWEN38_AUTOTUNE_EXPANDED_POOL") : nullptr;
+    const bool expanded_pool = expanded_pool_value &&
+            std::strcmp(expanded_pool_value, "1") == 0;
+    const int candidate_capacity = expanded_pool ? 64 : kMaxCandidates;
+    const char *stages_value = tune
+            ? std::getenv("AXIOM_QWEN38_AUTOTUNE_GATEUP_STAGES") : nullptr;
+    const bool gateup_stages = !gateup_workspace64 && stages_value &&
+            std::strcmp(stages_value, "1") == 0 &&
+            projection->rows == 34816u && projection->cols == 5120u &&
+            columns == 8u;
+    const char *swizzle_value = tune
+            ? std::getenv("AXIOM_QWEN38_AUTOTUNE_GATEUP_SWIZZLE") : nullptr;
+    // Keep experiments separate even if both flags are inherited.
+    const bool gateup_swizzle = !gateup_workspace64 && !gateup_stages && swizzle_value &&
+            std::strcmp(swizzle_value, "1") == 0 &&
+            projection->rows == 2u * AXIOM_QWEN38_NVFP4_FFN &&
+            projection->cols == AXIOM_QWEN38_NVFP4_HIDDEN &&
+            columns == AXIOM_QWEN38_NVFP4_TC_BATCH;
+    const int host_capacity = (gateup_cap_tiles || gateup_swizzle || gateup_stages) ? 128
+            : candidate_capacity + (gateup_workspace64 ? kMaxCandidates : 0);
+    // Host headroom must not enlarge the heuristic request or narrow-tile pool.
+    cublasLtMatmulHeuristicResult_t default_candidates[kMaxCandidates]{};
+    std::vector<cublasLtMatmulHeuristicResult_t> expanded_candidates(
+            (gateup_cap_tiles || expanded_pool || gateup_swizzle || gateup_stages || gateup_workspace64)
+                    ? host_capacity : 0);
+    auto *candidates = (gateup_cap_tiles || expanded_pool || gateup_swizzle || gateup_stages || gateup_workspace64)
+            ? expanded_candidates.data() : default_candidates;
     int returned = 0;
     cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
             handle, projection->desc, projection->a_layout, plan->b_layout,
@@ -550,8 +658,110 @@ cublasStatus_t select_projection_algorithm(
         return status == CUBLAS_STATUS_SUCCESS
                 ? CUBLAS_STATUS_NOT_SUPPORTED : status;
     }
+    // Actual GetHeuristic count, NOT the requested 32 or post-narrow count.
+    // Append-only helpers leave this primary prefix immutable.
+    const int primary_count = returned;
+    if (tune) append_narrow_algorithms(handle, projection->desc,
+            projection->a_layout, plan->b_layout, plan->c_layout, plan->d_layout,
+            kLtWorkspaceBytes, candidates, candidate_capacity, &returned);
+    if (expanded_pool) {
+        std::fprintf(stderr,
+                     "axiom-qwen38-nvfp4: expanded-pool rows=%u cols=%u columns=%u "
+                     "original=%d appended=%d\n",
+                     projection->rows, projection->cols, columns,
+                     primary_count, returned - primary_count);
+    }
+    if (gateup_cap_tiles) {
+        const int cap_tiles_original_count = returned;
+        append_cap_tile_algorithms(handle, projection->desc,
+                projection->a_layout, plan->b_layout, plan->c_layout, plan->d_layout,
+                kLtWorkspaceBytes, candidates, primary_count, host_capacity, &returned);
+        std::fprintf(stderr,
+                     "axiom-qwen38-nvfp4: gateup-cap-tiles rows=%u cols=%u columns=%u "
+                     "primary=%d original=%d appended=%d\n",
+                     projection->rows, projection->cols, columns,
+                     primary_count, cap_tiles_original_count, returned - cap_tiles_original_count);
+    }
+    if (gateup_workspace64) {
+        // Keep the original 8 MiB preference, primary prefix, and narrow append
+        // unchanged. The separate search can only append after that whole pool.
+        const int original_count = returned;
+        cublasLtMatmulPreference_t workspace64_preference = nullptr;
+        cublasLtMatmulHeuristicResult_t workspace64_candidates[kMaxCandidates]{};
+        int workspace64_count = 0;
+        status = cublasLtMatmulPreferenceCreate(&workspace64_preference);
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            status = cublasLtMatmulPreferenceSetAttribute(
+                    workspace64_preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    &workspace_limit, sizeof(workspace_limit));
+        }
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            status = cublasLtMatmulAlgoGetHeuristic(
+                    handle, projection->desc, projection->a_layout, plan->b_layout,
+                    plan->c_layout, plan->d_layout, workspace64_preference,
+                    kMaxCandidates, workspace64_candidates, &workspace64_count);
+        }
+        // Destroy on every path, and propagate cleanup failure if search succeeded.
+        if (workspace64_preference) {
+            const cublasStatus_t cleanup_status =
+                    cublasLtMatmulPreferenceDestroy(workspace64_preference);
+            if (status == CUBLAS_STATUS_SUCCESS) status = cleanup_status;
+        }
+        if (status != CUBLAS_STATUS_SUCCESS) return status;
+        for (int i = 0; i < workspace64_count && returned < host_capacity; ++i) {
+            const auto &candidate = workspace64_candidates[i];
+            if (candidate.state != CUBLAS_STATUS_SUCCESS) continue;
+            bool duplicate = false;
+            for (int j = 0; j < returned; ++j) {
+                if (std::memcmp(&candidate.algo, &candidates[j].algo,
+                                sizeof(candidate.algo)) == 0) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            cublasLtMatmulHeuristicResult_t checked{};
+            checked.state = CUBLAS_STATUS_NOT_SUPPORTED;
+            if (cublasLtMatmulAlgoCheck(
+                    handle, projection->desc, projection->a_layout, plan->b_layout,
+                    plan->c_layout, plan->d_layout, &candidate.algo, &checked) !=
+                    CUBLAS_STATUS_SUCCESS || checked.state != CUBLAS_STATUS_SUCCESS ||
+                    checked.workspaceSize > workspace_limit) continue;
+            // AlgoCheck does not populate the algorithm itself.
+            checked.algo = candidate.algo;
+            candidates[returned++] = checked;
+        }
+        std::fprintf(stderr,
+                     "axiom-qwen38-nvfp4: gateup-workspace64 rows=%u cols=%u columns=%u "
+                     "primary=%d original=%d heuristics64=%d appended=%d\n",
+                     projection->rows, projection->cols, columns,
+                     primary_count, original_count, workspace64_count,
+                     returned - original_count);
+    }
+    if (gateup_stages) {
+        const int stages_original_count = returned;
+        append_stages_algorithms(handle, projection->desc,
+                projection->a_layout, plan->b_layout, plan->c_layout, plan->d_layout,
+                kLtWorkspaceBytes, candidates, primary_count, host_capacity, &returned);
+        std::fprintf(stderr,
+                     "axiom-qwen38-nvfp4: gateup-stages rows=%u cols=%u columns=%u "
+                     "primary=%d original=%d appended=%d\n",
+                     projection->rows, projection->cols, columns,
+                     primary_count, stages_original_count, returned - stages_original_count);
+    }
+    if (gateup_swizzle) {
+        const int swizzle_original_count = returned;
+        append_cta_swizzle_algorithms(handle, projection->desc,
+                projection->a_layout, plan->b_layout, plan->c_layout, plan->d_layout,
+                kLtWorkspaceBytes, candidates, host_capacity, &returned);
+        std::fprintf(stderr,
+                     "axiom-qwen38-nvfp4: gateup-swizzle rows=%u cols=%u columns=%u "
+                     "original=%d appended=%d\n",
+                     projection->rows, projection->cols, columns,
+                     swizzle_original_count, returned - swizzle_original_count);
+    }
     plan->algo = candidates[0];
-    if (!tune || returned == 1) {
+    if (!tune || (returned == 1 && !diagnostic_gateup_tile487)) {
         if (tune) {
             {
                 AlgoCacheGuard guard;
@@ -573,6 +783,11 @@ cublasStatus_t select_projection_algorithm(
     cudaStream_t stream = nullptr;
     cudaEvent_t begin = nullptr;
     cudaEvent_t end = nullptr;
+    const char *cold_cache_value = std::getenv("AXIOM_QWEN38_AUTOTUNE_COLD_CACHE");
+    const bool cold_cache = cold_cache_value &&
+            cold_cache_value[0] == '1' && cold_cache_value[1] == '\0';
+    constexpr size_t kEvictionBytes = 128ull * 1024ull * 1024ull;
+    void *eviction_buffer = nullptr;
     const size_t input_bytes =
             static_cast<size_t>(projection->cols / 2u) * columns;
     const size_t scale_bytes = scale_view_bytes(columns, projection->groups);
@@ -580,7 +795,7 @@ cublasStatus_t select_projection_algorithm(
             static_cast<size_t>(projection->rows) * columns * sizeof(float);
     const uint64_t output_elements =
             static_cast<uint64_t>(projection->rows) * columns;
-    cudaError_t cuda_status = cudaMalloc(&workspace, kLtWorkspaceBytes);
+    cudaError_t cuda_status = cudaMalloc(&workspace, workspace_limit);
     if (cuda_status == cudaSuccess) cuda_status = cudaMalloc(&output, output_bytes);
     if (cuda_status == cudaSuccess) cuda_status = cudaMalloc(&reference, output_bytes);
     if (cuda_status == cudaSuccess) cuda_status = cudaMalloc(&mismatch_device, sizeof(uint32_t));
@@ -588,6 +803,8 @@ cublasStatus_t select_projection_algorithm(
             &stream, cudaStreamNonBlocking);
     if (cuda_status == cudaSuccess) cuda_status = cudaEventCreate(&begin);
     if (cuda_status == cudaSuccess) cuda_status = cudaEventCreate(&end);
+    if (cuda_status == cudaSuccess && cold_cache)
+        cuda_status = cudaMalloc(&eviction_buffer, kEvictionBytes);
     constexpr uint32_t kWarmupRuns = 2u;
     constexpr uint32_t kMeasuredRuns = 20u;
     constexpr float kMinimumSpeedup = 1.03f;
@@ -597,10 +814,12 @@ cublasStatus_t select_projection_algorithm(
     uint32_t exact_candidates = 0u;
     float best_ms = std::numeric_limits<float>::infinity();
     float baseline_ms = std::numeric_limits<float>::infinity();
+    int diagnostic_index = -1;
+    float diagnostic_ms = std::numeric_limits<float>::infinity();
     if (cuda_status == cudaSuccess) {
         for (int candidate = 0; candidate < returned; ++candidate) {
             if (candidates[candidate].state != CUBLAS_STATUS_SUCCESS ||
-                candidates[candidate].workspaceSize > kLtWorkspaceBytes) {
+                candidates[candidate].workspaceSize > workspace_limit) {
                 continue;
             }
             const bool exact = candidate == 0 || nvfp4_candidate_is_exact(
@@ -636,31 +855,83 @@ cublasStatus_t select_projection_algorithm(
                         &candidates[candidate].algo, workspace,
                         candidates[candidate].workspaceSize, stream);
             }
-            if (run_status != CUBLAS_STATUS_SUCCESS ||
-                cudaStreamSynchronize(stream) != cudaSuccess ||
-                cudaEventRecord(begin, stream) != cudaSuccess) {
-                (void)cudaGetLastError();
-                continue;
-            }
-            for (uint32_t run = 0u; run < kMeasuredRuns &&
-                 run_status == CUBLAS_STATUS_SUCCESS; ++run) {
-                run_status = cublasLtMatmul(
-                        handle, projection->desc, &projection->alpha,
-                        projection->weight, projection->a_layout,
-                        projection->input_packed, plan->b_layout,
-                        &beta, output, plan->c_layout, output, plan->d_layout,
-                        &candidates[candidate].algo, workspace,
-                        candidates[candidate].workspaceSize, stream);
-            }
             float elapsed_ms = 0.0f;
-            if (run_status != CUBLAS_STATUS_SUCCESS ||
-                cudaEventRecord(end, stream) != cudaSuccess ||
-                cudaEventSynchronize(end) != cudaSuccess ||
-                cudaEventElapsedTime(&elapsed_ms, begin, end) != cudaSuccess) {
-                (void)cudaGetLastError();
-                continue;
+            if (cold_cache) {
+                if (run_status != CUBLAS_STATUS_SUCCESS ||
+                    cudaStreamSynchronize(stream) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    continue;
+                }
+                bool samples_ok = true;
+                for (uint32_t run = 0u; run < kMeasuredRuns; ++run) {
+                    // Same-stream eviction completes before the start event;
+                    // only this single matmul contributes to the sample time.
+                    if (cudaMemsetAsync(eviction_buffer, 0, kEvictionBytes, stream) != cudaSuccess ||
+                        cudaEventRecord(begin, stream) != cudaSuccess) {
+                        samples_ok = false;
+                        break;
+                    }
+                    run_status = cublasLtMatmul(
+                            handle, projection->desc, &projection->alpha,
+                            projection->weight, projection->a_layout,
+                            projection->input_packed, plan->b_layout,
+                            &beta, output, plan->c_layout, output, plan->d_layout,
+                            &candidates[candidate].algo, workspace,
+                            candidates[candidate].workspaceSize, stream);
+                    float sample_ms = 0.0f;
+                    if (run_status != CUBLAS_STATUS_SUCCESS ||
+                        cudaEventRecord(end, stream) != cudaSuccess ||
+                        cudaEventSynchronize(end) != cudaSuccess ||
+                        cudaEventElapsedTime(&sample_ms, begin, end) != cudaSuccess) {
+                        samples_ok = false;
+                        break;
+                    }
+                    elapsed_ms += sample_ms;
+                }
+                if (!samples_ok) {
+                    (void)cudaGetLastError();
+                    continue;
+                }
+            } else {
+                if (run_status != CUBLAS_STATUS_SUCCESS ||
+                    cudaStreamSynchronize(stream) != cudaSuccess ||
+                    cudaEventRecord(begin, stream) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    continue;
+                }
+                for (uint32_t run = 0u; run < kMeasuredRuns &&
+                     run_status == CUBLAS_STATUS_SUCCESS; ++run) {
+                    run_status = cublasLtMatmul(
+                            handle, projection->desc, &projection->alpha,
+                            projection->weight, projection->a_layout,
+                            projection->input_packed, plan->b_layout,
+                            &beta, output, plan->c_layout, output, plan->d_layout,
+                            &candidates[candidate].algo, workspace,
+                            candidates[candidate].workspaceSize, stream);
+                }
+                if (run_status != CUBLAS_STATUS_SUCCESS ||
+                    cudaEventRecord(end, stream) != cudaSuccess ||
+                    cudaEventSynchronize(end) != cudaSuccess ||
+                    cudaEventElapsedTime(&elapsed_ms, begin, end) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    continue;
+                }
             }
             const float per_call_ms = elapsed_ms / kMeasuredRuns;
+            // Reached only after the existing exactness and execution/timing
+            // checks. No speedup threshold applies to the diagnostic minimum.
+            if (diagnostic_gateup_tile487 && std::isfinite(per_call_ms) &&
+                per_call_ms > 0.0f && per_call_ms < diagnostic_ms) {
+                uint32_t tile = 0u;
+                size_t tile_written = 0u;
+                if (cublasLtMatmulAlgoConfigGetAttribute(
+                        &candidates[candidate].algo, CUBLASLT_ALGO_CONFIG_TILE_ID,
+                        &tile, sizeof(tile), &tile_written) == CUBLAS_STATUS_SUCCESS &&
+                    tile_written == sizeof(tile) && tile == 487u) {
+                    diagnostic_index = candidate;
+                    diagnostic_ms = per_call_ms;
+                }
+            }
             if (candidate == 0) baseline_ms = per_call_ms;
             if (!std::isfinite(best_ms) ||
                 per_call_ms * kCandidateReplacementSpeedup < best_ms) {
@@ -672,6 +943,7 @@ cublasStatus_t select_projection_algorithm(
     if (end) (void)cudaEventDestroy(end);
     if (begin) (void)cudaEventDestroy(begin);
     if (stream) (void)cudaStreamDestroy(stream);
+    if (eviction_buffer) (void)cudaFree(eviction_buffer);
     if (mismatch_device) (void)cudaFree(mismatch_device);
     if (reference) (void)cudaFree(reference);
     if (output) (void)cudaFree(output);
@@ -684,6 +956,23 @@ cublasStatus_t select_projection_algorithm(
                (!std::isfinite(baseline_ms) || best_ms * kMinimumSpeedup >= baseline_ms)) {
         best_index = 0u;
         best_ms = baseline_ms;
+    }
+    if (diagnostic_gateup_tile487) {
+        if (diagnostic_index < 0) {
+            std::fprintf(stderr, "axiom-qwen38-nvfp4: diagnostic-gateup-tile487 "
+                         "no exact successfully measured tile=487 candidate; "
+                         "normal_winner=%u normal_ms=%.6f; failing closed\n",
+                         best_index, static_cast<double>(best_ms));
+            return CUBLAS_STATUS_NOT_SUPPORTED;
+        }
+        std::fprintf(stderr, "axiom-qwen38-nvfp4: diagnostic-gateup-tile487 "
+                     "rows=%u cols=%u columns=%u forced_index=%d tile=487 "
+                     "measured_ms=%.6f normal_winner=%u normal_ms=%.6f\n",
+                     projection->rows, projection->cols, columns, diagnostic_index,
+                     static_cast<double>(diagnostic_ms), best_index,
+                     static_cast<double>(best_ms));
+        best_index = static_cast<uint32_t>(diagnostic_index);
+        best_ms = diagnostic_ms;
     }
     plan->algo = candidates[best_index];
     {
@@ -1129,9 +1418,13 @@ extern "C" int axiom_qwen38_nvfp4_mlp_load(
     try { mlp = new axiom_qwen38_nvfp4_mlp(); } catch (...) { return AXIOM_ERR_BUDGET; }
     mlp->device = device;
     mlp->layer = layer;
+    const bool rightsize_workspace = nvfp4_rightsize_workspace_enabled();
+    size_t workspace_bytes = kLtWorkspaceBytes;
     cublasStatus_t lt_status = cublasLtCreate(&mlp->handle);
     cudaError_t cuda_status = cudaSuccess;
-    if (lt_status == CUBLAS_STATUS_SUCCESS) cuda_status = cudaMalloc(&mlp->workspace, kLtWorkspaceBytes);
+    if (lt_status == CUBLAS_STATUS_SUCCESS && !rightsize_workspace) {
+        cuda_status = cudaMalloc(&mlp->workspace, workspace_bytes);
+    }
     int rc = lt_status == CUBLAS_STATUS_SUCCESS
             ? (cuda_status == cudaSuccess ? AXIOM_OK : (cuda_status == cudaErrorMemoryAllocation ? AXIOM_ERR_BUDGET : AXIOM_ERR_CUDA))
             : AXIOM_ERR_RUNTIME;
@@ -1164,11 +1457,24 @@ extern "C" int axiom_qwen38_nvfp4_mlp_load(
                 static_cast<size_t>(AXIOM_QWEN38_NVFP4_FFN) * AXIOM_QWEN38_NVFP4_TC_BATCH * sizeof(float));
         if (cuda_status != cudaSuccess) rc = cuda_status == cudaErrorMemoryAllocation ? AXIOM_ERR_BUDGET : AXIOM_ERR_CUDA;
     }
+    if (rc == AXIOM_OK && rightsize_workspace) {
+        // Private, stable allocation before publication/capture. Keep a nonnull
+        // pointer even when every selected plan requires zero workspace bytes.
+        workspace_bytes = 1u;
+        for (const Projection *projection :
+             {&mlp->gate_up, &mlp->gate, &mlp->up, &mlp->down}) {
+            const size_t bytes = selected_projection_workspace_bytes(*projection);
+            if (bytes > workspace_bytes) workspace_bytes = bytes;
+        }
+        cuda_status = cudaMalloc(&mlp->workspace, workspace_bytes);
+        if (cuda_status != cudaSuccess) rc = cuda_status == cudaErrorMemoryAllocation
+                ? AXIOM_ERR_BUDGET : AXIOM_ERR_CUDA;
+    }
     if (rc != AXIOM_OK) {
         axiom_qwen38_nvfp4_mlp_destroy(mlp);
         return rc;
     }
-    mlp->device_bytes = static_cast<uint64_t>(kLtWorkspaceBytes) +
+    mlp->device_bytes = static_cast<uint64_t>(workspace_bytes) +
             mlp->gate_up.device_bytes + mlp->gate.device_bytes +
             mlp->up.device_bytes + mlp->down.device_bytes +
             (mlp->mid ? static_cast<uint64_t>(AXIOM_QWEN38_NVFP4_FFN) *
@@ -1290,10 +1596,12 @@ extern "C" int axiom_qwen38_nvfp4_linear_load(
     axiom_qwen38_nvfp4_linear *linear = nullptr;
     try { linear = new axiom_qwen38_nvfp4_linear(); } catch (...) { return AXIOM_ERR_BUDGET; }
     linear->device = device;
+    const bool rightsize_workspace = nvfp4_rightsize_workspace_enabled();
+    size_t workspace_bytes = kLtWorkspaceBytes;
     cublasStatus_t lt_status = cublasLtCreate(&linear->handle);
     cudaError_t cuda_status = cudaSuccess;
-    if (lt_status == CUBLAS_STATUS_SUCCESS) {
-        cuda_status = cudaMalloc(&linear->workspace, kLtWorkspaceBytes);
+    if (lt_status == CUBLAS_STATUS_SUCCESS && !rightsize_workspace) {
+        cuda_status = cudaMalloc(&linear->workspace, workspace_bytes);
     }
     int rc = lt_status == CUBLAS_STATUS_SUCCESS
             ? (cuda_status == cudaSuccess ? AXIOM_OK
@@ -1305,11 +1613,18 @@ extern "C" int axiom_qwen38_nvfp4_linear_load(
                 model, device, base, rows, cols, linear->handle,
                 false, &linear->projection);
     }
+    if (rc == AXIOM_OK && rightsize_workspace) {
+        workspace_bytes = selected_projection_workspace_bytes(linear->projection);
+        if (workspace_bytes == 0u) workspace_bytes = 1u;
+        cuda_status = cudaMalloc(&linear->workspace, workspace_bytes);
+        if (cuda_status != cudaSuccess) rc = cuda_status == cudaErrorMemoryAllocation
+                ? AXIOM_ERR_BUDGET : AXIOM_ERR_CUDA;
+    }
     if (rc != AXIOM_OK) {
         axiom_qwen38_nvfp4_linear_destroy(linear);
         return rc;
     }
-    linear->device_bytes = static_cast<uint64_t>(kLtWorkspaceBytes) +
+    linear->device_bytes = static_cast<uint64_t>(workspace_bytes) +
             linear->projection.device_bytes;
     *out = linear;
     return AXIOM_OK;

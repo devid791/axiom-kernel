@@ -24,6 +24,7 @@ constexpr uint32_t kQwen38TemporalWidth = 8u;
 constexpr uint32_t kQwen38Heads = 24u;
 constexpr uint32_t kQwen38KvHeads = 4u;
 constexpr uint32_t kQwen38HeadDim = 256u;
+constexpr uint32_t kQwen38MinKvChunk = 256u;
 
 static_assert(kQwen38Heads / kQwen38KvHeads == 6u, "Qwen3.8 GQA changed");
 
@@ -100,6 +101,17 @@ uint32_t graph_planning_kv_len(
 }
 
 }  // namespace
+
+extern "C" uint64_t axiom_qwen38_flashinfer_temporal8_workspace_bytes(
+        uint32_t kv_len_host) {
+    if (kv_len_host < kQwen38TemporalWidth) return 0u;
+    const uint64_t chunks =
+            (static_cast<uint64_t>(kv_len_host) + kQwen38MinKvChunk - 1u) /
+            kQwen38MinKvChunk;
+    const uint64_t rows = static_cast<uint64_t>(kQwen38TemporalWidth) * kQwen38Heads;
+    return chunks * rows *
+            (static_cast<uint64_t>(kQwen38HeadDim) * sizeof(uint16_t) + sizeof(float));
+}
 
 extern "C" int axiom_qwen38_flashinfer_temporal8_bf16_e4m3_device(
         const uint16_t *q_bf16,

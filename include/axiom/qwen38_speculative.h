@@ -56,7 +56,10 @@ typedef struct axiom_qwen38_speculative axiom_qwen38_speculative;
  * to retain including the anchor; `abort` restores the pre-verify suffix on
  * the same stream.
  */
-#define AXIOM_QWEN38_SPECULATIVE_DEVICE_TARGET_ABI_VERSION 1u
+/* Revision 2 makes the DSpark device-history confidence payload part of the
+ * result contract.  Old callers are rejected before they can interpret the
+ * larger revision-3 compute history with a revision-1 layout. */
+#define AXIOM_QWEN38_SPECULATIVE_DEVICE_TARGET_ABI_VERSION 2u
 /* Binding flags. A capture-safe target has stable device addresses and its
  * callbacks only enqueue graph-capturable CUDA work; the full controller
  * refuses to bind anything else. */

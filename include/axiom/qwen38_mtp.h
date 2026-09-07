@@ -2,13 +2,13 @@
 #define AXIOM_QWEN38_MTP_H
 
 /*
- * Resident sidecar loader for the native MTP block shipped with
- * unsloth/Qwen3.8-27B-NVFP4.
+ * Resident loader for the native MTP block shipped with Qwen3.8 checkpoints.
  *
- * The sidecar lives in model_mtp.safetensors and is intentionally loaded in
- * its original BF16 representation.  It contains one full-attention decoder
+ * The block may live in the historical model_mtp.safetensors sidecar or be
+ * embedded in a normal model-*.safetensors checkpoint shard. It is loaded in
+ * its original BF16 representation and contains one full-attention decoder
  * block plus the input fusion and RMSNorm weights; it does not contain a
- * second vocabulary embedding table or LM head.  Those are shared with the
+ * second vocabulary embedding table or LM head. Those are shared with the
  * base Qwen3.8 checkpoint.
  *
  * This component is a loader and a strict forward ABI contract, not an MTP
@@ -123,10 +123,11 @@ typedef struct {
     uint64_t flags;
 } axiom_qwen38_mtp_forward_request;
 
-/* `model` must have been opened on the Qwen3.8 model directory, not on the
- * single safetensors file. All fifteen MTP tensors must come from exactly
- * model_mtp.safetensors, have their original BF16 dtype, and match the shipped
- * Qwen3.8 geometry. `runtime` must be a CUDA Axiom runtime for `device`. */
+/* `model` must have been opened on the Qwen3.8 model directory, not on a
+ * single safetensors file. All fifteen MTP tensors must come atomically from
+ * one model_mtp.safetensors or model-*.safetensors file in that opened
+ * checkpoint, retain their original BF16 dtype, and match the Qwen3.8
+ * geometry. `runtime` must be a CUDA Axiom runtime for `device`. */
 int axiom_qwen38_mtp_load(
         axiom_model *model,
         axiom_runtime *runtime,

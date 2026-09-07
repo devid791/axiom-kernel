@@ -191,6 +191,26 @@ int axiom_qwen38_kv_tier_commit(
  * unreachable because the committed watermark returns to zero. */
 int axiom_qwen38_kv_tier_reset(axiom_qwen38_kv_tier *tier);
 
+/* Crash-safe append transaction for a persistent session tier.  begin()
+ * durably records the old header and the only committed page that an append
+ * may overwrite (the partial tail page).  rollback() restores payload first
+ * and the old watermark last.  recover_file() is called before opening a
+ * session tier after restart and resolves a surviving journal against the
+ * manifest's durable watermark.  discard() is valid only after the matching
+ * manifest has been atomically published. */
+int axiom_qwen38_kv_tier_transaction_begin(
+        axiom_qwen38_kv_tier *tier,
+        const char *journal_path,
+        uint32_t base_committed_tokens);
+int axiom_qwen38_kv_tier_transaction_rollback(
+        axiom_qwen38_kv_tier *tier,
+        const char *journal_path);
+int axiom_qwen38_kv_tier_transaction_recover_file(
+        const char *tier_path,
+        const char *journal_path,
+        uint32_t manifest_committed_tokens);
+int axiom_qwen38_kv_tier_transaction_discard(const char *journal_path);
+
 #ifdef __cplusplus
 }
 #endif

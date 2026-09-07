@@ -55,13 +55,16 @@ constexpr uint32_t kDefaultAttentionTileKeys = 32u;
 constexpr uint32_t kAttentionMaxSplitK = 4u;
 constexpr uint64_t kCublasWorkspaceBytes = 32ull * 1024ull * 1024ull;
 constexpr float kRmsEps = 1.0e-6f;
-constexpr float kRopeTheta = 10000000.0f;
-/* Match the Qwen3.8 1M YaRN override: native 262,144, factor 4. */
-constexpr float kYarnFactor = 4.0f;
-constexpr float kYarnOriginalContext = 262144.0f;
-constexpr float kYarnBetaFast = 32.0f;
-constexpr float kYarnBetaSlow = 1.0f;
-constexpr float kYarnMscale = 1.138629436111989f; /* 1 + 0.1 * ln(4). */
+constexpr float kRopeTheta = AXIOM_QWEN38_DSPARK_ROPE_THETA;
+/* Match the immutable DSpark checkpoint config, not the target model's YaRN
+ * override.  The draft was trained with factor=32 and original context=8192;
+ * using the target's factor=4/original=262144 silently preserves correctness
+ * only because target verification rejects the resulting proposals. */
+constexpr float kYarnFactor = AXIOM_QWEN38_DSPARK_YARN_FACTOR;
+constexpr float kYarnOriginalContext = AXIOM_QWEN38_DSPARK_YARN_ORIGINAL_CONTEXT;
+constexpr float kYarnBetaFast = AXIOM_QWEN38_DSPARK_YARN_BETA_FAST;
+constexpr float kYarnBetaSlow = AXIOM_QWEN38_DSPARK_YARN_BETA_SLOW;
+constexpr float kYarnMscale = 1.346573590279973f; /* 1 + 0.1 * ln(32). */
 constexpr float kAttentionScale = 1.0f / 11.313708498984760f;  // 1/sqrt(128)
 
 static_assert(kKvDim == 1024u, "DSpark KV geometry changed");
@@ -173,28 +176,6 @@ __device__ __forceinline__ uint16_t float_to_bf16(const float value) {
     return __bfloat16_as_ushort(__float2bfloat16(value));
 }
 
-/* Exact SGLang/Hugging Face YaRN blend used by the DSpark checkpoint. */
-__device__ __forceinline__ float yarn_inv_frequency(const uint32_t pair) {
-    const float dim = static_cast<float>(kHeadDim);
-    const float exponent = (2.0f * static_cast<float>(pair)) / static_cast<float>(kHeadDim);
-    const float base = powf(kRopeTheta, exponent);
-    const float inv = 1.0f / base;
-    const float correction_fast = dim *
-            logf(kYarnOriginalContext / (kYarnBetaFast * 6.283185307179586f)) /
-            (2.0f * logf(kRopeTheta));
-    const float correction_slow = dim *
-            logf(kYarnOriginalContext / (kYarnBetaSlow * 6.283185307179586f)) /
-            (2.0f * logf(kRopeTheta));
-    const float low = floorf(correction_fast < correction_slow ? correction_fast : correction_slow);
-    const float high = ceilf(correction_fast > correction_slow ? correction_fast : correction_slow);
-    float ramp = high > low
-            ? (static_cast<float>(pair) - low) / (high - low)
-            : static_cast<float>(pair) >= high ? 1.0f : 0.0f;
-    ramp = fminf(1.0f, fmaxf(0.0f, ramp));
-    const float interpolated = inv / kYarnFactor;
-    return inv * (1.0f - ramp) + interpolated * ramp;
-}
-
 __global__ void pack_target_taps_kernel(
         const float *__restrict__ taps,
         float *__restrict__ fusion_input,
@@ -269,6 +250,8 @@ __global__ void rmsnorm_bf16_kernel(
 __global__ void qk_rmsnorm_rope_bf16_kernel(
         const uint16_t *__restrict__ weight,
         float *__restrict__ x,
+        const float *__restrict__ rope_cache,
+        const uint32_t rope_cache_positions,
         const uint32_t heads,
         const uint32_t columns,
         const uint32_t first_position,
@@ -278,6 +261,12 @@ __global__ void qk_rmsnorm_rope_bf16_kernel(
     const uint32_t head = block - column * heads;
     const uint32_t tid = threadIdx.x;
     if (column >= columns || tid >= kHeadDim) return;
+    const uint32_t position_base = first_position_device ? first_position_device[0] : first_position;
+    const uint32_t position = position_base + column;
+    /* Context admission guarantees this bound.  Keep the check in the kernel
+     * as a last-resort guard for device-owned graph positions; every thread in
+     * this block observes the same value, so the return is synchronization-safe. */
+    if (!rope_cache || position >= rope_cache_positions) return;
     const uint64_t offset = static_cast<uint64_t>(column) * heads * kHeadDim +
             static_cast<uint64_t>(head) * kHeadDim;
     __shared__ float reductions[kHeadThreads];
@@ -297,10 +286,12 @@ __global__ void qk_rmsnorm_rope_bf16_kernel(
     __syncthreads();
     if (tid < kHeadDim / 2u) {
         const uint32_t other = tid + kHeadDim / 2u;
-        const uint32_t position_base = first_position_device ? first_position_device[0] : first_position;
-        const float angle = static_cast<float>(position_base + column) * yarn_inv_frequency(tid);
-        const float c = cosf(angle) * kYarnMscale;
-        const float s = sinf(angle) * kYarnMscale;
+        /* Read the same FP32 [cos(64), sin(64)] table layout used by SGLang's
+         * DFlash/DSpark fused QK kernel.  Recomputing powf/cosf/sinf in every
+         * decode kernel causes avoidable large-position phase drift. */
+        const float *row = rope_cache + static_cast<uint64_t>(position) * kHeadDim;
+        const float c = row[tid];
+        const float s = row[kHeadDim / 2u + tid];
         const float a = x[offset + tid];
         const float b = x[offset + other];
         x[offset + tid] = a * c - b * s;
@@ -516,6 +507,10 @@ __global__ void noncausal_gqa_attention_bf16_kernel(
     }
 }
 
+#ifndef AXIOM_DSPARK_PARALLEL_SOFTMAX
+#define AXIOM_DSPARK_PARALLEL_SOFTMAX 1
+#endif
+
 /* Wider key tiles keep the exact per-head arithmetic order of the reference
  * tile-4 kernel while halving (or better) the number of block barriers.  Each
  * of the eight warps owns one or more key slots and computes both query heads
@@ -537,6 +532,9 @@ __global__ void noncausal_gqa_attention_bf16_wide_kernel(
         const uint32_t *__restrict__ cache_tokens_device) {
     static_assert(TileKeys >= kAttentionWarps && TileKeys % kAttentionWarps == 0u,
                   "wide attention tile must map evenly across warps");
+#if AXIOM_DSPARK_PARALLEL_SOFTMAX
+    static_assert(TileKeys <= 32u, "parallel softmax requires one warp per head");
+#endif
     static_assert(SplitK == 1u || SplitK == 2u || SplitK == 4u,
                   "unsupported DSpark attention split count");
     const uint32_t packed = blockIdx.x;
@@ -642,6 +640,53 @@ __global__ void noncausal_gqa_attention_bf16_wide_kernel(
         }
         __syncthreads();
 
+#if AXIOM_DSPARK_PARALLEL_SOFTMAX
+        if (warp < valid_heads) {
+            constexpr uint32_t mask = 0xffffffffu;
+            const uint32_t valid_keys = min(TileKeys, key_end - key_base);
+            const float initial_maximum = running_maximum[warp];
+            const float score = lane < valid_keys ? scores[warp][lane] : -CUDART_INF_F;
+            /* Seed every lane with the carried maximum: NaN scores are
+             * ignored by fmaxf just as in the sequential recurrence, even
+             * for a prefix containing only NaNs.  Padded lanes never feed
+             * back into a valid prefix. */
+            float next_maximum = fmaxf(initial_maximum, score);
+            #pragma unroll
+            for (uint32_t offset = 1u; offset < TileKeys; offset <<= 1u) {
+                const float previous = __shfl_up_sync(mask, next_maximum, offset);
+                if (lane >= offset) next_maximum = fmaxf(previous, next_maximum);
+            }
+            const float previous_maximum = __shfl_up_sync(mask, next_maximum, 1u);
+            const float maximum = lane == 0u ? initial_maximum : previous_maximum;
+            if (lane < TileKeys) {
+                float rescale = 1.0f;
+                float probability = 0.0f;
+                if (lane < valid_keys) {
+                    rescale = maximum == -CUDART_INF_F ? 0.0f : expf(maximum - next_maximum);
+                    probability = expf(score - next_maximum);
+                }
+                rescales[warp][lane] = rescale;
+                probabilities[warp][lane] = probability;
+            }
+            const float final_maximum = __shfl_sync(mask, next_maximum, valid_keys - 1u);
+            /* Publish lane-owned factors before lane 0 consumes them.  Do
+             * not reduce/reassociate the FP32 normalizer or change its
+             * multiply/add expression (including compiler contraction). */
+            __syncwarp(mask);
+            if (lane == 0u) {
+                float normalizer = running_normalizer[warp];
+                #pragma unroll
+                for (uint32_t group = 0u; group < TileKeys; ++group) {
+                    if (key_base + group >= key_end) continue;
+                    const float rescale = rescales[warp][group];
+                    const float probability = probabilities[warp][group];
+                    normalizer = normalizer * rescale + probability;
+                }
+                running_maximum[warp] = final_maximum;
+                running_normalizer[warp] = normalizer;
+            }
+        }
+#else
         if (tid < valid_heads) {
             float maximum = running_maximum[tid];
             float normalizer = running_normalizer[tid];
@@ -663,6 +708,7 @@ __global__ void noncausal_gqa_attention_bf16_wide_kernel(
             running_maximum[tid] = maximum;
             running_normalizer[tid] = normalizer;
         }
+#endif
         __syncthreads();
 
         if (value_head < valid_heads) {
@@ -1042,14 +1088,20 @@ int launch_rmsnorm(
 int launch_qk_norm_rope(
         const uint16_t *weight,
         float *x,
+        const float *rope_cache,
+        const uint32_t rope_cache_positions,
         const uint32_t heads,
         const uint32_t columns,
         const uint32_t first_position,
         const uint32_t *first_position_device,
         const cudaStream_t stream) {
-    if (!weight || !x || heads == 0u || columns == 0u) return AXIOM_ERR_INVALID_ARGUMENT;
+    if (!weight || !x || !rope_cache || rope_cache_positions == 0u ||
+        heads == 0u || columns == 0u) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
     qk_rmsnorm_rope_bf16_kernel<<<heads * columns, kHeadThreads, 0, stream>>>(
-            weight, x, heads, columns, first_position, first_position_device);
+            weight, x, rope_cache, rope_cache_positions, heads, columns,
+            first_position, first_position_device);
     return cudaGetLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
 }
 
@@ -1192,6 +1244,7 @@ struct axiom_qwen38_dspark_compute {
     dspark_layer_weights layers[kLayers]{};
 
     axiom_device_buffer *fusion_input_buffer = nullptr;
+    axiom_device_buffer *rope_cache_buffer = nullptr;
     axiom_device_buffer *activation_stage_buffer = nullptr;
     axiom_device_buffer *cublas_workspace_buffer = nullptr;
     axiom_device_buffer *fused_buffer = nullptr;
@@ -1217,6 +1270,7 @@ struct axiom_qwen38_dspark_compute {
     axiom_device_buffer *device_anchor_token_buffer = nullptr;
     axiom_device_buffer *device_anchor_position_buffer = nullptr;
     axiom_device_buffer *device_proposal_tokens_buffer = nullptr;
+    axiom_device_buffer *device_proposal_confidence_buffer = nullptr;
     axiom_device_buffer *device_verify_tokens_buffer = nullptr;
     axiom_device_buffer *device_accepted_prefix_buffer = nullptr;
     axiom_device_buffer *device_target_commit_prefix_buffer = nullptr;
@@ -1230,6 +1284,7 @@ struct axiom_qwen38_dspark_compute {
     axiom_device_buffer *v_cache_buffer[kLayers]{};
 
     float *fusion_input = nullptr;
+    float *rope_cache = nullptr;
     uint16_t *activation_stage = nullptr;
     uint64_t activation_stage_capacity = 0u;
     void *cublas_workspace = nullptr;
@@ -1256,6 +1311,7 @@ struct axiom_qwen38_dspark_compute {
     uint32_t *device_anchor_token = nullptr;
     uint32_t *device_anchor_position = nullptr;
     uint32_t *device_proposal_tokens = nullptr;
+    float *device_proposal_confidence = nullptr;
     uint32_t *device_verify_tokens = nullptr;
     uint32_t *device_accepted_prefix = nullptr;
     uint32_t *device_target_commit_prefix = nullptr;
@@ -1297,6 +1353,7 @@ void destroy_workspace(axiom_qwen38_dspark_compute *compute) {
     axiom_device_buffer_destroy(compute->device_commit_limit_buffer);
     axiom_device_buffer_destroy(compute->device_accepted_prefix_buffer);
     axiom_device_buffer_destroy(compute->device_verify_tokens_buffer);
+    axiom_device_buffer_destroy(compute->device_proposal_confidence_buffer);
     axiom_device_buffer_destroy(compute->device_proposal_tokens_buffer);
     axiom_device_buffer_destroy(compute->device_anchor_position_buffer);
     axiom_device_buffer_destroy(compute->device_anchor_token_buffer);
@@ -1318,6 +1375,7 @@ void destroy_workspace(axiom_qwen38_dspark_compute *compute) {
     axiom_device_buffer_destroy(compute->token_buffer);
     axiom_device_buffer_destroy(compute->fused_buffer);
     axiom_device_buffer_destroy(compute->fusion_input_buffer);
+    axiom_device_buffer_destroy(compute->rope_cache_buffer);
     axiom_device_buffer_destroy(compute->activation_stage_buffer);
     axiom_device_buffer_destroy(compute->cublas_workspace_buffer);
     compute->greedy_block_ids_buffer = nullptr;
@@ -1332,6 +1390,7 @@ void destroy_workspace(axiom_qwen38_dspark_compute *compute) {
     compute->device_commit_limit_buffer = nullptr;
     compute->device_accepted_prefix_buffer = nullptr;
     compute->device_verify_tokens_buffer = nullptr;
+    compute->device_proposal_confidence_buffer = nullptr;
     compute->device_proposal_tokens_buffer = nullptr;
     compute->device_anchor_position_buffer = nullptr;
     compute->device_anchor_token_buffer = nullptr;
@@ -1353,13 +1412,16 @@ void destroy_workspace(axiom_qwen38_dspark_compute *compute) {
     compute->token_buffer = nullptr;
     compute->fused_buffer = nullptr;
     compute->fusion_input_buffer = nullptr;
+    compute->rope_cache_buffer = nullptr;
     compute->activation_stage_buffer = nullptr;
     compute->cublas_workspace_buffer = nullptr;
+    compute->rope_cache = nullptr;
     compute->greedy_block_values = nullptr;
     compute->greedy_block_ids = nullptr;
     compute->device_anchor_token = nullptr;
     compute->device_anchor_position = nullptr;
     compute->device_proposal_tokens = nullptr;
+    compute->device_proposal_confidence = nullptr;
     compute->device_verify_tokens = nullptr;
     compute->device_accepted_prefix = nullptr;
     compute->device_target_commit_prefix = nullptr;
@@ -1394,6 +1456,62 @@ int allocate_buffer(
     return rc;
 }
 
+int initialize_rope_cache(axiom_qwen38_dspark_compute *compute) {
+    if (!compute || !compute->rope_cache || compute->max_context == 0u) {
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    }
+    const uint64_t entries = static_cast<uint64_t>(compute->max_context) * kHeadDim;
+    if (entries > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float))) {
+        return AXIOM_ERR_BUDGET;
+    }
+    float *host = new (std::nothrow) float[static_cast<size_t>(entries)];
+    if (!host) return AXIOM_ERR_BUDGET;
+
+    /* Match YaRNScalingRotaryEmbedding._compute_inv_freq: correction bounds
+     * are determined in double precision, while the frequency/ramp tensors
+     * and the outer-product angles are FP32. */
+    const double two_pi = 6.283185307179586476925286766559;
+    const double correction_fast = static_cast<double>(kHeadDim) *
+            std::log(static_cast<double>(kYarnOriginalContext) /
+                     (static_cast<double>(kYarnBetaFast) * two_pi)) /
+            (2.0 * std::log(static_cast<double>(kRopeTheta)));
+    const double correction_slow = static_cast<double>(kHeadDim) *
+            std::log(static_cast<double>(kYarnOriginalContext) /
+                     (static_cast<double>(kYarnBetaSlow) * two_pi)) /
+            (2.0 * std::log(static_cast<double>(kRopeTheta)));
+    const float low = static_cast<float>(std::max(0.0, std::floor(correction_fast)));
+    const float high = static_cast<float>(std::min(
+            static_cast<double>(kHeadDim - 1u), std::ceil(correction_slow)));
+    float inv_frequency[kHeadDim / 2u]{};
+    for (uint32_t pair = 0u; pair < kHeadDim / 2u; ++pair) {
+        const float exponent = static_cast<float>(2u * pair) / static_cast<float>(kHeadDim);
+        const float pos_frequency = std::pow(kRopeTheta, exponent);
+        const float extrapolated = 1.0f / pos_frequency;
+        const float interpolated = 1.0f / (kYarnFactor * pos_frequency);
+        float ramp = high > low
+                ? (static_cast<float>(pair) - low) / (high - low)
+                : (static_cast<float>(pair) >= high ? 1.0f : 0.0f);
+        ramp = std::min(1.0f, std::max(0.0f, ramp));
+        const float extrapolation_mask = 1.0f - ramp;
+        inv_frequency[pair] = interpolated * (1.0f - extrapolation_mask) +
+                extrapolated * extrapolation_mask;
+    }
+    for (uint32_t position = 0u; position < compute->max_context; ++position) {
+        float *row = host + static_cast<uint64_t>(position) * kHeadDim;
+        const float t = static_cast<float>(position);
+        for (uint32_t pair = 0u; pair < kHeadDim / 2u; ++pair) {
+            const float angle = t * inv_frequency[pair];
+            row[pair] = std::cos(angle) * kYarnMscale;
+            row[kHeadDim / 2u + pair] = std::sin(angle) * kYarnMscale;
+        }
+    }
+    const cudaError_t status = cudaMemcpy(
+            compute->rope_cache, host, static_cast<size_t>(entries * sizeof(float)),
+            cudaMemcpyHostToDevice);
+    delete[] host;
+    return cuda_status(status);
+}
+
 int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
     if (!compute) return AXIOM_ERR_INVALID_ARGUMENT;
     uint64_t hidden_block = 0u;
@@ -1404,6 +1522,7 @@ int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
     uint64_t cache_block = 0u;
     uint64_t attention_split_values_block = 0u;
     uint64_t attention_split_stats_block = 0u;
+    uint64_t rope_cache_block = 0u;
     if (!checked_mul(static_cast<uint64_t>(kHidden) * kBlock, sizeof(float), &hidden_block) ||
         !checked_mul(static_cast<uint64_t>(kIntermediate) * kBlock, sizeof(float), &intermediate_block) ||
         !checked_mul(static_cast<uint64_t>(kFusionInput) * kVerifyWidth, sizeof(float), &fusion_block) ||
@@ -1413,6 +1532,8 @@ int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
                      kHeadDim * sizeof(float), &attention_split_values_block) ||
         !checked_mul(static_cast<uint64_t>(kBlock) * kHeads * kAttentionMaxSplitK,
                      sizeof(float), &attention_split_stats_block) ||
+        !checked_mul(static_cast<uint64_t>(compute->max_context) * kHeadDim,
+                     sizeof(float), &rope_cache_block) ||
         !checked_mul(static_cast<uint64_t>(compute->max_context) * kKvDim, sizeof(uint16_t), &cache_block)) {
         return AXIOM_ERR_BUDGET;
     }
@@ -1426,6 +1547,10 @@ int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
     int rc = allocate_buffer(compute, &compute->fusion_input_buffer,
                              reinterpret_cast<void **>(&compute->fusion_input), fusion_block,
                              &compute->workspace_bytes);
+    if (rc == AXIOM_OK) rc = allocate_buffer(
+            compute, &compute->rope_cache_buffer,
+            reinterpret_cast<void **>(&compute->rope_cache), rope_cache_block,
+            &compute->workspace_bytes);
     if (rc == AXIOM_OK) rc = allocate_buffer(compute, &compute->activation_stage_buffer,
                                               reinterpret_cast<void **>(&compute->activation_stage),
                                               activation_stage_block, &compute->workspace_bytes);
@@ -1515,6 +1640,10 @@ int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
             reinterpret_cast<void **>(&compute->device_proposal_tokens),
             static_cast<uint64_t>(kBlock) * sizeof(uint32_t));
     if (rc == AXIOM_OK) rc = allocate_device_control(
+            &compute->device_proposal_confidence_buffer,
+            reinterpret_cast<void **>(&compute->device_proposal_confidence),
+            static_cast<uint64_t>(kBlock) * sizeof(float));
+    if (rc == AXIOM_OK) rc = allocate_device_control(
             &compute->device_verify_tokens_buffer,
             reinterpret_cast<void **>(&compute->device_verify_tokens),
             static_cast<uint64_t>(kVerifyWidth) * sizeof(uint32_t));
@@ -1552,6 +1681,9 @@ int allocate_workspace(axiom_qwen38_dspark_compute *compute) {
                                  reinterpret_cast<void **>(&compute->v_cache[layer]), cache_block,
                                  &compute->kv_cache_bytes);
         }
+    }
+    if (rc == AXIOM_OK) {
+        rc = initialize_rope_cache(compute);
     }
     if (rc == AXIOM_OK) {
         const uint32_t default_commit_limit = kVerifyWidth;
@@ -1682,10 +1814,12 @@ int enqueue_proposal(
         if (rc == AXIOM_OK) rc = launch_round_bf16(compute->k, static_cast<uint64_t>(kKvDim) * columns, stream);
         if (rc == AXIOM_OK) rc = launch_round_bf16(compute->v, static_cast<uint64_t>(kKvDim) * columns, stream);
         if (rc == AXIOM_OK) rc = launch_qk_norm_rope(
-                weights.q_norm, compute->q, kHeads, columns, anchor_position,
+                weights.q_norm, compute->q, compute->rope_cache, compute->max_context,
+                kHeads, columns, anchor_position,
                 anchor_position_device, stream);
         if (rc == AXIOM_OK) rc = launch_qk_norm_rope(
-                weights.k_norm, compute->k, kKvHeads, columns, anchor_position,
+                weights.k_norm, compute->k, compute->rope_cache, compute->max_context,
+                kKvHeads, columns, anchor_position,
                 anchor_position_device, stream);
         if (rc == AXIOM_OK) rc = launch_round_bf16(compute->q, static_cast<uint64_t>(kHidden) * columns, stream);
         if (rc == AXIOM_OK) rc = launch_round_bf16(compute->k, static_cast<uint64_t>(kKvDim) * columns, stream);
@@ -2178,8 +2312,9 @@ extern "C" int axiom_qwen38_dspark_compute_inject_target(
                 compute->activation_stage_capacity, stream);
         if (rc == AXIOM_OK) rc = launch_round_bf16(
                 compute->k, static_cast<uint64_t>(kKvDim) * request->columns, stream);
-        if (rc == AXIOM_OK) rc = launch_qk_norm_rope(weights.k_norm, compute->k, kKvHeads,
-                                                      request->columns, request->target_position, nullptr, stream);
+        if (rc == AXIOM_OK) rc = launch_qk_norm_rope(
+                weights.k_norm, compute->k, compute->rope_cache, compute->max_context,
+                kKvHeads, request->columns, request->target_position, nullptr, stream);
         if (rc == AXIOM_OK) {
             const uint64_t count = static_cast<uint64_t>(kKvDim) * request->columns;
             store_kv_bf16_kernel<<<static_cast<uint32_t>((count + kThreads - 1u) / kThreads), kThreads, 0, stream>>>(
@@ -2223,7 +2358,8 @@ namespace {
 
 bool device_controls_ready(const axiom_qwen38_dspark_compute *compute) {
     return compute && compute->device_anchor_token && compute->device_anchor_position &&
-            compute->device_proposal_tokens && compute->device_verify_tokens &&
+            compute->device_proposal_tokens && compute->device_proposal_confidence &&
+            compute->device_verify_tokens &&
             compute->device_accepted_prefix && compute->device_target_commit_prefix &&
             compute->device_commit_limit &&
             compute->device_continuation_token &&
@@ -2237,6 +2373,7 @@ bool device_operation_active(const axiom_qwen38_dspark_compute *compute) {
 
 __global__ void pack_device_history_kernel(
         const uint32_t *proposal_tokens,
+        const float *proposal_confidence,
         const uint32_t *accepted_prefix,
         const uint32_t *continuation_token,
         const uint32_t *async_status,
@@ -2245,6 +2382,7 @@ __global__ void pack_device_history_kernel(
         axiom_qwen38_dspark_device_history *output) {
     const uint32_t index = static_cast<uint32_t>(threadIdx.x);
     if (index < 7u) output->proposal_tokens[index] = proposal_tokens[index];
+    if (index < 7u) output->proposal_confidence[index] = proposal_confidence[index];
     if (index == 0u) {
         output->accepted_prefix = accepted_prefix[0];
         output->continuation_token = continuation_token[0];
@@ -2293,7 +2431,15 @@ extern "C" int axiom_qwen38_dspark_compute_device_history_pack_enqueue(
 }
 
 extern "C" int axiom_qwen38_dspark_compute_device_history_pack_enqueue_v2(
+        const uint32_t *, const uint32_t *, const uint32_t *, const uint32_t *,
+        const uint32_t *, const uint32_t *, axiom_qwen38_dspark_device_history *,
+        const uint64_t, void *) {
+    return AXIOM_ERR_INVALID_ARGUMENT;
+}
+
+extern "C" int axiom_qwen38_dspark_compute_device_history_pack_enqueue_v3(
         const uint32_t *proposal_tokens_device,
+        const float *proposal_confidence_device,
         const uint32_t *accepted_prefix_device,
         const uint32_t *continuation_token_device,
         const uint32_t *async_status_device,
@@ -2305,13 +2451,13 @@ extern "C" int axiom_qwen38_dspark_compute_device_history_pack_enqueue_v2(
     if (output_device_bytes != sizeof(axiom_qwen38_dspark_device_history)) {
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
-    if (!proposal_tokens_device || !accepted_prefix_device ||
+    if (!proposal_tokens_device || !proposal_confidence_device || !accepted_prefix_device ||
         !continuation_token_device || !async_status_device ||
         !next_position_device || !committed_tokens_device || !output_device || !stream) {
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
     pack_device_history_kernel<<<1u, 32u, 0, static_cast<cudaStream_t>(stream)>>>(
-            proposal_tokens_device, accepted_prefix_device,
+            proposal_tokens_device, proposal_confidence_device, accepted_prefix_device,
             continuation_token_device, async_status_device,
             next_position_device, committed_tokens_device, output_device);
     return cudaGetLastError() == cudaSuccess ? AXIOM_OK : AXIOM_ERR_CUDA;
@@ -2324,6 +2470,13 @@ extern "C" int axiom_qwen38_dspark_compute_device_state_get(
 }
 
 extern "C" int axiom_qwen38_dspark_compute_device_state_get_v2(
+        const axiom_qwen38_dspark_compute *,
+        axiom_qwen38_dspark_compute_device_state *,
+        const uint64_t) {
+    return AXIOM_ERR_INVALID_ARGUMENT;
+}
+
+extern "C" int axiom_qwen38_dspark_compute_device_state_get_v3(
         const axiom_qwen38_dspark_compute *compute,
         axiom_qwen38_dspark_compute_device_state *out,
         const uint64_t out_bytes) {
@@ -2345,6 +2498,7 @@ extern "C" int axiom_qwen38_dspark_compute_device_state_get_v2(
     out->anchor_token_device = compute->device_anchor_token;
     out->anchor_position_device = compute->device_anchor_position;
     out->proposal_tokens_device = compute->device_proposal_tokens;
+    out->proposal_confidence_device = compute->device_proposal_confidence;
     out->verify_tokens_device = compute->device_verify_tokens;
     out->accepted_prefix_device = compute->device_accepted_prefix;
     out->target_commit_prefix_device = compute->device_target_commit_prefix;
@@ -2378,7 +2532,8 @@ extern "C" int axiom_qwen38_dspark_compute_device_graph_prepare(
     }
     const int rc = enqueue_proposal(compute, 0u, 0u, compute->device_anchor_token,
                                     compute->device_anchor_position, kBlock,
-                                    compute->device_proposal_tokens, nullptr, nullptr, stream);
+                                    compute->device_proposal_tokens, nullptr,
+                                    compute->device_proposal_confidence, stream);
     cudaGraph_t graph = nullptr;
     const cudaError_t end_status = cudaStreamEndCapture(stream, &graph);
     if (rc != AXIOM_OK || end_status != cudaSuccess || !graph) {
@@ -2524,7 +2679,8 @@ extern "C" int axiom_qwen38_dspark_compute_device_propose_enqueue(
     if (cudaSetDevice(compute->device) != cudaSuccess) return AXIOM_ERR_CUDA;
     return enqueue_proposal(compute, 0u, 0u, compute->device_anchor_token,
                             compute->device_anchor_position, kBlock,
-                            compute->device_proposal_tokens, nullptr, nullptr,
+                            compute->device_proposal_tokens, nullptr,
+                            compute->device_proposal_confidence,
                             static_cast<cudaStream_t>(stream));
 }
 
@@ -2592,7 +2748,8 @@ extern "C" int axiom_qwen38_dspark_compute_device_inject_target(
         if (rc == AXIOM_OK) rc = launch_round_bf16(
                 compute->k, static_cast<uint64_t>(kKvDim) * columns, stream);
         if (rc == AXIOM_OK) rc = launch_qk_norm_rope(
-                weights.k_norm, compute->k, kKvHeads, columns, 0u,
+                weights.k_norm, compute->k, compute->rope_cache, compute->max_context,
+                kKvHeads, columns, 0u,
                 compute->device_anchor_position, stream);
         if (rc == AXIOM_OK) {
             const uint64_t count = static_cast<uint64_t>(kKvDim) * columns;

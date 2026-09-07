@@ -1,5 +1,31 @@
 # Build and verification
 
+## September source update
+
+The public source builds both the updated 27B backend and the opt-in Flash-Next
+library. OpenSSL development headers/libraries are required for manifest v2.
+The native reference CUDA units deliberately exclude global fast-math.
+
+```sh
+make -j4 CUDA_ARCH=sm_120 all extended-host-tests qwen38-dspark-abi-gate
+make -j4 CUDA_ARCH=sm_120 qwen4exp-build qwen4exp-text-model-build
+make qwen4exp-host-tests
+```
+
+These commands compile/link the native GPU code but do not load model weights
+or run new GPU inference. Host tests cover manifests, KV transaction recovery,
+SHA-256, checkpoint/speculator identities, scheduler, PLE and expert paging.
+They do not replace checkpoint-backed CUDA correctness or performance gates.
+`bin/qwen4exp-text-model-test MODEL_ROOT` is a separate explicit GPU operation.
+Run only with adequate hardware and the compatible externally supplied weights.
+
+The publication scan uses Gitleaks default rules. Eight findings were reviewed:
+attention-dimension identifiers in the two GDN implementations, MTP key/value
+head constants, and a public model-id string in the session-store fixture.
+They are C++ symbols/test data, not credentials. The raw scan is not described
+as zero findings, and no files or rules are disabled to suppress it.
+Model/control/deployment exclusion checks are also provided by `public-scan`.
+
 ## Source checks
 
 Run these checks from the repository root:
@@ -24,7 +50,8 @@ with AddressSanitizer and UndefinedBehaviorSanitizer enabled:
 c++ -O1 -g -Wall -Wextra -Werror -std=c++17 \
   -fsanitize=address,undefined -Iinclude \
   tests/axiom_qwen38_session_store_test.cpp \
-  src/axiom_qwen38_session_store.cpp -o /tmp/axiom-session-store-asan
+  src/axiom_qwen38_session_store.cpp src/axiom_sha256.cpp \
+  -lcrypto -o /tmp/axiom-session-store-asan
 /tmp/axiom-session-store-asan
 ```
 
@@ -99,7 +126,7 @@ repository. A release result is valid only if:
 - the output digest and artifact hashes are recorded with throughput.
 
 The DSpark ABI gate is model-independent and runs after linking. It verifies
-that the public header and library agree on layout revision 2, that undersized
+that the public header and library agree on layout revision 3, that undersized
 configuration/state/history buffers are rejected without being touched, and
 that revision-1 binary symbols fail closed. Passing this gate proves the ABI
 guards; it does not replace model-backed token/logit parity.

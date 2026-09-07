@@ -27,7 +27,7 @@ device session for both draft and target state. Stop-token selection, terminal
 no-op cycles and the exact committed-token count remain device-authoritative
 until the synchronized handoff installs the committed host history.
 
-DSpark-specific structures carry layout revision 2 independently of Axiom's
+DSpark-specific structures carry layout revision 3 independently of Axiom's
 family-neutral ABI version. Rebuilt callers are routed to size-checked v2
 symbols. Historical revision-1 binary symbols remain exported only to return a
 deterministic invalid-argument error without touching a smaller caller buffer.
@@ -35,6 +35,14 @@ This prevents a model-backend layout change from becoming silent memory
 corruption at the shared-library boundary.
 
 ## Public backend maturity
+
+The native `qwen4_exp` backend is now included for Qwen3.8 Flash-Next NVFP4.
+It builds as a separate `libaxiom-qwen4exp.so`, preserving the existing 27B
+library and its DSpark integration. Its native decoder uses QSA, Gated
+DeltaNet, mHC, PLE and explicit expert residency across GPU, RAM and NVMe.
+It has real short-context execution evidence, including approximately 41
+decode tok/s on a warm greeting. See [Flash-Next](qwen4exp/README.md) for
+precise evidence, build targets and currently unqualified surfaces.
 
 | Family or integration | Evidence in this repository | Public status |
 | --- | --- | --- |

@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <new>
+#include <openssl/evp.h>
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -24,13 +25,13 @@ namespace qwen38 {
 namespace {
 
 constexpr char kManifestMagic[] = "AXQ38SM1";
-constexpr uint32_t kManifestAbi = 1u;
 constexpr uint32_t kManifestHeaderBytes = 4096u;
 constexpr size_t kSessionIdBytes = 128u;
 constexpr size_t kNamespaceIdBytes = 33u;
 constexpr size_t kNamespaceTextBytes = 1536u;
 constexpr size_t kProfileBytes = 32u;
 constexpr size_t kMaxRecurrentBytes = 1024u * 1024u * 1024u;
+constexpr size_t kMaxSpeculativeBytes = 16u * 1024u * 1024u;
 constexpr size_t kMaxGcArtifactsPerNamespace = 16384u;
 
 #pragma pack(push, 1)
@@ -50,10 +51,13 @@ struct manifest_disk_header {
     char session_id[kSessionIdBytes];
     char namespace_text[kNamespaceTextBytes];
     char profile[kProfileBytes];
+    /* Added inside the ABI-v1 reserved tail. Old manifests read this as zero,
+     * so legacy namespaces remain byte-compatible. */
+    uint32_t speculative_bytes;
     uint8_t reserved[kManifestHeaderBytes -
             (8u + 4u + 4u + 8u + 4u + 4u + 4u + 4u +
              8u + 8u + 8u + kNamespaceIdBytes + kSessionIdBytes +
-             kNamespaceTextBytes + kProfileBytes)];
+             kNamespaceTextBytes + kProfileBytes + 4u)];
 };
 #pragma pack(pop)
 static_assert(sizeof(manifest_disk_header) == kManifestHeaderBytes,
@@ -199,15 +203,43 @@ bool read_text(const char *source, const size_t capacity, std::string *out) {
     return true;
 }
 
-uint64_t header_payload_checksum(
+// Byte order and v1 FNV stream are unchanged. v2 stores SHA256 in reserved[0:32]
+// and requires the legacy checksum field to be zero. The rest of the header,
+// including reserved bytes, is covered; this is corruption detection, not auth.
+bool seal_manifest(
         const manifest_disk_header &source,
-        const std::vector<uint8_t> &payload) {
+        const std::vector<uint32_t> &tokens,
+        const std::vector<uint8_t> &recurrent,
+        const std::vector<uint8_t> &speculative,
+        manifest_disk_header *sealed) {
     manifest_disk_header header = source;
     header.checksum = 0u;
-    uint64_t hash = 1469598103934665603ull;
-    hash = fnv_update(hash, &header, sizeof(header));
-    if (!payload.empty()) hash = fnv_update(hash, payload.data(), payload.size());
-    return hash;
+    if (header.abi == 1u) {
+        uint64_t hash = fnv_update(1469598103934665603ull, &header, sizeof(header));
+        hash = fnv_update(hash, tokens.data(), tokens.size() * sizeof(uint32_t));
+        hash = fnv_update(hash, recurrent.data(), recurrent.size());
+        header.checksum = fnv_update(hash, speculative.data(), speculative.size());
+    } else if (header.abi == 2u) {
+        std::memset(header.reserved, 0, 32u);
+        EVP_MD_CTX *context = EVP_MD_CTX_new();
+        if (!context) return false;
+        bool ok = EVP_DigestInit_ex(context, EVP_sha256(), nullptr) == 1 &&
+                EVP_DigestUpdate(context, &header, sizeof(header)) == 1;
+        if (ok && !tokens.empty()) ok = EVP_DigestUpdate(
+                context, tokens.data(), tokens.size() * sizeof(uint32_t)) == 1;
+        if (ok && !recurrent.empty()) ok = EVP_DigestUpdate(
+                context, recurrent.data(), recurrent.size()) == 1;
+        if (ok && !speculative.empty()) ok = EVP_DigestUpdate(
+                context, speculative.data(), speculative.size()) == 1;
+        unsigned int bytes = 0u;
+        if (ok) ok = EVP_DigestFinal_ex(context, header.reserved, &bytes) == 1 && bytes == 32u;
+        EVP_MD_CTX_free(context);
+        if (!ok) return false;
+    } else {
+        return false;
+    }
+    *sealed = header;
+    return true;
 }
 
 bool parent_directory_sync(const std::string &path) {
@@ -235,15 +267,22 @@ bool parse_generation_filename(
         uint64_t *generation) {
     if (!generation) return false;
     const std::string prefix = session_stem + ".g";
-    constexpr const char *suffix = ".kv";
-    constexpr size_t suffix_size = 3u;
-    if (name.size() <= prefix.size() + suffix_size ||
+    constexpr const char *suffixes[] = {".kv", ".kv.txn", ".kv.txn.tmp"};
+    size_t suffix_size = 0u;
+    for (const char *suffix : suffixes) {
+        const size_t candidate_size = std::strlen(suffix);
+        if (name.size() > candidate_size &&
+            name.compare(name.size() - candidate_size, candidate_size, suffix) == 0) {
+            suffix_size = candidate_size;
+            break;
+        }
+    }
+    if (suffix_size == 0u || name.size() <= prefix.size() + suffix_size ||
         name.compare(0u, prefix.size(), prefix) != 0 ||
-        name.compare(name.size() - suffix_size, suffix_size, suffix) != 0) {
+        name[prefix.size()] == '0') {
         return false;
     }
     const size_t digits_end = name.size() - suffix_size;
-    if (name[prefix.size()] == '0') return false;
     uint64_t value = 0u;
     for (size_t index = prefix.size(); index < digits_end; ++index) {
         const unsigned char character = static_cast<unsigned char>(name[index]);
@@ -651,18 +690,23 @@ int qwen38_build_stateful_resume_prompt(
 qwen38_persistent_session_store::qwen38_persistent_session_store(
         std::string base_path,
         const uint32_t max_context,
-        const uint64_t recurrent_state_bytes) {
-    configure(std::move(base_path), max_context, recurrent_state_bytes);
+        const uint64_t recurrent_state_bytes,
+        const uint64_t speculative_state_bytes) {
+    configure(
+            std::move(base_path), max_context, recurrent_state_bytes,
+            speculative_state_bytes);
 }
 
 void qwen38_persistent_session_store::configure(
         std::string base_path,
         const uint32_t max_context,
-        const uint64_t recurrent_state_bytes) {
+        const uint64_t recurrent_state_bytes,
+        const uint64_t speculative_state_bytes) {
     base_path_ = std::move(base_path);
     root_path_ = base_path_.empty() ? std::string() : base_path_ + ".sessions";
     max_context_ = max_context;
     recurrent_state_bytes_ = recurrent_state_bytes;
+    speculative_state_bytes_ = speculative_state_bytes;
 }
 
 bool qwen38_persistent_session_store::valid_session_id(const std::string &session_id) {
@@ -724,6 +768,7 @@ qwen38_session_paths qwen38_persistent_session_store::paths_for(
     paths.generation = generation;
     paths.tier_path = paths.namespace_dir + "/" + paths.session_stem + ".g" +
             std::to_string(generation) + ".kv";
+    paths.transaction_path = paths.tier_path + ".txn";
     return paths;
 }
 
@@ -785,11 +830,14 @@ int qwen38_persistent_session_store::load(
         return AXIOM_ERR_IO;
     }
     if (std::memcmp(header.magic, kManifestMagic, sizeof(header.magic)) != 0 ||
-        header.abi != kManifestAbi || header.header_bytes != kManifestHeaderBytes ||
+        (header.abi != 1u && header.abi != 2u) || header.header_bytes != kManifestHeaderBytes ||
         header.generation == 0u || header.committed_tokens > max_context_ ||
         header.token_count > max_context_ || header.committed_tokens > header.token_count ||
         header.recurrent_bytes > kMaxRecurrentBytes ||
-        (recurrent_state_bytes_ != 0u && header.recurrent_bytes != recurrent_state_bytes_)) {
+        header.speculative_bytes > kMaxSpeculativeBytes ||
+        (recurrent_state_bytes_ != 0u && header.recurrent_bytes != recurrent_state_bytes_) ||
+        (speculative_state_bytes_ != 0u &&
+         header.speculative_bytes != speculative_state_bytes_)) {
         ::close(fd);
         *error = "session manifest contract mismatch";
         return AXIOM_ERR_IO;
@@ -801,9 +849,16 @@ int qwen38_persistent_session_store::load(
         return AXIOM_ERR_IO;
     }
     expected_payload += header.recurrent_bytes;
+    if (header.speculative_bytes >
+        std::numeric_limits<uint64_t>::max() - expected_payload) {
+        ::close(fd);
+        *error = "session manifest speculative payload overflow";
+        return AXIOM_ERR_IO;
+    }
+    expected_payload += header.speculative_bytes;
     if (header.payload_bytes != expected_payload ||
         header.payload_bytes > static_cast<uint64_t>(max_context_) * sizeof(uint32_t) +
-                kMaxRecurrentBytes) {
+                kMaxRecurrentBytes + kMaxSpeculativeBytes) {
         ::close(fd);
         *error = "session manifest payload mismatch";
         return AXIOM_ERR_IO;
@@ -816,21 +871,29 @@ int qwen38_persistent_session_store::load(
         *error = "session manifest size mismatch";
         return AXIOM_ERR_IO;
     }
-    std::vector<uint8_t> payload;
+    std::vector<uint32_t> token_ids;
+    std::vector<uint8_t> recurrent, speculative;
     try {
-        payload.resize(static_cast<size_t>(header.payload_bytes));
+        token_ids.resize(header.token_count);
+        recurrent.resize(header.recurrent_bytes);
+        speculative.resize(header.speculative_bytes);
     } catch (...) {
         ::close(fd);
         *error = "session manifest allocation failed";
         return AXIOM_ERR_BUDGET;
     }
-    if (!payload.empty() && !read_full(fd, payload.data(), payload.size())) {
+    if ((!token_ids.empty() && !read_full(fd, token_ids.data(), token_ids.size() * sizeof(uint32_t))) ||
+        (!recurrent.empty() && !read_full(fd, recurrent.data(), recurrent.size())) ||
+        (!speculative.empty() && !read_full(fd, speculative.data(), speculative.size()))) {
         ::close(fd);
         *error = "truncated session manifest payload";
         return AXIOM_ERR_IO;
     }
     ::close(fd);
-    if (header.checksum != header_payload_checksum(header, payload)) {
+    manifest_disk_header sealed{};
+    if (!seal_manifest(header, token_ids, recurrent, speculative, &sealed) ||
+        header.checksum != sealed.checksum ||
+        (header.abi == 2u && std::memcmp(header.reserved, sealed.reserved, 32u) != 0)) {
         *error = "session manifest checksum mismatch";
         return AXIOM_ERR_IO;
     }
@@ -847,20 +910,11 @@ int qwen38_persistent_session_store::load(
     }
     const std::string expected_namespace = namespace_id(key);
     const std::string expected_text = namespace_text(key);
-    const size_t token_bytes = static_cast<size_t>(header.token_count) * sizeof(uint32_t);
-    std::vector<uint32_t> token_ids(header.token_count);
-    if (token_bytes != 0u) std::memcpy(token_ids.data(), payload.data(), token_bytes);
     if (namespace_id_text != expected_namespace || session_id_text != key.session_id ||
         namespace_text_value != expected_text || profile_text != key.profile ||
         header.token_hash != token_hash(token_ids)) {
         *error = "session manifest namespace or token checksum mismatch";
         return AXIOM_ERR_IO;
-    }
-    const size_t recurrent_offset = token_bytes;
-    std::vector<uint8_t> recurrent(header.recurrent_bytes);
-    if (header.recurrent_bytes != 0u) {
-        std::memcpy(recurrent.data(), payload.data() + recurrent_offset,
-                    static_cast<size_t>(header.recurrent_bytes));
     }
     *paths = paths_for(key, header.generation);
     *out = qwen38_session_manifest{};
@@ -874,6 +928,7 @@ int qwen38_persistent_session_store::load(
     out->profile = std::move(profile_text);
     out->token_ids = std::move(token_ids);
     out->recurrent_state = std::move(recurrent);
+    out->speculative_state = std::move(speculative);
     *exists = true;
     return AXIOM_OK;
 }
@@ -891,6 +946,8 @@ int qwen38_persistent_session_store::save(
         manifest.committed_tokens > manifest.token_ids.size() ||
         manifest.recurrent_state.size() > std::numeric_limits<uint32_t>::max() ||
         manifest.recurrent_state.size() != recurrent_state_bytes_ ||
+        manifest.speculative_state.size() > std::numeric_limits<uint32_t>::max() ||
+        manifest.speculative_state.size() != speculative_state_bytes_ ||
         manifest.session_id != key.session_id ||
         manifest.namespace_id != namespace_id(key) ||
         manifest.namespace_text != namespace_text(key) ||
@@ -902,44 +959,35 @@ int qwen38_persistent_session_store::save(
     int rc = prepare(key, manifest.generation, &prepared, error);
     if (rc != AXIOM_OK) return rc;
     if (prepared.manifest_path != paths.manifest_path ||
-        prepared.tier_path != paths.tier_path) {
+        prepared.tier_path != paths.tier_path ||
+        prepared.transaction_path != paths.transaction_path) {
         *error = "persistent KV manifest path does not match namespace";
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
     const uint64_t token_bytes =
             static_cast<uint64_t>(manifest.token_ids.size()) * sizeof(uint32_t);
     const uint64_t recurrent_bytes = manifest.recurrent_state.size();
+    const uint64_t speculative_bytes = manifest.speculative_state.size();
     if (token_bytes > std::numeric_limits<uint64_t>::max() - recurrent_bytes ||
-        token_bytes + recurrent_bytes > std::numeric_limits<size_t>::max()) {
+        token_bytes + recurrent_bytes >
+                std::numeric_limits<uint64_t>::max() - speculative_bytes ||
+        token_bytes + recurrent_bytes + speculative_bytes >
+                std::numeric_limits<size_t>::max()) {
         *error = "persistent KV manifest payload overflow";
         return AXIOM_ERR_BUDGET;
     }
-    std::vector<uint8_t> payload;
-    try {
-        payload.resize(static_cast<size_t>(token_bytes + recurrent_bytes));
-    } catch (...) {
-        *error = "persistent KV manifest allocation failed";
-        return AXIOM_ERR_BUDGET;
-    }
-    if (token_bytes != 0u) {
-        std::memcpy(payload.data(), manifest.token_ids.data(),
-                    static_cast<size_t>(token_bytes));
-    }
-    if (recurrent_bytes != 0u) {
-        std::memcpy(payload.data() + token_bytes, manifest.recurrent_state.data(),
-                    static_cast<size_t>(recurrent_bytes));
-    }
     manifest_disk_header header{};
     std::memcpy(header.magic, kManifestMagic, sizeof(header.magic));
-    header.abi = kManifestAbi;
+    header.abi = manifest_version_;
     header.header_bytes = kManifestHeaderBytes;
     header.generation = manifest.generation;
     header.committed_tokens = manifest.committed_tokens;
     header.next_token = manifest.next_token;
     header.token_count = static_cast<uint32_t>(manifest.token_ids.size());
     header.recurrent_bytes = static_cast<uint32_t>(recurrent_bytes);
+    header.speculative_bytes = static_cast<uint32_t>(speculative_bytes);
     header.token_hash = token_hash(manifest.token_ids);
-    header.payload_bytes = payload.size();
+    header.payload_bytes = token_bytes + recurrent_bytes + speculative_bytes;
     if (!copy_text(header.namespace_id, sizeof(header.namespace_id), manifest.namespace_id) ||
         !copy_text(header.session_id, sizeof(header.session_id), manifest.session_id) ||
         !copy_text(header.namespace_text, sizeof(header.namespace_text), manifest.namespace_text) ||
@@ -947,7 +995,13 @@ int qwen38_persistent_session_store::save(
         *error = "persistent KV manifest string field is too long";
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
-    header.checksum = header_payload_checksum(header, payload);
+    manifest_disk_header sealed{};
+    if (!seal_manifest(header, manifest.token_ids, manifest.recurrent_state,
+                       manifest.speculative_state, &sealed)) {
+        *error = "session manifest checksum computation failed";
+        return AXIOM_ERR_RUNTIME;
+    }
+    header = sealed;
 
     const uint64_t temp_id = g_temp_sequence.fetch_add(1u) + 1u;
     const std::string temporary = paths.manifest_path + ".tmp." +
@@ -961,7 +1015,9 @@ int qwen38_persistent_session_store::save(
         return AXIOM_ERR_IO;
     }
     bool ok = write_full(fd, &header, sizeof(header));
-    if (ok && !payload.empty()) ok = write_full(fd, payload.data(), payload.size());
+    if (ok && token_bytes) ok = write_full(fd, manifest.token_ids.data(), token_bytes);
+    if (ok && recurrent_bytes) ok = write_full(fd, manifest.recurrent_state.data(), recurrent_bytes);
+    if (ok && speculative_bytes) ok = write_full(fd, manifest.speculative_state.data(), speculative_bytes);
     if (ok) ok = ::fsync(fd) == 0;
     const int close_rc = ::close(fd);
     if (close_rc != 0) ok = false;
@@ -992,7 +1048,8 @@ int qwen38_persistent_session_store::prune_obsolete_generations(
         expected.namespace_id != committed_paths.namespace_id ||
         expected.session_stem != committed_paths.session_stem ||
         expected.manifest_path != committed_paths.manifest_path ||
-        expected.tier_path != committed_paths.tier_path) {
+        expected.tier_path != committed_paths.tier_path ||
+        expected.transaction_path != committed_paths.transaction_path) {
         *error = "persistent KV generation GC path does not match namespace";
         return AXIOM_ERR_INVALID_ARGUMENT;
     }

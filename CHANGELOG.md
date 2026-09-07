@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.5.0-public — 2026-09-07
+
+- Published the saved September 5 RTX 5090 record: **409.324 decoded tokens/s
+  median** across three post-restart HTTP requests, normal 27B NVFP4 + DSpark,
+  1,002 prompt / 256 completion tokens, golden-output identical. This is a
+  decode measurement, not end-to-end throughput or an uncensored-model claim.
+- Added the native Qwen3.8 Flash-Next NVFP4 backend (`qwen4_exp`) in a separate
+  opt-in library: checkpoint admission, QSA/GDN, multi-hyperconnection, PLE,
+  routed/shared experts and bounded GPU/RAM/NVMe expert residency.
+- Updated 27B DSpark feature capture to post-decoder-block hidden states and
+  published stronger scalar/temporal KV, logits and tap validation.
+- Updated the size-checked DSpark device ABI to revision 3, including history
+  and target verification-policy identity; older symbol layouts reject safely.
+- Added exact attention overlap kernels, register-state GDN, BF16 paired
+  projections and expanded matmul tuning candidates. Native reference CUDA
+  objects compile without global fast-math to preserve the exact math contract.
+- Added transactional KV recovery and SHA-256 protected version-2 session
+  manifests, while preserving legacy session loading and cleanup semantics.
+- Added checkpoint/speculator fingerprint validation and native MTP library
+  primitives. MTP availability is distinct from accelerated qualification for
+  an individual checkpoint; DSpark remains the production reference path.
+- Added build/host checks for both backends. No production restart, new
+  inference benchmark, public daemon or model weights are part of this release.
+- Excluded the unqualified HTTP width2/adaptive-proposal candidate. No new
+  universal throughput, vision HTTP or full-context claim is made.
+
 ## v0.4.0-public — 2026-08-24
 
 - Published DSpark device-layout ABI revision 2 with size-checked entry points.

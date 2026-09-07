@@ -317,11 +317,11 @@ int fill_contract(axiom_qwen38_dspark_forward_contract *out) {
     out->max_context = 262144u;
     out->rms_norm_eps = 1.0e-6f;
     out->confidence_head_alpha = 1.0f;
-    out->rope_theta = 10000000.0f;
-    out->yarn_factor = 4.0f;
-    out->yarn_beta_fast = 32.0f;
-    out->yarn_beta_slow = 1.0f;
-    out->yarn_original_context = 262144u;
+    out->rope_theta = AXIOM_QWEN38_DSPARK_ROPE_THETA;
+    out->yarn_factor = AXIOM_QWEN38_DSPARK_YARN_FACTOR;
+    out->yarn_beta_fast = AXIOM_QWEN38_DSPARK_YARN_BETA_FAST;
+    out->yarn_beta_slow = AXIOM_QWEN38_DSPARK_YARN_BETA_SLOW;
+    out->yarn_original_context = 8192u;
     return AXIOM_OK;
 }
 
