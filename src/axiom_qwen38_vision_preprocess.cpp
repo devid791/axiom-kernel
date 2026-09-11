@@ -1,6 +1,7 @@
 /* Native Qwen3.8 image/video preprocessing. */
 
 #include "axiom/qwen38_vision_preprocess.hpp"
+#include "axiom/vision_memory_budget.hpp"
 
 #include <csetjmp>
 #include <cmath>
@@ -308,6 +309,10 @@ bool resize_image(const rgb_image &source, uint32_t width, uint32_t height, rgb_
         set_error(error, "resized image exceeds the native image budget");
         return false;
     }
+    if (!axiom::vision_memory::host_allocation_fits(bytes)) {
+        set_error(error, "insufficient available host memory for resized media");
+        return false;
+    }
     try {
         out->width = width;
         out->height = height;
@@ -401,6 +406,10 @@ bool patchify(const std::vector<rgb_image> &frames, uint32_t width, uint32_t hei
     const uint64_t values = patch_count * AXIOM_QWEN38_VISION_PATCH_FEATURES;
     if (values > std::numeric_limits<size_t>::max() / sizeof(float)) {
         set_error(error, "patch tensor exceeds the native allocation limit");
+        return false;
+    }
+    if (!axiom::vision_memory::host_allocation_fits(values * sizeof(float))) {
+        set_error(error, "insufficient available host memory for the native visual patch tensor");
         return false;
     }
     try {
@@ -503,13 +512,17 @@ bool preprocess_image(const rgb_image &image, uint32_t min_pixels, uint32_t max_
     std::vector<rgb_image> frames;
     try {
         frames.push_back(std::move(resized));
+        if (!axiom::vision_memory::host_allocation_fits(frames.front().rgb.size())) {
+            set_error(error, "insufficient available host memory for temporal image copy");
+            return false;
+        }
+        frames.push_back(frames.front());
     } catch (const std::bad_alloc &) {
         set_error(error, "image frame allocation exceeded the native budget");
         return false;
     }
     /* A still image is represented as one temporal group of two identical
      * frames, as required by temporal_patch_size=2. */
-    frames.push_back(frames.front());
     const bool ok = patchify(frames, width, height, out, error);
     if (ok) out->source_frames = 1u;
     return ok;
@@ -546,7 +559,13 @@ bool preprocess_video_frames(const std::vector<rgb_image> &frames, uint32_t min_
             if (!resize_image(frame, width, height, &current, error)) return false;
             resized.push_back(std::move(current));
         }
-        if ((resized.size() % kTemporal) != 0u) resized.push_back(resized.back());
+        if ((resized.size() % kTemporal) != 0u) {
+            if (!axiom::vision_memory::host_allocation_fits(resized.back().rgb.size())) {
+                set_error(error, "insufficient available host memory for temporal frame copy");
+                return false;
+            }
+            resized.push_back(resized.back());
+        }
     } catch (const std::bad_alloc &) {
         set_error(error, "video frame allocation exceeded the native budget");
         return false;

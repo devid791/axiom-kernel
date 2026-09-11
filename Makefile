@@ -207,3 +207,4 @@ clean:
 	$(RM) -r $(BUILD_DIR) $(BIN_DIR) $(LIB_DIR)
 
 include mk/public_extensions.mk
+include mk/codex_provider.mk

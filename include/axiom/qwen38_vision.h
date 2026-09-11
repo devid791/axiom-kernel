@@ -60,8 +60,10 @@ typedef struct axiom_qwen38_vision_info {
     uint64_t loaded_tensor_bytes;
 } axiom_qwen38_vision_info;
 
-/* Loads and validates all model.visual.* tensors. No text weights are loaded
- * by this object. The checkpoint model remains owned by the caller. */
+/* Loads and validates all model.visual.* tensors. max_tokens is the reusable
+ * scratch capacity, not an input limit. Larger forwards allocate temporary
+ * scratch against actual free GPU memory and restore the resident workspace
+ * on success or failure. No text weights are loaded by this object. */
 int axiom_qwen38_vision_create(
         axiom_model *model,
         int device,

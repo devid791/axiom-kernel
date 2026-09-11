@@ -20,11 +20,13 @@
 #include <limits>
 #include <new>
 #include <string>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
 #include "axiom/axiom.h"
 #include "axiom/qwen38_vision.h"
+#include "axiom/vision_memory_budget.hpp"
 
 namespace {
 
@@ -84,29 +86,7 @@ struct vision_metadata {
     std::vector<uint32_t> cu_seqlens;
 };
 
-}  // namespace
-
-/* This definition must live in the global namespace: the public header
- * forward-declares the C ABI handle with this exact tag. */
-struct axiom_qwen38_vision {
-    int device = -1;
-    uint32_t max_tokens = 0u;
-    uint64_t loaded_tensor_count = 0u;
-    uint64_t loaded_tensor_bytes = 0u;
-    uint64_t device_bytes = 0u;
-    cublasHandle_t cublas = nullptr;
-
-    vision_linear patch_embed;
-    uint16_t *pos_embed = nullptr;
-    uint64_t pos_embed_bytes = 0u;
-    vision_block blocks[AXIOM_QWEN38_VISION_DEPTH];
-    vision_norm merger_norm;
-    vision_linear merger_fc1;
-    vision_linear merger_fc2;
-
-    /* Per-call metadata and activations. They are bounded by max_tokens and
-     * are owned by this object, so a future API worker can serialize calls on
-     * the object without allocating on the hot path. */
+struct vision_scratch {
     float *patches = nullptr;
     float *hidden = nullptr;
     float *normed = nullptr;
@@ -121,6 +101,26 @@ struct axiom_qwen38_vision {
     int32_t *position_ids = nullptr;
     uint32_t *segment_ids = nullptr;
     uint32_t *cu_seqlens = nullptr;
+};
+
+}  // namespace
+
+/* The ABI handle owns immutable weights and a small reusable workspace.
+ * Large calls temporarily grow only scratch, never reload or copy weights. */
+struct axiom_qwen38_vision : vision_scratch {
+    int device = -1;
+    uint32_t max_tokens = 0u;
+    uint64_t loaded_tensor_count = 0u;
+    uint64_t loaded_tensor_bytes = 0u;
+    uint64_t device_bytes = 0u;
+    cublasHandle_t cublas = nullptr;
+    vision_linear patch_embed;
+    uint16_t *pos_embed = nullptr;
+    uint64_t pos_embed_bytes = 0u;
+    vision_block blocks[AXIOM_QWEN38_VISION_DEPTH];
+    vision_norm merger_norm;
+    vision_linear merger_fc1;
+    vision_linear merger_fc2;
 };
 
 namespace {
@@ -149,6 +149,83 @@ int alloc_device(void **out, uint64_t bytes) {
     *out = nullptr;
     return cuda_status(cudaMalloc(out, static_cast<size_t>(bytes)));
 }
+
+void free_scratch(vision_scratch &s) {
+    cudaFree(s.cu_seqlens); cudaFree(s.segment_ids); cudaFree(s.position_ids);
+    cudaFree(s.interpolation_weights); cudaFree(s.interpolation_indices);
+    cudaFree(s.linear_input_bf16); cudaFree(s.merger_fc1_out); cudaFree(s.merger_input);
+    cudaFree(s.fc1); cudaFree(s.attention); cudaFree(s.qkv); cudaFree(s.normed);
+    cudaFree(s.hidden); cudaFree(s.patches);
+    s = vision_scratch{};
+}
+
+uint64_t scratch_size(uint32_t tokens) {
+    const uint64_t n = tokens, merged = (n + kMergeUnit - 1u) / kMergeUnit;
+    return n * (kPatchFeatures + 6ull * kVisionHidden + kIntermediate) * sizeof(float) +
+        merged * AXIOM_QWEN38_VISION_MERGED_HIDDEN * sizeof(float) * 2u +
+        n * AXIOM_QWEN38_VISION_MERGED_HIDDEN * sizeof(uint16_t) +
+        n * (4u * sizeof(uint32_t) + 4u * sizeof(float) + 2u * sizeof(int32_t) + sizeof(uint32_t)) +
+        (n + 1u) * sizeof(uint32_t);
+}
+
+int allocate_scratch(vision_scratch &s, uint32_t tokens) {
+    const uint64_t n = tokens, merged = (n + kMergeUnit - 1u) / kMergeUnit;
+    int rc = AXIOM_OK;
+    auto allocate = [&](auto **pointer, uint64_t bytes) {
+        if (rc == AXIOM_OK) rc = alloc_device(reinterpret_cast<void **>(pointer), bytes);
+    };
+    allocate(&s.patches, n * kPatchFeatures * sizeof(float));
+    allocate(&s.hidden, n * kVisionHidden * sizeof(float));
+    allocate(&s.normed, n * kVisionHidden * sizeof(float));
+    allocate(&s.qkv, n * 3u * kVisionHidden * sizeof(float));
+    allocate(&s.attention, n * kVisionHidden * sizeof(float));
+    allocate(&s.fc1, n * kIntermediate * sizeof(float));
+    allocate(&s.merger_input, merged * AXIOM_QWEN38_VISION_MERGED_HIDDEN * sizeof(float));
+    allocate(&s.merger_fc1_out, merged * AXIOM_QWEN38_VISION_MERGED_HIDDEN * sizeof(float));
+    allocate(&s.linear_input_bf16, n * AXIOM_QWEN38_VISION_MERGED_HIDDEN * sizeof(uint16_t));
+    allocate(&s.interpolation_indices, n * 4u * sizeof(uint32_t));
+    allocate(&s.interpolation_weights, n * 4u * sizeof(float));
+    allocate(&s.position_ids, n * 2u * sizeof(int32_t));
+    allocate(&s.segment_ids, n * sizeof(uint32_t));
+    allocate(&s.cu_seqlens, (n + 1u) * sizeof(uint32_t));
+    if (rc != AXIOM_OK) free_scratch(s);
+    return rc;
+}
+
+/* Transactional, call-scoped growth. A rejected allocation cannot poison the
+ * resident workspace. All capacity/device accounting is restored on every exit. */
+struct scoped_scratch {
+    axiom_qwen38_vision *vision;
+    vision_scratch previous;
+    uint32_t previous_tokens = 0u;
+    explicit scoped_scratch(axiom_qwen38_vision *value) : vision(value) {}
+    scoped_scratch(const scoped_scratch &) = delete;
+    scoped_scratch &operator=(const scoped_scratch &) = delete;
+    int ensure(uint32_t tokens, uint64_t io_bytes) {
+        if (tokens <= vision->max_tokens) return AXIOM_OK;
+        if (tokens > INT32_MAX) return AXIOM_ERR_BUDGET;
+        size_t available = 0u, total = 0u;
+        if (cudaMemGetInfo(&available, &total) != cudaSuccess) return AXIOM_ERR_CUDA;
+        uint64_t needed = 0u;
+        if (!checked_add(scratch_size(tokens), io_bytes, &needed) ||
+            !checked_add(needed, 128ull * 1024ull * 1024ull, &needed) || needed > available)
+            return AXIOM_ERR_BUDGET;
+        vision_scratch replacement;
+        const int rc = allocate_scratch(replacement, tokens);
+        if (rc != AXIOM_OK) return rc;
+        previous = static_cast<vision_scratch &>(*vision);
+        previous_tokens = vision->max_tokens;
+        static_cast<vision_scratch &>(*vision) = replacement;
+        vision->max_tokens = tokens;
+        return AXIOM_OK;
+    }
+    ~scoped_scratch() {
+        if (!previous_tokens) return;
+        free_scratch(*vision);
+        static_cast<vision_scratch &>(*vision) = previous;
+        vision->max_tokens = previous_tokens;
+    }
+};
 
 __device__ __forceinline__ float bf16_to_float_device(uint16_t bits) {
     return __uint_as_float(static_cast<uint32_t>(bits) << 16u);
@@ -420,10 +497,30 @@ __device__ __forceinline__ float rotary_value(
     return base[dimension] * cosine + (dimension < kRotaryDim ? -partner : partner) * sine;
 }
 
+/* Materialize the SAME rotary_value once per Q/K dimension, rather than
+ * recomputing sin/cos/pow for each query/key/value combination. All raw partner
+ * dimensions are loaded before any in-place write. V and dot/softmax reduction
+ * order are unchanged; this is not a different attention approximation. */
+__global__ void vision_rotary_kernel(float *qkv, const int32_t *position_ids, uint32_t tokens) {
+    const uint32_t token = blockIdx.x, head = blockIdx.y, lane = threadIdx.x;
+    if (token >= tokens || head >= kHeads) return;
+    __shared__ float query[kHeadDim];
+    __shared__ float key[kHeadDim];
+    float *q = qkv + static_cast<uint64_t>(token) * (3u * kVisionHidden) + head * kHeadDim;
+    float *k = q + kVisionHidden;
+    if (lane < kHeadDim) { query[lane] = q[lane]; key[lane] = k[lane]; }
+    __syncthreads();
+    if (lane < kHeadDim) {
+        const int32_t h = position_ids[static_cast<uint64_t>(token) * 2u];
+        const int32_t w = position_ids[static_cast<uint64_t>(token) * 2u + 1u];
+        q[lane] = rotary_value(query, lane, h, w);
+        k[lane] = rotary_value(key, lane, h, w);
+    }
+}
+
 __global__ void vision_attention_kernel(
         const float *__restrict__ qkv,
         float *__restrict__ output,
-        const int32_t *__restrict__ position_ids,
         const uint32_t *__restrict__ segment_ids,
         const uint32_t *__restrict__ cu_seqlens,
         uint32_t tokens) {
@@ -436,10 +533,8 @@ __global__ void vision_attention_kernel(
     __shared__ float reduction[kMaxThreads];
     const float *query_base = qkv + static_cast<uint64_t>(query_token) * (3u * kVisionHidden) +
             static_cast<uint64_t>(head) * kHeadDim;
-    const int32_t q_height = position_ids[static_cast<uint64_t>(query_token) * 2u];
-    const int32_t q_width = position_ids[static_cast<uint64_t>(query_token) * 2u + 1u];
     for (uint32_t dimension = lane; dimension < kHeadDim; dimension += blockDim.x) {
-        query[dimension] = rotary_value(query_base, dimension, q_height, q_width);
+        query[dimension] = query_base[dimension];
     }
     __syncthreads();
 
@@ -452,11 +547,9 @@ __global__ void vision_attention_kernel(
     for (uint32_t key_token = begin + lane; key_token < end; key_token += blockDim.x) {
         const float *key = key_base + static_cast<uint64_t>(key_token) * (3u * kVisionHidden) +
                 kVisionHidden + static_cast<uint64_t>(head) * kHeadDim;
-        const int32_t key_height = position_ids[static_cast<uint64_t>(key_token) * 2u];
-        const int32_t key_width = position_ids[static_cast<uint64_t>(key_token) * 2u + 1u];
         float dot = 0.0f;
         for (uint32_t dimension = 0u; dimension < kHeadDim; ++dimension) {
-            dot += query[dimension] * rotary_value(key, dimension, key_height, key_width);
+            dot += query[dimension] * key[dimension];
         }
         local_max = fmaxf(local_max, dot * scale);
     }
@@ -471,11 +564,9 @@ __global__ void vision_attention_kernel(
     for (uint32_t key_token = begin + lane; key_token < end; key_token += blockDim.x) {
         const float *key = key_base + static_cast<uint64_t>(key_token) * (3u * kVisionHidden) +
                 kVisionHidden + static_cast<uint64_t>(head) * kHeadDim;
-        const int32_t key_height = position_ids[static_cast<uint64_t>(key_token) * 2u];
-        const int32_t key_width = position_ids[static_cast<uint64_t>(key_token) * 2u + 1u];
         float dot = 0.0f;
         for (uint32_t dimension = 0u; dimension < kHeadDim; ++dimension) {
-            dot += query[dimension] * rotary_value(key, dimension, key_height, key_width);
+            dot += query[dimension] * key[dimension];
         }
         local_sum += expf(dot * scale - max_score);
     }
@@ -492,11 +583,9 @@ __global__ void vision_attention_kernel(
         for (uint32_t key_token = begin; key_token < end; ++key_token) {
             const float *key = qkv + static_cast<uint64_t>(key_token) * (3u * kVisionHidden) +
                     kVisionHidden + static_cast<uint64_t>(head) * kHeadDim;
-            const int32_t key_height = position_ids[static_cast<uint64_t>(key_token) * 2u];
-            const int32_t key_width = position_ids[static_cast<uint64_t>(key_token) * 2u + 1u];
             float dot = 0.0f;
             for (uint32_t qdim = 0u; qdim < kHeadDim; ++qdim) {
-                dot += query[qdim] * rotary_value(key, qdim, key_height, key_width);
+                dot += query[qdim] * key[qdim];
             }
             const float probability = expf(dot * scale - max_score) / denominator;
             const float sample = *(qkv + static_cast<uint64_t>(key_token) * (3u * kVisionHidden) +
@@ -581,9 +670,27 @@ int norm_forward(
 int build_metadata(
         const axiom_qwen38_vision_grid *grids,
         uint32_t grid_count,
-        vision_metadata *out) {
+        vision_metadata *out) try {
     if (!grids || grid_count == 0u || !out) return AXIOM_ERR_INVALID_ARGUMENT;
+    uint64_t total_patches = 0u, total_segments = 0u;
+    for (uint32_t i = 0u; i < grid_count; ++i) {
+        const auto &g = grids[i];
+        if (!g.temporal || g.height < kMergeSize || g.width < kMergeSize ||
+            g.height % kMergeSize || g.width % kMergeSize) return AXIOM_ERR_INVALID_ARGUMENT;
+        uint64_t n = 0u;
+        if (!checked_mul(g.height, g.width, &n) || !checked_mul(n, g.temporal, &n) ||
+            !checked_add(total_patches, n, &total_patches) || total_patches > INT32_MAX ||
+            !checked_add(total_segments, g.temporal, &total_segments)) return AXIOM_ERR_BUDGET;
+    }
+    const uint64_t bytes = total_patches * (4u * sizeof(uint32_t) + 4u * sizeof(float) + 2u * sizeof(int32_t) + sizeof(uint32_t)) +
+            (total_segments + 1u) * sizeof(uint32_t);
+    if (!axiom::vision_memory::host_allocation_fits(bytes)) return AXIOM_ERR_BUDGET;
     vision_metadata result;
+    result.interpolation_indices.reserve(total_patches * 4u);
+    result.interpolation_weights.reserve(total_patches * 4u);
+    result.position_ids.reserve(total_patches * 2u);
+    result.segment_ids.reserve(total_patches);
+    result.cu_seqlens.reserve(total_segments + 1u);
     result.cu_seqlens.push_back(0u);
     uint64_t patch_count = 0u;
     uint64_t merged_count = 0u;
@@ -653,6 +760,10 @@ int build_metadata(
     result.segment_count = segment;
     *out = std::move(result);
     return AXIOM_OK;
+} catch (const std::bad_alloc &) {
+    return AXIOM_ERR_BUDGET;
+} catch (const std::length_error &) {
+    return AXIOM_ERR_BUDGET;
 }
 
 int upload_metadata(axiom_qwen38_vision *vision, const vision_metadata &metadata) {
@@ -715,8 +826,13 @@ int forward_device(
                 vision, block.qkv, vision->normed, vision->qkv, metadata.patch_count);
         if (rc == AXIOM_OK) {
             dim3 grid(metadata.patch_count, kHeads);
+            vision_rotary_kernel<<<grid, kMaxThreads>>>(vision->qkv, vision->position_ids, metadata.patch_count);
+            if (cudaGetLastError() != cudaSuccess) rc = AXIOM_ERR_CUDA;
+        }
+        if (rc == AXIOM_OK) {
+            dim3 grid(metadata.patch_count, kHeads);
             vision_attention_kernel<<<grid, kMaxThreads>>>(
-                    vision->qkv, vision->attention, vision->position_ids,
+                    vision->qkv, vision->attention,
                     vision->segment_ids, vision->cu_seqlens, metadata.patch_count);
             if (cudaGetLastError() != cudaSuccess) rc = AXIOM_ERR_CUDA;
         }
@@ -843,35 +959,7 @@ extern "C" int axiom_qwen38_vision_create(
             model, "model.visual.merger.linear_fc2", &vision->merger_fc2,
             kOutput, AXIOM_QWEN38_VISION_MERGED_HIDDEN);
 
-    const uint64_t n = max_tokens;
-    const uint64_t max_merged = (n + kMergeUnit - 1u) / kMergeUnit;
-    const uint64_t max_linear_cols = AXIOM_QWEN38_VISION_MERGED_HIDDEN;
-    auto alloc_float = [&](float **pointer, uint64_t count) -> int {
-        return alloc_device(reinterpret_cast<void **>(pointer), count * sizeof(float));
-    };
-    if (rc == AXIOM_OK) rc = alloc_float(&vision->patches, n * kPatchFeatures);
-    if (rc == AXIOM_OK) rc = alloc_float(&vision->hidden, n * kVisionHidden);
-    if (rc == AXIOM_OK) rc = alloc_float(&vision->normed, n * kVisionHidden);
-    if (rc == AXIOM_OK) rc = alloc_float(&vision->qkv, n * (3u * kVisionHidden));
-    if (rc == AXIOM_OK) rc = alloc_float(&vision->attention, n * kVisionHidden);
-    if (rc == AXIOM_OK) rc = alloc_float(&vision->fc1, n * kIntermediate);
-    if (rc == AXIOM_OK) rc = alloc_float(&vision->merger_input, max_merged * max_linear_cols);
-    if (rc == AXIOM_OK) rc = alloc_float(&vision->merger_fc1_out, max_merged * max_linear_cols);
-    if (rc == AXIOM_OK) rc = alloc_device(
-            reinterpret_cast<void **>(&vision->linear_input_bf16),
-            n * max_linear_cols * sizeof(uint16_t));
-    if (rc == AXIOM_OK) rc = alloc_device(
-            reinterpret_cast<void **>(&vision->interpolation_indices),
-            n * 4u * sizeof(uint32_t));
-    if (rc == AXIOM_OK) rc = alloc_device(
-            reinterpret_cast<void **>(&vision->interpolation_weights),
-            n * 4u * sizeof(float));
-    if (rc == AXIOM_OK) rc = alloc_device(
-            reinterpret_cast<void **>(&vision->position_ids), n * 2u * sizeof(int32_t));
-    if (rc == AXIOM_OK) rc = alloc_device(
-            reinterpret_cast<void **>(&vision->segment_ids), n * sizeof(uint32_t));
-    if (rc == AXIOM_OK) rc = alloc_device(
-            reinterpret_cast<void **>(&vision->cu_seqlens), (n + 1u) * sizeof(uint32_t));
+    if (rc == AXIOM_OK) rc = allocate_scratch(*vision, max_tokens);
     if (rc != AXIOM_OK) {
         axiom_qwen38_vision_destroy(vision);
         return rc;
@@ -909,13 +997,7 @@ extern "C" int axiom_qwen38_vision_create(
     vision->loaded_tensor_count = loaded_count;
     vision->loaded_tensor_bytes = loaded_bytes;
     uint64_t device_bytes = loaded_bytes;
-    const uint64_t scratch_bytes =
-            n * kPatchFeatures * sizeof(float) + n * kVisionHidden * sizeof(float) * 3u +
-            n * (3u * kVisionHidden) * sizeof(float) + n * kVisionHidden * sizeof(float) +
-            n * kIntermediate * sizeof(float) + max_merged * max_linear_cols * sizeof(float) * 2u +
-            n * max_linear_cols * sizeof(uint16_t) + n * 4u * sizeof(uint32_t) +
-            n * 4u * sizeof(float) + n * 2u * sizeof(int32_t) + n * sizeof(uint32_t) +
-            (n + 1u) * sizeof(uint32_t);
+    const uint64_t scratch_bytes = scratch_size(max_tokens);
     if (!checked_add(device_bytes, scratch_bytes, &device_bytes)) {
         axiom_qwen38_vision_destroy(vision);
         return AXIOM_ERR_BUDGET;
@@ -941,20 +1023,7 @@ extern "C" void axiom_qwen38_vision_destroy(axiom_qwen38_vision *vision) {
     destroy_norm(&vision->merger_norm);
     destroy_linear(&vision->patch_embed);
     cudaFree(vision->pos_embed);
-    cudaFree(vision->cu_seqlens);
-    cudaFree(vision->segment_ids);
-    cudaFree(vision->position_ids);
-    cudaFree(vision->interpolation_weights);
-    cudaFree(vision->interpolation_indices);
-    cudaFree(vision->linear_input_bf16);
-    cudaFree(vision->merger_fc1_out);
-    cudaFree(vision->merger_input);
-    cudaFree(vision->fc1);
-    cudaFree(vision->attention);
-    cudaFree(vision->qkv);
-    cudaFree(vision->normed);
-    cudaFree(vision->hidden);
-    cudaFree(vision->patches);
+    free_scratch(*vision);
     if (vision->cublas) cublasDestroy(vision->cublas);
     delete vision;
 }
@@ -1009,10 +1078,12 @@ extern "C" int axiom_qwen38_vision_forward_patches(
         patch_value_count != expected_patch_values || out_value_capacity < expected_output_values) {
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
-    if (metadata.patch_count > vision->max_tokens) return AXIOM_ERR_BUDGET;
     if (cudaSetDevice(vision->device) != cudaSuccess) return AXIOM_ERR_CUDA;
     const uint64_t patch_bytes = expected_patch_values * sizeof(float);
     const uint64_t output_bytes = expected_output_values * sizeof(float);
+    scoped_scratch scratch(vision);
+    rc = scratch.ensure(metadata.patch_count, patch_bytes + output_bytes);
+    if (rc != AXIOM_OK) return rc;
     float *patch_device = nullptr;
     float *output_device = nullptr;
     rc = alloc_device(reinterpret_cast<void **>(&patch_device), patch_bytes);
@@ -1050,8 +1121,10 @@ extern "C" int axiom_qwen38_vision_forward_patches_device(
         patch_value_count != expected_patch_values || out_value_capacity < expected_output_values) {
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
-    if (metadata.patch_count > vision->max_tokens) return AXIOM_ERR_BUDGET;
     if (cudaSetDevice(vision->device) != cudaSuccess) return AXIOM_ERR_CUDA;
+    scoped_scratch scratch(vision);
+    rc = scratch.ensure(metadata.patch_count, 0u);
+    if (rc != AXIOM_OK) return rc;
     rc = forward_device(vision, patch_values_device, metadata, out_device);
     if (rc == AXIOM_OK) *out_tokens = metadata.merged_count;
     return rc;

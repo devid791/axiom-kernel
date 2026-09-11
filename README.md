@@ -9,17 +9,17 @@
 Axiom is a native C++17/CUDA inference kernel for quantized and mixed-precision
 large language model execution. The public tree is a sanitized source release:
 it contains kernel code, public headers, tests, performance probes and design
-documentation; it does not contain model weights, private service daemons,
+documentation and an opt-in native Codex HTTP provider; it does not contain model weights, private service daemons,
 deployment files, credentials, internal endpoints, or production machines.
 
-Axiom is an owned GPU inference kernel and a multi-family, OpenAI-compatible inference daemon. It is not vLLM, llama.cpp, GGML, or a fork of any of them. This public repository is the sanitized kernel source release; the private serving daemon and its adapters are intentionally maintained outside this repository.
+Axiom is an owned GPU inference kernel and a multi-family, OpenAI-compatible inference daemon. It is not vLLM, llama.cpp, GGML, or a fork of any of them. This public repository now includes the sanitized native Qwen3.8 provider with its Codex integration; private deployment and other unaudited adapters remain outside it.
 
 The runtime is multi-family by design. The stable C ABI and family-neutral
 step-engine ABI are separate from model-specific math. The public snapshot
 includes the native Qwen3.8 path as its first complete reference integration,
 reusable NVFP4/FP8/BF16 primitives, generic engine contracts and additional
-family onboarding work. Private service adapters remain outside this public
-kernel snapshot.
+family onboarding work. Other unaudited private service adapters remain outside
+this public snapshot.
 
 ## Architecture at a glance
 
@@ -28,7 +28,7 @@ kernel snapshot.
 | Axiom core | Stable C ABI, tensor/model I/O, scheduling and family-neutral execution contracts | `axiom.h`, `axiom_engine.h`, `axiom_runtime.cpp` |
 | Device primitives | Quantized linear algebra, attention, RoPE, MoE and paged KV building blocks | `axiom_cuda*.cu` |
 | Model backends | Architecture-specific topology, weights, token flow and verification | `qwen38_*` reference backend; Gemma and DeepSeek integration components |
-| Serving layer | HTTP protocols, authentication, tools and deployment policy | Deliberately outside this public repository |
+| Serving layer | Native HTTP/Responses and Codex wire compatibility | Opt-in `axiom-qwen38-api`; authentication and deployment policy are external responsibilities |
 
 See [Architecture and model backends](docs/ARCHITECTURE.md) for the exact
 boundary and maturity of each public integration.
@@ -49,9 +49,12 @@ boundary and maturity of each public integration.
 | Agents | C++ swarm scheduler and generic continuous-batching engine contracts |
 | Reasoning | Seven explicit profiles: ultra-fast, minimal, low, medium, high, xhigh, max |
 
-The public source does not include a serving API. OpenAI/Anthropic adapters,
-authentication, tool policy and network exposure belong in a separately audited
-application layer.
+The public source now includes the `/codex/v1` provider bridge, subsequent
+known-token/paged prefill improvements and dynamic vision memory budgeting.
+See [Codex App Server integration](docs/CODEX_APP_SERVER.md) for build commands,
+route distinctions and exact qualification limits. Authentication, tool execution
+policy and network exposure remain separately audited application responsibilities.
+The HTTP daemon has no built-in authentication and defaults to loopback only.
 
 ## Deliberate security scope
 

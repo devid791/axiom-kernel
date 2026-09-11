@@ -1,5 +1,20 @@
 # Changelog
 
+## Codex provider source update — 2026-09-11
+
+- Added the native `/codex/v1` provider and its schema/name/custom-tool boundary,
+  discovery, original call/result identity and incremental Responses stream.
+- Added original-schema output validation, explicit unsupported-tool errors,
+  deadline/cancellation handling and long-request stream progress.
+- Added known-token scalar/paged prefill without extending speculative decode
+  boundaries, and checked dynamic vision scratch-memory growth.
+- Preserved the already published DSpark/M8 update and historical performance
+  record. No new model-backed performance or public-build inference claim.
+- Included native host-side contract tests; removed private activation controls
+  from the public provider and changed its default listener to loopback only.
+- No production deployment, installed-app replacement, private history or
+  credentials are included in source publication.
+
 ## v0.5.0-public — 2026-09-07
 
 - Published the saved September 5 RTX 5090 record: **409.324 decoded tokens/s

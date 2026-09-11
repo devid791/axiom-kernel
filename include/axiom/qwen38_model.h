@@ -291,6 +291,26 @@ int axiom_qwen38_model_forward_token(
         uint32_t *out_token_id,
         float *out_logit);
 
+/* Consume a known intermediate text prompt token without final RMSNorm,
+ * vocabulary projection or top-1. Updates the identical mixer/KV/history state
+ * and synchronously validates finite residuals/CUDA completion. No logits are
+ * produced: callers MUST use a normal forward for the final prompt token and
+ * every generated token. Not permitted during capture/temporal transactions.
+ * Additive API; ordinary decode entry points retain their existing contract. */
+int axiom_qwen38_model_prefill_known_token(
+        axiom_qwen38_model *model,
+        uint32_t token_id);
+
+/* Dedicated known-prompt batch, not a speculative transaction. Eight exact
+ * input tokens, full predictions returned for numerical qualification.
+ * Only resident paged text suffixes; a block cannot cross a 256-token page.
+ * Validation errors leave state unchanged. Execution failures invalidate the
+ * request state and require restore/reset; no partial block is accepted. */
+uint32_t axiom_qwen38_model_can_prefill_paged8(const axiom_qwen38_model *model);
+int axiom_qwen38_model_prefill_paged8(
+        axiom_qwen38_model *model, const uint32_t token_ids[8],
+        uint32_t out_token_ids[8], float out_logits[8]);
+
 /* Execute one token and copy the first temporal column's full LM-head logits
  * to host memory.  This is the scalar sampling bridge for API requests that
  * use Qwen's non-greedy temperature/top-k/top-p defaults.  The caller must

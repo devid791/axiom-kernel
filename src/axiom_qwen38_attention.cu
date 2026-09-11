@@ -558,7 +558,7 @@ __global__ void qwen38_qk_norm_partial_rope_cache8_kernel(
  * loads each FP8 K/V value once per CTA, fans it out to the six warps, and
  * stores an online-softmax partial.  The merge keeps chronological split
  * order and BF16 materializes the same public attention boundary. */
-template <bool kTemporal, uint32_t kSplits>
+template <bool kTemporal, uint32_t kSplits, bool kPaged = false>
 __global__ void qwen38_attention_core_gqa_splitk8_kernel(
         const float *__restrict__ q,
         const uint8_t *__restrict__ k_cache,
@@ -569,7 +569,9 @@ __global__ void qwen38_attention_core_gqa_splitk8_kernel(
         uint32_t scalar_cache_tokens,
         uint32_t base_position_host,
         const uint32_t *__restrict__ base_position_device,
-        uint32_t max_context) {
+        uint32_t max_context,
+        const uint8_t *const *__restrict__ page_table = nullptr,
+        uint32_t hot_pages = 0u) {
     const uint32_t kv_head = blockIdx.x;
     const uint32_t row = blockIdx.y;
     const uint32_t split = blockIdx.z;
@@ -622,8 +624,16 @@ __global__ void qwen38_attention_core_gqa_splitk8_kernel(
             const uint64_t cache_index = cache_column +
                     (static_cast<uint64_t>(tile_begin + tile_token) * kKvHeads + kv_head) *
                     kHeadDim + dim;
-            tile_k[index] = qwen38_kv_decode_e4m3fn_scale1(k_cache[cache_index]);
-            tile_v[index] = qwen38_kv_decode_e4m3fn_scale1(v_cache[cache_index]);
+            if constexpr (kPaged) {
+                const uint32_t token = tile_begin + tile_token;
+                const uint8_t *page = page_table[(token / AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS) % hot_pages];
+                const uint64_t offset = (static_cast<uint64_t>(token % AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS) * kKvHeads + kv_head) * kHeadDim + dim;
+                tile_k[index] = qwen38_kv_decode_e4m3fn_scale1(page[offset]);
+                tile_v[index] = qwen38_kv_decode_e4m3fn_scale1(page[AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES / 2u + offset]);
+            } else {
+                tile_k[index] = qwen38_kv_decode_e4m3fn_scale1(k_cache[cache_index]);
+                tile_v[index] = qwen38_kv_decode_e4m3fn_scale1(v_cache[cache_index]);
+            }
         }
         __syncthreads();
         if (active) {
@@ -654,7 +664,11 @@ __global__ void qwen38_attention_core_gqa_splitk8_kernel(
         __syncthreads();
     }
     if (!active) return;
-    const uint64_t stats_index = qwen38_attention_split_stats_index(row, kv_head, split, warp);
+    // Scalar paged attention borrows the already allocated 8-row x 8-split
+    // workspace, as 64 splits of ONE query. Temporal/MTP layout is unchanged.
+    const uint32_t stats_row = kPaged ? split / kAttentionSplitK : row;
+    const uint32_t stats_split = kPaged ? split % kAttentionSplitK : split;
+    const uint64_t stats_index = qwen38_attention_split_stats_index(stats_row, kv_head, stats_split, warp);
     if (lane == 0u) {
         split_maxima[stats_index] = maximum;
         split_denominators[stats_index] = denominator;
@@ -662,10 +676,11 @@ __global__ void qwen38_attention_core_gqa_splitk8_kernel(
 #pragma unroll
     for (uint32_t part = 0u; part < kHeadDim / 32u; ++part) {
         split_values[qwen38_attention_split_value_index(
-                row, kv_head, split, warp, lane + part * 32u)] = accumulators[part];
+                stats_row, kv_head, stats_split, warp, lane + part * 32u)] = accumulators[part];
     }
 }
 
+template <bool kScalarPaged = false>
 __global__ void qwen38_attention_merge_gqa_splitk8_kernel(
         const float *__restrict__ split_values,
         const float *__restrict__ split_maxima,
@@ -681,8 +696,10 @@ __global__ void qwen38_attention_merge_gqa_splitk8_kernel(
     float accumulators[kHeadDim / 32u]{};
     float maximum = -3.4028234663852886e+38F;
     float denominator = 0.0f;
-    for (uint32_t split = 0u; split < kAttentionSplitK; ++split) {
-        const uint64_t stats_index = qwen38_attention_split_stats_index(row, kv_head, split, warp);
+    for (uint32_t split = 0u; split < (kScalarPaged ? kBatch * kAttentionSplitK : kAttentionSplitK); ++split) {
+        const uint32_t stats_row = kScalarPaged ? split / kAttentionSplitK : row;
+        const uint32_t stats_split = kScalarPaged ? split % kAttentionSplitK : split;
+        const uint64_t stats_index = qwen38_attention_split_stats_index(stats_row, kv_head, stats_split, warp);
         const float partial_denominator = split_denominators[stats_index];
         if (partial_denominator == 0.0f) continue;
         const float partial_maximum = split_maxima[stats_index];
@@ -694,7 +711,7 @@ __global__ void qwen38_attention_merge_gqa_splitk8_kernel(
         for (uint32_t part = 0u; part < kHeadDim / 32u; ++part) {
             const uint32_t dim = lane + part * 32u;
             const float partial = split_values[qwen38_attention_split_value_index(
-                    row, kv_head, split, warp, dim)];
+                    stats_row, kv_head, stats_split, warp, dim)];
             accumulators[part] = fmaf(partial_correction, partial, accumulators[part] * correction);
         }
         maximum = next_maximum;
@@ -1131,6 +1148,14 @@ __global__ void qwen38_attention_temporal_exact_fused_kernel(
     if (!persistent_tiles) break;
     __syncthreads();
     }
+}
+
+// Host-prefill position only. The exact path does not use split-K maxima;
+// its first word can carry this scalar until the same-stream enqueue ends.
+// This is scratch workspace, not a KV page or a persistent model state.
+__global__ void qwen38_host_prefill_position_kernel(
+        uint32_t *position_device, uint32_t position) {
+    if (threadIdx.x == 0u && blockIdx.x == 0u) *position_device = position;
 }
 
 int qwen38_attention_temporal_exact_tiled_enqueue(
@@ -2690,12 +2715,27 @@ int forward_streaming_kv(
         void *page_table = nullptr;
         rc = buffer_pointer(layer->stream_hot_page_table, &page_table);
         if (rc != AXIOM_OK) return rc;
-        qwen38_stream_reference_hot_pages_kernel<<<
+        if (layer->position >= layer->temporal_hot_tokens &&
+            env_enabled("AXIOM_QWEN38_SCALAR_PAGED_SPLIT64")) {
+            const uint32_t tokens = layer->position + 1u;
+            qwen38_attention_core_gqa_splitk8_kernel<false, kBatch * kAttentionSplitK, true><<<
+                    dim3(kKvHeads, 1u, kBatch * kAttentionSplitK), kAttentionThreads>>>(
+                    static_cast<const float *>(q), nullptr, nullptr,
+                    static_cast<float *>(split_values), static_cast<float *>(split_maxima),
+                    static_cast<float *>(split_denominators), tokens, 0u, nullptr, tokens,
+                    reinterpret_cast<const uint8_t *const *>(page_table), layer->stream_hot_pages);
+            if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+            qwen38_attention_merge_gqa_splitk8_kernel<true><<<dim3(kKvHeads, 1u), kAttentionThreads>>>(
+                    static_cast<const float *>(split_values), static_cast<const float *>(split_maxima),
+                    static_cast<const float *>(split_denominators), static_cast<float *>(attention));
+        } else {
+            qwen38_stream_reference_hot_pages_kernel<<<
                 kHeads, kHeadDim, static_cast<size_t>(kHeadDim) * sizeof(float)>>>(
                 static_cast<const float *>(q),
                 reinterpret_cast<const uint8_t *const *>(page_table),
                 layer->stream_hot_pages, page_count, current_page_tokens,
                 static_cast<float *>(attention));
+        }
         if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
     } else {
         qwen38_stream_init_stats_kernel<<<
@@ -2767,6 +2807,111 @@ int forward_streaming_kv(
 }
 
 }  // namespace
+
+extern "C" uint32_t axiom_qwen38_attention_layer_can_prefill_paged8(
+        const axiom_qwen38_attention_layer *layer) {
+    if (!layer || !layer->streaming_kv || !layer->kv_tier || !layer->stream_host_page ||
+        layer->spec_active || layer->kv_fp8_parity_enabled ||
+        layer->position < layer->temporal_hot_tokens || layer->position > layer->max_context ||
+        kBatch > layer->max_context - layer->position ||
+        !env_enabled("AXIOM_QWEN38_SCALAR_PAGED_SPLIT64")) return 0u;
+    const uint32_t page = layer->position / AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+    const uint32_t offset = layer->position % AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+    if (kBatch > AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS - offset ||
+        page >= layer->stream_hot_pages) return 0u;
+    if (offset == 0u && layer->position != 0u)
+        return page == layer->stream_current_page + 1u;
+    return page == layer->stream_current_page && layer->stream_hot_page_ids[page] == page;
+}
+
+extern "C" int axiom_qwen38_attention_layer_prefill_paged8(
+        axiom_qwen38_attention_layer *layer, const float *input, float *out) {
+    if (!input || !out || !axiom_qwen38_attention_layer_can_prefill_paged8(layer))
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    if (cudaSetDevice(layer->device) != cudaSuccess) return AXIOM_ERR_CUDA;
+    const uint32_t base = layer->position;
+    if (base % AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS == 0u) {
+        int rc = stream_flush_current_page(layer);
+        if (rc != AXIOM_OK) return rc;
+        const uint32_t page = base / AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+        layer->stream_current_page = page;
+        layer->stream_current_page_device = layer->stream_hot_page_device[page];
+        layer->stream_hot_page_ids[page] = page;
+        void *current = nullptr;
+        rc = buffer_pointer(layer->stream_current_page_device, &current);
+        if (rc != AXIOM_OK) return rc;
+        const auto status = cudaMemset(current, 0, AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES);
+        if (status != cudaSuccess) return cuda_status(status);
+    }
+    void *weight = nullptr, *norm = nullptr, *q_gate = nullptr, *q = nullptr;
+    void *gate = nullptr, *k = nullptr, *v = nullptr, *attention = nullptr, *gated = nullptr;
+    void *values = nullptr, *maxima = nullptr, *denominators = nullptr, *page = nullptr, *table = nullptr;
+    int rc = buffer_pointer(layer->input_norm_weight, &weight);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->norm, &norm);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->q_gate, &q_gate);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->q, &q);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->gate, &gate);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->k, &k);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->v, &v);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->attention, &attention);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->gated_attention, &gated);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->attention_split_values, &values);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->attention_split_maxima, &maxima);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->attention_split_denominators, &denominators);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->stream_current_page_device, &page);
+    if (rc == AXIOM_OK) rc = buffer_pointer(layer->stream_hot_page_table, &table);
+    if (rc != AXIOM_OK) return rc;
+    qwen38_attention_rmsnorm8_kernel<<<kBatch, kThreads>>>(
+            static_cast<const float *>(weight), input, static_cast<float *>(norm));
+    if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+    rc = qwen38_attention_project_qkv(layer, static_cast<const float *>(norm),
+            static_cast<float *>(q_gate), static_cast<float *>(k), static_cast<float *>(v), nullptr);
+    if (rc == AXIOM_OK) rc = split_q_gate_round_k8(static_cast<const float *>(q_gate),
+            static_cast<float *>(q), static_cast<float *>(gate), static_cast<float *>(k), nullptr);
+    if (rc != AXIOM_OK) return rc;
+    // Preserve precisely the scalar per-row norm, RoPE, FP8 encoding and
+    // 64-split reduction. Reuse its workspace sequentially, no allocation and
+    // no future-token visibility. Only the surrounding projections are batched.
+    for (uint32_t row = 0u; row < kBatch; ++row) {
+        float *qr = static_cast<float *>(q) + row * kQDim;
+        float *kr = static_cast<float *>(k) + row * kKvDim;
+        const float *vr = static_cast<const float *>(v) + row * kKvDim;
+        rc = axiom_runtime_qk_rmsnorm_w_f32_device(layer->runtime, layer->q,
+                static_cast<uint64_t>(row) * kQDim * sizeof(float), layer->q_norm_weight, 0u,
+                kHeads, kHeadDim, kEps);
+        if (rc == AXIOM_OK) rc = axiom_runtime_qk_rmsnorm_w_f32_device(layer->runtime, layer->k,
+                static_cast<uint64_t>(row) * kKvDim * sizeof(float), layer->k_norm_weight, 0u,
+                kKvHeads, kHeadDim, kEps);
+        if (rc == AXIOM_OK) rc = launch_qwen38_rope_neox_partial_yarn(qr, kHeads, base + row, layer->yarn_enabled, nullptr);
+        if (rc == AXIOM_OK) rc = launch_qwen38_rope_neox_partial_yarn(kr, kKvHeads, base + row, layer->yarn_enabled, nullptr);
+        if (rc == AXIOM_OK) rc = round_bf16_inplace(qr, kQDim);
+        if (rc == AXIOM_OK) rc = round_bf16_inplace(kr, kKvDim);
+        if (rc != AXIOM_OK) return rc;
+        qwen38_stream_store_kv_page_kernel<<<(kKvDim + kThreads - 1u) / kThreads, kThreads>>>(
+                kr, vr, static_cast<uint8_t *>(page),
+                (base + row) % AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS);
+        if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        layer->stream_page_dirty = true;
+        const uint32_t tokens = base + row + 1u;
+        qwen38_attention_core_gqa_splitk8_kernel<false, kBatch * kAttentionSplitK, true><<<
+                dim3(kKvHeads, 1u, kBatch * kAttentionSplitK), kAttentionThreads>>>(
+                qr, nullptr, nullptr, static_cast<float *>(values), static_cast<float *>(maxima),
+                static_cast<float *>(denominators), tokens, 0u, nullptr, tokens,
+                reinterpret_cast<const uint8_t *const *>(table), layer->stream_hot_pages);
+        if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        qwen38_attention_merge_gqa_splitk8_kernel<true><<<dim3(kKvHeads, 1u), kAttentionThreads>>>(
+                static_cast<const float *>(values), static_cast<const float *>(maxima),
+                static_cast<const float *>(denominators), static_cast<float *>(attention) + row * kQDim);
+        if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+    }
+    const uint64_t count = static_cast<uint64_t>(kQDim) * kBatch;
+    qwen38_sigmoid_gate_kernel<<<(count + kThreads - 1u) / kThreads, kThreads>>>(
+            static_cast<const float *>(attention), static_cast<const float *>(gate), static_cast<float *>(gated));
+    if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+    rc = axiom_qwen38_fp8_linear_forward_f32_device(layer->o_proj, static_cast<const float *>(gated), out, nullptr);
+    if (rc == AXIOM_OK) layer->position += kBatch;
+    return rc;
+}
 
 extern "C" int axiom_qwen38_attention_layer_kv_tier_bind(
         axiom_qwen38_attention_layer *layer,
@@ -3622,10 +3767,31 @@ extern "C" int axiom_qwen38_attention_layer_forward_temporal8_f32_device(
             static_cast<float *>(v_cache_f32), layer->spec_base_position, nullptr,
             cache_context, layer->yarn_enabled, static_cast<uint32_t *>(parity_metrics));
     if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-    /* Host M8 is the scalar-parity oracle. Keep its exact fallback reduction
-     * order; production decode reaches the FlashInfer specialization through
-     * the device-position / CUDA-graph entry point below. */
-    if (layer->spec_device_position && layer->flashinfer_ready &&
+    /* Opt-in host prefill reuses the existing chronological exact tiled
+     * attention, not approximate split-K or FlashInfer. The reference kernel
+     * remains the default and the FP8 parity oracle. The device-position
+     * decode entry point below is unchanged. */
+    if (env_enabled("AXIOM_QWEN38_HOST_M8_EXACT_TILED") &&
+        layer->device_temporal_exact && !layer->device_temporal_exact_reference &&
+        !layer->kv_fp8_parity_enabled && layer->cache_columns == 1u &&
+        cache_context <= layer->temporal_hot_tokens) {
+        void *scores = nullptr, *maxima = nullptr, *denominators = nullptr;
+        rc = buffer_pointer(layer->attention_exact_scores, &scores);
+        if (rc == AXIOM_OK) rc = buffer_pointer(layer->attention_exact_maxima, &maxima);
+        if (rc == AXIOM_OK) rc = buffer_pointer(layer->attention_exact_denominators, &denominators);
+        if (rc != AXIOM_OK) return rc;
+        auto *base = static_cast<uint32_t *>(split_maxima);
+        qwen38_host_prefill_position_kernel<<<1u, 1u, 0, cuda_stream>>>(
+                base, layer->spec_base_position);
+        if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        rc = qwen38_attention_temporal_exact_tiled_enqueue(
+                static_cast<const float *>(q), static_cast<const uint8_t *>(k_cache),
+                static_cast<const uint8_t *>(v_cache), static_cast<float *>(scores),
+                static_cast<float *>(maxima), static_cast<float *>(denominators),
+                static_cast<float *>(attention), base, cache_context,
+                layer->temporal_hot_tokens, layer->device_temporal_exact_fused, cuda_stream);
+        if (rc != AXIOM_OK) return rc;
+    } else if (layer->spec_device_position && layer->flashinfer_ready &&
         !layer->device_temporal_force_native_splitk &&
         !layer->kv_fp8_parity_enabled) {
         rc = flashinfer_convert_q_to_bf16(

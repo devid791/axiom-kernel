@@ -1,5 +1,21 @@
 # Public release scope
 
+## September 11 Codex integration update
+
+The follow-up selectively imports source through `711318c` onto the existing
+public history. It adds the native Qwen3.8 HTTP provider, `/codex/v1` bridge,
+known-token/paged prefill and dynamic vision memory management. This explicitly
+extends the historical v0.5 serving exclusion below for this audited provider
+only. See [CODEX_APP_SERVER.md](CODEX_APP_SERVER.md).
+
+Private credentials, network identities, deployment scripts, raw operational
+reports, activation-control implementations and DFlash2 are still excluded.
+The public provider defaults to loopback, preserves request serialization and
+does not provide authentication or TLS. Host/build checks are not model-backed
+or production qualification of the independently sanitized executable.
+
+## Historical v0.5 boundary
+
 The v0.5 update includes the subsequent production-reference kernel changes
 through `d29b033c6c1593ed31ae6c4e15431a1d11ca4ed1`, plus the separate native
 Flash-Next backend at `a4aeda07b332471cb8aed1320b231c03521f01b2`.

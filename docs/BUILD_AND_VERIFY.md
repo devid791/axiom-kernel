@@ -1,5 +1,21 @@
 # Build and verification
 
+## Codex provider follow-up
+
+The optional public HTTP integration requires the image and FFmpeg development
+libraries. Build and run the model-free native contract gates with:
+
+```sh
+make -j4 CUDA_ARCH=sm_120 MEDIA=1 VISION=1 all extended-host-tests codex-host-tests
+make public-scan
+```
+
+An initial provider link with the kernel's default `MEDIA=0` exposed its required
+video-decoder dependency. Provider targets now report that prerequisite explicitly;
+the `MEDIA=1 VISION=1` build links the existing native decoder. This is not a
+change to standalone kernel defaults. See [CODEX_APP_SERVER.md](CODEX_APP_SERVER.md)
+for listener, authentication and real-inference qualification boundaries.
+
 ## September source update
 
 The public source builds both the updated 27B backend and the opt-in Flash-Next

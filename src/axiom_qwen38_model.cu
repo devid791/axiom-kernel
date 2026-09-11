@@ -455,6 +455,31 @@ __global__ void qwen38_top1_8_kernel(
     }
 }
 
+/* Known prompt tokens need recurrent/KV updates, not a vocabulary prediction.
+ * Validate every residual row before advancing history; reuse the existing
+ * result buffer and synchronous completion/error boundary, with no allocation.
+ * This kernel is used only by the explicit prefill-only entry point. */
+__global__ void qwen38_prefill_finite_hidden_kernel(
+        const float *__restrict__ hidden,
+        qwen38_top1_result *__restrict__ result) {
+    const uint32_t tid = threadIdx.x;
+    uint32_t invalid = 0u;
+    for (uint32_t i = tid; i < kBatch * kHidden; i += kThreads)
+        invalid |= !isfinite(hidden[i]);
+    __shared__ uint32_t invalids[kThreads];
+    invalids[tid] = invalid;
+    __syncthreads();
+    for (uint32_t stride = kThreads / 2u; stride; stride >>= 1u) {
+        if (tid < stride) invalids[tid] |= invalids[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        result[0].token_id = 0u;
+        result[0].value = 0.0f;
+        result[0].invalid = invalids[0];
+    }
+}
+
 __device__ __forceinline__ void qwen38_top1_select(
         const float candidate_value,
         const uint32_t candidate_id,
@@ -1266,14 +1291,15 @@ int qwen38_model_forward_batch8_internal(
         const uint32_t token_ids[kBatch],
         const float *embedding_override_device,
         uint32_t out_token_ids[kBatch],
-        float out_logits[kBatch]) {
+        float out_logits[kBatch],
+        bool compute_prediction = true) {
     if (out_token_ids) {
         for (uint32_t column = 0u; column < kBatch; ++column) out_token_ids[column] = 0u;
     }
     if (out_logits) {
         for (uint32_t column = 0u; column < kBatch; ++column) out_logits[column] = 0.0f;
     }
-    if (!model || !token_ids || !out_token_ids || !out_logits || !model->checkpoint || !model->runtime ||
+    if (!model || !token_ids || (compute_prediction && (!out_token_ids || !out_logits)) || !model->checkpoint || !model->runtime ||
         model->active_transaction || model->device_position_authoritative ||
         model->position >= model->max_context ||
         (model->scalar_tap_capture_active && model->scalar_tap_capture_time >= kBatch)) {
@@ -1372,6 +1398,19 @@ int qwen38_model_forward_batch8_internal(
                     model->scalar_tap_capture_time);
             if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
         }
+    }
+    if (!compute_prediction) {
+        qwen38_prefill_finite_hidden_kernel<<<1u, kThreads>>>(
+                static_cast<const float *>(hidden),
+                static_cast<qwen38_top1_result *>(top1_results));
+        if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        qwen38_top1_result result{};
+        status = cudaMemcpy(&result, top1_results, sizeof(result), cudaMemcpyDeviceToHost);
+        if (status != cudaSuccess) return cuda_status(status);
+        if (result.invalid != 0u) return AXIOM_ERR_CUDA;
+        ++model->position;
+        if (!model->suppress_history_mutation) model->committed_history_valid = false;
+        return AXIOM_OK;
     }
     void *final_weight = nullptr;
     rc = buffer_pointer(model->final_norm_weight, &final_weight);
@@ -1498,15 +1537,17 @@ extern "C" int axiom_qwen38_model_forward_embedding_logits(
     return AXIOM_OK;
 }
 
-extern "C" int axiom_qwen38_model_forward_token(
+static int qwen38_model_forward_token_internal(
         axiom_qwen38_model *model,
         uint32_t token_id,
         uint32_t *out_token_id,
-        float *out_logit) {
+        float *out_logit,
+        bool compute_prediction) {
     if (out_token_id) *out_token_id = 0u;
     if (out_logit) *out_logit = 0.0f;
-    if (!out_token_id || !out_logit || !model || model->active_transaction ||
-        model->device_position_authoritative) {
+    if ((compute_prediction && (!out_token_id || !out_logit)) || !model || model->active_transaction ||
+        model->device_position_authoritative ||
+        (!compute_prediction && (model->scalar_tap_capture_active || model->validation_early_capture_active))) {
         return AXIOM_ERR_INVALID_ARGUMENT;
     }
     uint32_t inputs[kBatch]{};
@@ -1515,11 +1556,14 @@ extern "C" int axiom_qwen38_model_forward_token(
     for (uint32_t column = 0u; column < kBatch; ++column) inputs[column] = token_id;
     const bool history_was_valid = model->committed_history_valid;
     model->suppress_history_mutation = true;
-    const int rc = axiom_qwen38_model_forward_batch8(model, inputs, outputs, logits);
+    const int rc = qwen38_model_forward_batch8_internal(
+            model, inputs, nullptr, outputs, logits, compute_prediction);
     model->suppress_history_mutation = false;
     if (rc == AXIOM_OK) {
-        *out_token_id = outputs[0];
-        *out_logit = logits[0];
+        if (compute_prediction) {
+            *out_token_id = outputs[0];
+            *out_logit = logits[0];
+        }
         if (history_was_valid) {
             try {
                 model->committed_tokens.push_back(token_id);
@@ -1536,6 +1580,18 @@ extern "C" int axiom_qwen38_model_forward_token(
         model->temporal_m8_validated = false;
     }
     return rc;
+}
+
+extern "C" int axiom_qwen38_model_forward_token(
+        axiom_qwen38_model *model, uint32_t token_id,
+        uint32_t *out_token_id, float *out_logit) {
+    return qwen38_model_forward_token_internal(model, token_id, out_token_id, out_logit, true);
+}
+
+extern "C" int axiom_qwen38_model_prefill_known_token(
+        axiom_qwen38_model *model, uint32_t token_id) {
+    if (!model || token_id >= kVocab) return AXIOM_ERR_INVALID_ARGUMENT;
+    return qwen38_model_forward_token_internal(model, token_id, nullptr, nullptr, false);
 }
 
 extern "C" int axiom_qwen38_model_forward_token_logits(
@@ -1801,7 +1857,8 @@ int model_transaction_verify_block8_enqueue(
         const uint32_t *input_tokens_device,
         cudaStream_t cuda_stream,
         const float *embedding_override_device,
-        axiom_qwen38_model_dspark_verify_block8_device_result *out) {
+        axiom_qwen38_model_dspark_verify_block8_device_result *out,
+        bool paged_known_prefill = false) {
     if (out) {
         *out = {};
         out->abi_version = AXIOM_QWEN38_MODEL_DSPARK_ABI_VERSION;
@@ -1862,7 +1919,9 @@ int model_transaction_verify_block8_enqueue(
             static_cast<uint32_t>((hidden_count + kThreads - 1u) / kThreads);
     for (uint32_t layer = 0u; layer < kLayers; ++layer) {
         if (model->layers[layer].attention) {
-            rc = axiom_qwen38_attention_layer_forward_temporal8_f32_device(
+            rc = paged_known_prefill ? axiom_qwen38_attention_layer_prefill_paged8(
+                    model->layers[layer].attention, static_cast<const float *>(hidden),
+                    static_cast<float *>(mixer)) : axiom_qwen38_attention_layer_forward_temporal8_f32_device(
                     model->layers[layer].attention, static_cast<const float *>(hidden),
                     static_cast<float *>(mixer), cuda_stream);
         } else if (model->layers[layer].gdn) {
@@ -2076,6 +2135,83 @@ int model_device_transaction_verify_block8_enqueue(
 }
 
 }  // namespace
+
+extern "C" uint32_t axiom_qwen38_model_can_prefill_paged8(const axiom_qwen38_model *model) {
+    if (!model || model->active_transaction || model->device_position_authoritative ||
+        !model->temporal_m8_validated || !model->committed_history_valid ||
+        model->scalar_tap_capture_active || model->validation_early_capture_active ||
+        model->position > model->max_context || kBatch > model->max_context - model->position ||
+        model->committed_tokens.size() != static_cast<size_t>(model->position)) return 0u;
+    for (uint32_t i = 0u; i < kLayers; ++i) {
+        if (model->layers[i].attention) {
+            if (axiom_qwen38_attention_layer_position(model->layers[i].attention) != model->position ||
+                !axiom_qwen38_attention_layer_can_prefill_paged8(model->layers[i].attention)) return 0u;
+        } else if (!model->layers[i].gdn) return 0u;
+    }
+    return 1u;
+}
+
+extern "C" int axiom_qwen38_model_prefill_paged8(
+        axiom_qwen38_model *model, const uint32_t token_ids[8],
+        uint32_t out_token_ids[8], float out_logits[8]) {
+    if (out_token_ids) std::fill_n(out_token_ids, kBatch, 0u);
+    if (out_logits) std::fill_n(out_logits, kBatch, 0.0f);
+    if (!token_ids || !out_token_ids || !out_logits || !axiom_qwen38_model_can_prefill_paged8(model))
+        return AXIOM_ERR_INVALID_ARGUMENT;
+    uint32_t inputs[kBatch]{};
+    for (uint32_t i = 0; i < kBatch; ++i) {
+        if (token_ids[i] >= kVocab) return AXIOM_ERR_INVALID_ARGUMENT;
+        inputs[i] = token_ids[i];
+    }
+    try { model->committed_tokens.reserve(model->committed_tokens.size() + kBatch); }
+    catch (...) { return AXIOM_ERR_BUDGET; }
+    if (cudaSetDevice(model->device) != cudaSuccess) return AXIOM_ERR_CUDA;
+    void *device_inputs = nullptr;
+    int rc = buffer_pointer(model->token_ids, &device_inputs);
+    if (rc != AXIOM_OK) return rc;
+    const auto copied = cudaMemcpy(device_inputs, inputs, sizeof(inputs), cudaMemcpyHostToDevice);
+    if (copied != cudaSuccess) return cuda_status(copied);
+
+    // Known tokens only. Use the existing causal GDN transaction, but never
+    // open a draft attention transaction or expand its 8192-token window.
+    axiom_qwen38_model_transaction transaction{};
+    transaction.model = model;
+    transaction.snapshot_position = model->position;
+    model->active_transaction = &transaction;
+    for (uint32_t i = 0u; i < kLayers && rc == AXIOM_OK; ++i)
+        if (model->layers[i].gdn) rc = axiom_qwen38_gdn_layer_spec_begin(model->layers[i].gdn, nullptr);
+    axiom_qwen38_model_dspark_verify_block8_device_result result{};
+    if (rc == AXIOM_OK) rc = model_transaction_verify_block8_enqueue(&transaction, inputs,
+            static_cast<const uint32_t *>(device_inputs), nullptr, nullptr, &result, true);
+    qwen38_top1_result predictions[kBatch]{};
+    if (rc == AXIOM_OK) rc = cuda_status(cudaMemcpy(predictions, result.target_top1_results,
+            sizeof(predictions), cudaMemcpyDeviceToHost));
+    if (rc == AXIOM_OK) {
+        for (const auto &prediction : predictions)
+            if (prediction.invalid || prediction.token_id >= kVocab || !std::isfinite(prediction.value))
+                rc = AXIOM_ERR_CUDA;
+    }
+    for (uint32_t i = 0u; i < kLayers && rc == AXIOM_OK; ++i)
+        if (model->layers[i].gdn) rc = axiom_qwen38_gdn_layer_spec_commit_prefix(model->layers[i].gdn, kBatch, nullptr);
+    if (rc == AXIOM_OK) rc = cuda_status(cudaStreamSynchronize(cudaStreamPerThread));
+    model->active_transaction = nullptr;
+    if (rc != AXIOM_OK) {
+        // Some paged rows may already exist, so this is NOT a scalar retry.
+        // Drop the failed in-memory request state; the HTTP caller restores
+        // its last committed session via the existing rollback mechanism.
+        (void)cudaStreamSynchronize(cudaStreamPerThread);
+        model->temporal_m8_validated = false;
+        const int reset = axiom_qwen38_model_reset(model);
+        return reset == AXIOM_OK ? rc : reset;
+    }
+    model->position += kBatch;
+    model->committed_tokens.insert(model->committed_tokens.end(), inputs, inputs + kBatch);
+    for (uint32_t i = 0u; i < kBatch; ++i) {
+        out_token_ids[i] = predictions[i].token_id;
+        out_logits[i] = predictions[i].value;
+    }
+    return AXIOM_OK;
+}
 
 extern "C" int axiom_qwen38_model_transaction_verify_block8(
         axiom_qwen38_model_transaction *transaction,

@@ -1,0 +1,108 @@
+{
+  "release_id": "axiom-kernel-v0.5.0-public",
+  "release_date": "2026-09-07",
+  "release_type": "sanitized-native-source-update",
+  "project": "Axiom Kernel",
+  "license": "MIT",
+  "source_commit": "d29b033c6c1593ed31ae6c4e15431a1d11ca4ed1",
+  "source_commit_scope": "Private 27B reference selectively merged into sanitized public history; not this public commit or the historical benchmark binary.",
+  "flash_next_source_commit": "a4aeda07b332471cb8aed1320b231c03521f01b2",
+  "flash_next_qualified_code_commit": "d3633f924e036fa444506f3f155ac4eb0841dfc0",
+  "public_history": "sanitized-public-snapshot-no-private-history-import",
+  "build_snapshot": {
+    "cuda_toolkit": "13.3.73",
+    "host_compiler": "g++ 13.3.0",
+    "cuda_arch": "sm_120",
+    "vision": true,
+    "media_decoder": false,
+    "native_reference_global_fast_math": false,
+    "flash_next_library": "separate-opt-in"
+  },
+  "artifact_hashes": {
+    "lib/libaxiom.so": "a7b74be1da2c3986fe6fd0bac919d1fb21a5e057d300f7ccd9b6ea617dffd0ea",
+    "lib/libaxiom-qwen4exp.so": "b2c1c727970958b7e0b8e5a87efeda451df9aa34c3f855085673a636ae48eadd",
+    "bin/axiom-qwen38-generate": "eb2efc08a0250dbd40e75b0a2b8ad7d60b08fbfc98e6696fbe90665f16e4e3dd",
+    "bin/qwen4exp-text-model-test": "eeb67fa0edd9ff480b9be86b3e3cb96e076d4ce6db929c8d1e32a259ffa61c58"
+  },
+  "artifact_scope": "Local publication build evidence only; binaries are not distributed and are not historical benchmark artifacts.",
+  "config_hashes": {
+    "Makefile": "e9a1c96c0a23b74c25e3681ff8f1023e444276851d85b3e906cc538cb2d2d2fb",
+    "mk/public_extensions.mk": "a1cbad55ce1f56fc7bea177948f8e47a6e8bc9302b95aeb91cd18105c494c535",
+    "README.md": "5fcad986046af32e6c80c372c550bccf485df9109be3dabd0b07ac4f0cd7f64b",
+    "CHANGELOG.md": "34b53b39cea8f0db0b6c13e65b326cb77452eb5820ca090d9ad2c00e2d9c81ae",
+    "docs/ARCHITECTURE.md": "611b54122d9e81f50c9ebbfb8d870b333209404701f1ce941ae6b8fd864cbf2c",
+    "docs/BUILD_AND_VERIFY.md": "a139c64b05be3aa575899c2994025c4c4d63e7602ea8ce39bc62706d7f232344",
+    "docs/PUBLIC_SCOPE.md": "854a8560b85445b3c02b1eb8357964f7452db1506c0af5360756fb6a899d4619",
+    "docs/qwen38/PERFORMANCE.md": "0f55399f4327442251cc0b3f618e83ac0fbf2c50d2cd31d602b0e05bf40961d5",
+    "docs/qwen38/RECORD_409.json": "2293be747eceb0d0c1159ed0986f1fe7b0309ca75d718b46d327c41dd7f20cda",
+    "docs/qwen4exp/README.md": "d8ca2a329d73bcb165ff5e7331835632693d4ace63019aed360bfbf0006e4670"
+  },
+  "checkpoint_hashes": {},
+  "gate_results": {
+    "scope": "Publication build and host checks, distinct from historical private runtime evidence.",
+    "cuda_compile_sm120": "pass",
+    "both_libraries_link_and_dynamic_symbols": "pass",
+    "session_store_host": "pass",
+    "kv_transaction_host": "pass",
+    "sha256_host": "pass",
+    "checkpoint_speculator_identity_host": "pass",
+    "swarm_scheduler_host": "pass",
+    "dspark_layout_abi_v3": "pass",
+    "flash_next_ple_host": "pass",
+    "flash_next_expert_pager_host": "pass",
+    "public_scan": "pass",
+    "gitleaks": "8-reviewed-false-positives-no-actual-secrets-found",
+    "gitleaks_review": "GDN attention dimension identifiers, MTP key/value head constants and public model-id test string; no rules disabled.",
+    "publication_gpu_inference": "not_run",
+    "publication_gpu_performance": "not_run"
+  },
+  "benchmark_record": {
+    "record_file": "docs/qwen38/RECORD_409.json",
+    "evidence": "historical-private-post-restart-http-fixture-2026-09-05",
+    "model": "normal-qwen3.8-27b-nvfp4-not-uncensored",
+    "backend": "native-DSpark-speculative-graph",
+    "gpu": "one-RTX-5090",
+    "prompt_tokens": 1002,
+    "completion_tokens": 256,
+    "decode_metric_tokens": 255,
+    "median_decode_tokens_per_second": 409.32379769617864,
+    "runs": [
+      409.1117241266142,
+      409.4104379554007,
+      409.32379769617864
+    ],
+    "all_outputs_match_golden": true,
+    "metric_excludes": [
+      "initial-anchor",
+      "prefill",
+      "transport",
+      "persistence"
+    ]
+  },
+  "flash_next_historical_evidence": {
+    "model": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+    "measurement_scope": "Warm short greeting on RTX 5090, native text inference; not general throughput.",
+    "decode_tokens_after_first": 8,
+    "decode_ms": 195.196,
+    "decode_tokens_per_second_approx": 40.98,
+    "support_details": "docs/qwen4exp/README.md",
+    "accelerated_mtp": "not-qualified",
+    "full_262k_or_1m_context": "not-qualified",
+    "vision_http": "not-in-public-source"
+  },
+  "exclusions": [
+    "credentials-and-internal-endpoints",
+    "model-weights-and-tokenizer-assets",
+    "private-http-daemons-and-deployment-configuration",
+    "activation-steering-code-and-packs",
+    "DFlash2-executor",
+    "unqualified-http-width2-and-adaptive-proposal-candidate"
+  ],
+  "installed_paths": [],
+  "health_snapshot": {
+    "status": "not-collected-for-source-publication",
+    "production_modified": false,
+    "production_restarted": false,
+    "new_inference_started": false
+  }
+}

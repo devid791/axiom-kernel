@@ -72,6 +72,15 @@ int axiom_qwen38_attention_layer_load(
 void axiom_qwen38_attention_layer_destroy(axiom_qwen38_attention_layer *layer);
 int axiom_qwen38_attention_layer_reset(axiom_qwen38_attention_layer *layer);
 uint32_t axiom_qwen38_attention_layer_position(const axiom_qwen38_attention_layer *layer);
+
+/* Known-text prefill only: eight causal rows inside one resident paged KV
+ * page, beyond the separate speculative hot window. No draft/partial commit.
+ * Reuses scalar QK/RoPE/split64 arithmetic, with batched projections.
+ * A failed forward requires caller-owned request reset/restore. */
+uint32_t axiom_qwen38_attention_layer_can_prefill_paged8(
+        const axiom_qwen38_attention_layer *layer);
+int axiom_qwen38_attention_layer_prefill_paged8(
+        axiom_qwen38_attention_layer *layer, const float *input, float *out);
 uint64_t axiom_qwen38_attention_layer_device_bytes(const axiom_qwen38_attention_layer *layer);
 axiom_qwen38_rope_profile axiom_qwen38_attention_layer_rope_profile(
         const axiom_qwen38_attention_layer *layer);
