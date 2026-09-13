@@ -13,6 +13,24 @@ static ajson json(const std::string &s) {
     ajson v; std::string e; assert(ajson_parse(s, v, e)); return v;
 }
 
+static void multimodal_assistant_replay_test() {
+    auto request = json(R"({"input":[{"role":"user","content":[{"type":"input_text","text":"Color?"},{"type":"input_image","image_url":"data:image/png;base64,QA"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Red","annotations":[]}]},{"role":"user","content":"What color was it?"}]})");
+    const std::string original = ajson_dumps(request);
+    ajson chat; std::string error;
+    assert(normalize_responses_request(request, &chat, &error));
+    const auto &messages = chat.get("messages")->arr;
+    assert(messages.size() == 3u);
+    assert(ajson_dumps(*messages[0].get("content")) == ajson_dumps(*request.get("input")->arr[0].get("content")));
+    const auto &part = messages[1].get("content")->arr[0];
+    assert(part.get("type")->s == "text" && part.get("text")->s == "Red");
+    assert(part.get("annotations")->is_array());
+    assert(ajson_dumps(request) == original);
+    request = json(R"({"input":[{"role":"assistant","content":[{"type":"output_text","text":7}]}]})");
+    assert(!normalize_responses_request(request, &chat, &error));
+    assert(error.find("require string text") != std::string::npos);
+    std::puts("Multimodal assistant output_text replay: PASS (media preserved, alias normalized, malformed text rejected)");
+}
+
 static void custom_format_tests() {
     const auto original = json(R"({"model":"qwen3.8-27b-nvfp4","input":"Edit a file","tools":[{"type":"custom","name":"apply_patch","description":"FREEFORM patch","format":{"type":"grammar","syntax":"lark","definition":"start: \"*** Begin Patch\" LF hunk+ \"*** End Patch\""}}]})");
     auto request = original; axiom_codex::tool_wire_map bridge; configure_codex_schema_bridge(bridge); std::string error;
@@ -117,6 +135,58 @@ static void responses_terminal_tests() {
     assert(bytes.find("response.failed") == std::string::npos);
     close(fd[0]); close(fd[1]);
     std::puts("Responses lifecycle: PASS (incremental deltas, accumulated text, exactly one terminal, implicit failure, legacy unchanged)");
+}
+
+static void incomplete_and_empty_response_tests() {
+    axiom_codex::tool_wire_map bridge;
+    for (int scenario=0; scenario<5; ++scenario) {
+        const bool limited=scenario<3;
+        const bool calls=scenario==2 || scenario==4;
+        generation_result result;
+        result.finish_reason=limited?"length":"stop";
+        result.text=scenario==0?"Partial answer":"";
+        native_tool_result parsed;parsed.status="pass";parsed.content=result.text;
+        if(calls) parsed.calls.push_back(json(R"({"id":"do-not-execute-if-truncated","type":"function","function":{"name":"qa_read_file","arguments":"{}"}})"));
+        const char *status=limited?"incomplete":calls?"completed":"failed";
+        const auto response=responses_response(result,99,"ultra-fast",nullptr,&parsed,true);
+        assert(axiom_codex::string_field(response,"status")==status);
+        if(scenario==2) assert(response.get("output")->arr.empty());
+        int fd[2];assert(socketpair(AF_UNIX,SOCK_STREAM,0,fd)==0);
+        live_responses_stream stream;
+        assert(start_live_responses_stream(&stream,fd[0],99,"terminal-budget",&bridge));
+        std::string bytes=available_bytes(fd[1]);
+        stream.progress=std::make_shared<axiom::qwen38::request_progress>();
+        assert(stream.progress->prefill(55503,65536,68575));
+        assert(live_responses_progress(&stream));
+        bytes+=available_bytes(fd[1]);
+        assert(bytes.find("\"prefill_tokens_processed\":10033")!=std::string::npos);
+        if(!result.text.empty()) {assert(live_responses_emit_token(&stream,result.text));bytes+=available_bytes(fd[1]);}
+        assert(finish_live_responses_stream(&stream,response,result,&parsed,nullptr));
+        assert(stream.terminal_sent);
+        assert(!live_responses_progress(&stream));
+        close_live_responses_stream(&stream);close_live_responses_stream(&stream);
+        bytes+=available_bytes(fd[1]);
+        const std::string terminal=std::string("event: response.")+status;
+        const auto pos=bytes.find(terminal);
+        assert(pos!=std::string::npos && bytes.find(terminal,pos+1)==std::string::npos);
+        if(limited) {
+            assert(bytes.find("event: response.completed")==std::string::npos);
+            assert(bytes.find("event: response.failed")==std::string::npos);
+            assert(bytes.find("max_output_tokens")!=std::string::npos);
+            assert(bytes.find("do-not-execute-if-truncated")==std::string::npos);
+        } else if(!calls) assert(bytes.find("empty_model_response")!=std::string::npos);
+        else assert(bytes.find("do-not-execute-if-truncated")!=std::string::npos);
+        const auto end=bytes.find("data: [DONE]");
+        assert(end>pos && bytes.find("data: [DONE]",end+1)==std::string::npos);
+        if (const char *prefix=std::getenv("AXIOM_QA_TERMINAL_OUTPUT")) {
+            std::ofstream fixture(std::string(prefix)+"-"+std::to_string(scenario)+".http",std::ios::binary);
+            fixture<<bytes;assert(fixture.good());
+        }
+        close(fd[0]);close(fd[1]);
+        // Non-Codex /v1 compatibility is explicitly retained.
+        assert(axiom_codex::string_field(responses_response(result,99,"ultra-fast",nullptr,&parsed),"status")=="completed");
+    }
+    std::puts("Codex incomplete/empty: PASS (partial or empty cannot claim success; truncated tools not dispatched; one terminal; legacy unchanged)");
 }
 
 static void stream_edge_tests() {
@@ -858,6 +928,7 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
+    multimodal_assistant_replay_test();
     custom_format_tests();
     schema_tests();
     client_search_tests();
@@ -865,14 +936,18 @@ int main(int argc, char **argv) {
     minimum_items_tests();
     codex_scalar_bounds_tests();
     uint64_t codex_deadline = 0;
-    assert(axiom_codex::request_deadline_ms(nullptr, &codex_deadline) && codex_deadline == 600000);
+    assert(axiom_codex::request_deadline_ms(nullptr, &codex_deadline) && codex_deadline == 0);
+    assert(axiom_codex::request_deadline_ms("", &codex_deadline) && codex_deadline == 0);
+    assert(!axiom_codex::request_deadline_ms(nullptr, nullptr));
+    assert(axiom_codex::request_deadline_ms("1", &codex_deadline) && codex_deadline == 1);
     assert(axiom_codex::request_deadline_ms("900000", &codex_deadline) && codex_deadline == 900000);
     assert(axiom_codex::request_deadline_ms("86400000", &codex_deadline) && codex_deadline == 86400000);
     for (const char *invalid : {"0", "-1", "1.5", "900000ms", "86400001", "999999999999999999999999"})
         assert(!axiom_codex::request_deadline_ms(invalid, &codex_deadline));
-    std::puts("Codex deadline: PASS (600s default, finite explicit budget, invalid/overflow rejected)");
+    std::puts("Codex deadline: PASS (no invented default total deadline, finite explicit budget, invalid/overflow rejected)");
     exact_alternative_tests();
     responses_terminal_tests();
+    incomplete_and_empty_response_tests();
     stream_edge_tests();
     assert(codex_target_prefill_block_fits(0, 11479, 8192, false));
     assert(codex_target_prefill_block_fits(8184, 11479, 8192, false));

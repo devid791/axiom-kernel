@@ -1,0 +1,64 @@
+{
+  "release_id": "axiom-kernel-codex-provider-20260911",
+  "release_date": "2026-09-11",
+  "release_type": "sanitized-source-integration-update",
+  "project": "Axiom Kernel",
+  "license": "MIT",
+  "previous_public_commit": "e64617f5b2b10a97dad62dfad4ae57ad7db124a9",
+  "previous_release_manifest": "docs/releases/v0.5.0-public.json",
+  "source_commit": "711318ca8eb4361e477ea1b47f17ec84cef16421",
+  "source_commit_scope": "Selective native prefill/vision changes plus a sanitized public provider; no private Git history.",
+  "included": [
+    "codex/v1-native-provider",
+    "native-schema-and-tool-identity-bridge",
+    "incremental-responses-and-stream-progress",
+    "known-token-and-paged-prefill",
+    "dynamic-vision-memory-budget"
+  ],
+  "public_provider_differences": [
+    "loopback-only-default",
+    "activation-controls-removed",
+    "request-serialization-retained",
+    "MEDIA=1-VISION=1-required"
+  ],
+  "build_snapshot": {
+    "cuda_arch": "sm_120",
+    "vision": true,
+    "media_decoder": true,
+    "native_reference_global_fast_math": false
+  },
+  "artifact_scope": "Local build evidence only; no new binaries distributed and no GPU model inference started.",
+  "artifact_hashes": {
+    "lib/libaxiom.so": "66bb27786a0bd191601048f0d3b8e0d0694e09336739708135c9c01f3777627e",
+    "bin/axiom-qwen38-api": "4a5f17870af6b3480f20b00ae569c7805cafc461b6912af10b630f684caf21dd",
+    "bin/axiom-codex-provider-api-test": "dcec7930dc2f790f35f176ddbb4869b8c9b24480c2ad6c72a9f7512ddedf58c8"
+  },
+  "gate_results": {
+    "native_compile_link": "pass",
+    "extended_host_tests": "pass",
+    "codex_provider_header_and_native_api": "pass",
+    "stream_progress": "pass-9-cases",
+    "utf8": "pass-8-cases",
+    "native_tool_contract": "pass-17-cases",
+    "speculative_routing": "pass",
+    "vision_memory_budget": "pass-7-boundaries",
+    "dspark_layout_abi_v3": "pass",
+    "public_scan": "pass",
+    "gitleaks": "8-reviewed-false-positives-unchanged-public-identifiers",
+    "new_app_server_live_inference": "not-run",
+    "new_gpu_performance": "not-run"
+  },
+  "gitleaks_review": "GDN key-head dimensions, MTP key/value-head constants and the public model-id test string; no credentials found and no rules suppressed.",
+  "historical_benchmark": "The September 5 409.324 tok/s record is preserved in the previous manifest; it is not evidence from this public build.",
+  "exclusions": [
+    "model-weights-and-tokenizer-assets",
+    "private-history-reports-and-network-configuration",
+    "credentials-and-deployment-profiles",
+    "activation-controls-and-DFlash2"
+  ],
+  "health_snapshot": {
+    "production_modified": false,
+    "production_restarted": false,
+    "new_inference_started": false
+  }
+}

@@ -1,5 +1,14 @@
 # Public release scope
 
+## September 13 conversation reliability update
+
+Selectively imported continuity, progress, image-replay and mixed-attention
+fixes from `fffdaf0588b05589fdbeb5bdf517031d3f68f8b6`, plus regression tests and
+loopback-default, explicitly invoked live QA runners. The public build retains
+the exclusions and transport protections below. Only aggregate qualification
+evidence is published; raw conversations and internal deployment reports stay
+private. See [CONVERSATION_RELIABILITY.md](CONVERSATION_RELIABILITY.md).
+
 ## September 11 Codex integration update
 
 The follow-up selectively imports source through `711318c` onto the existing

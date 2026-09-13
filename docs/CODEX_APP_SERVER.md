@@ -1,7 +1,9 @@
 # Codex App Server and the native provider
 
 This public source includes the native Qwen3.8 HTTP provider and its
-`/codex/v1` integration, derived from source `711318c` (11 September 2026).
+`/codex/v1` integration, initially derived from source `711318c` (11 September
+2026), with [conversation reliability fixes](CONVERSATION_RELIABILITY.md)
+from `fffdaf0` (13 September 2026).
 It complements the existing DSpark/M8 kernel update; it does not replace Codex
 App Server or move tool execution into the inference server.
 

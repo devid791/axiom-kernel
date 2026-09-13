@@ -10,6 +10,8 @@
  */
 
 #include <cuda_runtime_api.h>
+#include "axiom/qwen38_prefix_reuse.hpp"
+#include "axiom/qwen38_request_progress.hpp"
 
 #include <arpa/inet.h>
 #include <algorithm>
@@ -240,12 +242,15 @@ struct generation_result {
      * a durable prefix. */
     bool session_restored = false;
     bool session_stateful_resume = false;
+    bool session_prefix_retokenized = false;
+    bool session_tool_projection = false;
 };
 
 /* Optional wire sink owned by the HTTP handler.  The native decode paths
  * stay transport-agnostic: they append each committed token to the result
  * and, when present, hand only its decoded piece to this callback. */
 struct generation_stream_sink {
+    std::shared_ptr<axiom::qwen38::request_progress> progress;
     void *user = nullptr;
     bool (*emit)(void *user, const std::string &piece) = nullptr;
     /* Polled between prefill/decode units so a cancelled HTTP client cannot
@@ -262,6 +267,9 @@ struct generation_stream_sink {
     // Provider-specific optimization opt-in; legacy callers retain their
     // existing target prefill selection.
     bool codex_target_prefill = false;
+    // Request-owned native catalog: permits ONLY reconstruction of the same
+    // Core wire projection, never approximate tail/history replacement.
+    const ajson *codex_replay_tools = nullptr;
 };
 
 bool generation_cancelled(const generation_stream_sink *sink) {
@@ -486,6 +494,7 @@ struct server_state {
     mutable std::mutex active_request_mutex;
     uint64_t active_request_sequence = 0u;
     std::string active_request_session_id;
+    std::shared_ptr<axiom::qwen38::request_progress> active_request_progress;
     axiom::qwen38::qwen38_swarm_scheduler swarm_scheduler;
     mutable std::mutex swarm_lease_mutex;
     std::unordered_map<axiom::qwen38::swarm_task_id,
@@ -910,12 +919,13 @@ struct session_activation {
     bool manifest_exists = false;
     bool restored = false;
     bool stateful_resume = false;
+    bool prefix_retokenized = false;
+    bool tool_projection = false;
     bool transaction_active = false;
     uint32_t start_position = 0u;
     uint32_t next_token = 0u;
-    /* Non-empty only when the wire history cannot reproduce the exact native
-     * assistant bytes (hidden thinking or normalized tool calls).  It starts
-     * from the durable raw prefix and appends only the new client-side tail. */
+    /* Non-empty for byte-equivalent retokenization or the separately permitted
+     * legacy stateful tail. Native prefix token IDs/state always stay intact. */
     std::vector<uint32_t> effective_prompt_ids;
 };
 
@@ -2723,6 +2733,56 @@ bool session_prompt_matches(
                     prompt_ids.begin());
 }
 
+bool project_codex_tool_prefix(server_state *state,
+        const axiom::qwen38::qwen38_session_manifest &manifest,
+        const ajson &tools, std::vector<uint32_t> *projected);
+
+bool session_equivalent_prompt(
+        server_state *state,
+        const axiom::qwen38::qwen38_session_manifest &manifest,
+        const std::vector<uint32_t> &prompt_ids, uint32_t limit,
+        std::vector<uint32_t> *effective, const ajson *codex_tools = nullptr,
+        bool *tool_projected = nullptr) {
+    if (!state || !state->tokenizer || !effective) return false;
+    effective->clear();
+    if (tool_projected) *tool_projected = false;
+    try {
+        std::array<char, 65536> piece{};
+        auto decode = [&](uint32_t id, std::string *out) {
+            uint32_t bytes = 0;
+            if (axiom_tokenizer_decode_token(state->tokenizer, id, piece.data(),
+                                             piece.size(), &bytes) != AXIOM_OK) return false;
+            out->assign(piece.data(), bytes);
+            return true;
+        };
+        size_t consumed = 0;
+        bool projected = false;
+        if (!axiom::qwen38::equivalent_prefix(manifest.token_ids,
+                manifest.committed_tokens, prompt_ids, state->tokenizer_info.vocab_size,
+                decode, &consumed)) {
+            std::vector<uint32_t> reference;
+            if (!codex_tools || !project_codex_tool_prefix(state, manifest,
+                    *codex_tools, &reference) ||
+                !axiom::qwen38::equivalent_prefix(reference, reference.size(),
+                    prompt_ids, state->tokenizer_info.vocab_size, decode, &consumed))
+                return false;
+            projected = true;
+        }
+        const uint64_t total = static_cast<uint64_t>(manifest.committed_tokens) +
+                               prompt_ids.size() - consumed;
+        if (total > limit) return false;
+        effective->reserve(static_cast<size_t>(total));
+        effective->insert(effective->end(), manifest.token_ids.begin(),
+                          manifest.token_ids.begin() + manifest.committed_tokens);
+        effective->insert(effective->end(), prompt_ids.begin() + consumed, prompt_ids.end());
+        if (tool_projected) *tool_projected = projected;
+        return true;
+    } catch (...) {
+        effective->clear();
+        return false; // Cache optimization failure must not accept a weaker match.
+    }
+}
+
 axiom::qwen38::qwen38_session_key make_session_key(
         const server_state *state,
         const std::string &session_id,
@@ -2749,7 +2809,7 @@ int activate_session(
         const bool allow_stateful_resume,
         const uint32_t resume_prompt_limit,
         session_activation *out,
-        std::string *failure_stage) {
+        std::string *failure_stage, const ajson *codex_tools = nullptr) {
     if (!state || !state->model || !state->session_store.enabled() || !out ||
         !failure_stage || !state->streaming_kv) {
         return AXIOM_ERR_INVALID_ARGUMENT;
@@ -2790,6 +2850,17 @@ int activate_session(
     bool reuse = allow_reuse && exists && session_prompt_matches(out->manifest, prompt_ids);
     bool stateful_resume = false;
     if (exists && out->manifest.committed_tokens == 0u) reuse = false;
+    if (!reuse && allow_reuse && exists && session_equivalent_prompt(
+            state, out->manifest, prompt_ids, resume_prompt_limit, &out->effective_prompt_ids,
+            codex_tools, &out->tool_projection)) {
+        reuse = true;
+        out->prefix_retokenized = true;
+        std::fprintf(stderr,
+            "axiom-qwen38-api: %s cache prefix=%u suffix=%zu\n",
+            out->tool_projection ? "codex-wire-equivalent" : "tokenization-equivalent",
+            out->manifest.committed_tokens,
+            out->effective_prompt_ids.size() - out->manifest.committed_tokens);
+    }
     /* A client transports only visible assistant content and normalized tool
      * calls.  The durable state contains the exact native bytes, including
      * hidden thinking and the model's original XML whitespace.  When exact
@@ -3806,7 +3877,25 @@ bool append_responses_input_item(
     /* Preserve structured input_text/input_image/input_video parts.  The
      * text-only normalizer used to flatten them here, making Responses vision
      * impossible before the multimodal prompt builder even ran. */
-    message.set("content", content ? *content : ajson::jnull());
+    ajson normalized_content = content ? *content : ajson::jnull();
+    // Responses clients replay our own assistant output as output_text parts.
+    // The multimodal chat builder accepts text/input_text, so canonicalize this
+    // assistant-only wire alias here while preserving every media part and
+    // annotation. Do not flatten the whole message (that would discard images).
+    if (normalized_role == "assistant" && normalized_content.is_array()) {
+        for (auto &part : normalized_content.arr) {
+            const ajson *type = part.get("type");
+            if (type && type->is_string() && type->s == "output_text") {
+                const ajson *text = part.get("text");
+                if (!text || !text->is_string()) {
+                    *error = "Responses output_text parts require string text";
+                    return false;
+                }
+                part.set("type", ajson::jstr("text"));
+            }
+        }
+    }
+    message.set("content", std::move(normalized_content));
     messages->push(std::move(message));
     return true;
 }
@@ -5877,6 +5966,83 @@ bool make_chat_ids(
     return !out->empty();
 }
 
+// Reconstruct exactly what the Responses adapter exposes to Core: a native
+// assistant turn may emit a text item and multiple separate function_call
+// items. Core replays each as its own assistant turn. Transform ONLY the saved
+// reference for comparison; all native token IDs/KV/recurrent state stay intact.
+// Incoming history is never canonicalized, trimmed, reordered or skipped.
+bool project_codex_tool_prefix(server_state *state,
+        const axiom::qwen38::qwen38_session_manifest &manifest,
+        const ajson &tools, std::vector<uint32_t> *projected) {
+    if (!state || !state->tokenizer || !projected || !tools.is_array() ||
+        tools.arr.empty() || !manifest.committed_tokens ||
+        manifest.committed_tokens > manifest.token_ids.size()) return false;
+    projected->clear();
+    const auto &ids = manifest.token_ids;
+    const size_t committed = manifest.committed_tokens;
+    const auto start_id = state->tokenizer_info.im_start_token_id;
+    const auto end_id = state->tokenizer_info.im_end_token_id;
+    const std::string assistant_header = std::string("assistant\n") + kNoThinkingPrefix;
+    std::string decoded(4u << 20, '\0');
+    size_t total_bytes = 0;
+    bool changed = false;
+    for (size_t start = 0; start < committed;) {
+        if (ids[start] != start_id) return false;
+        size_t end = start + 1;
+        while (end < committed && ids[end] != end_id) {
+            if (ids[end] == start_id) return false; // Not an actual ChatML turn.
+            ++end;
+        }
+        const bool closed = end < committed;
+        const size_t next = end + (closed ? 1 : 0);
+        uint32_t bytes = 0;
+        if (axiom_tokenizer_decode_ids(state->tokenizer, ids.data() + start + 1,
+                end - start - 1, decoded.data(), decoded.size(), &bytes) != AXIOM_OK)
+            return false;
+        total_bytes += bytes;
+        if (total_bytes > (64u << 20)) return false;
+        const std::string body(decoded.data(), bytes);
+        const auto retain = [&] {
+            projected->insert(projected->end(), ids.begin() + start, ids.begin() + next);
+        };
+        if (body.compare(0, assistant_header.size(), assistant_header) != 0 ||
+            body.find("<tool_call>", assistant_header.size()) == std::string::npos) {
+            retain(); start = next; continue;
+        }
+        // The encoder accepts C strings. Never let a NUL truncate a projected
+        // tool argument into an apparently matching shorter wire reference.
+        if (body.find('\0') != std::string::npos) return false;
+        const auto parsed = parse_native_tool_calls(body.substr(assistant_header.size()), tools);
+        if (parsed.status != "pass" || parsed.calls.empty()) return false;
+        // These are the same parser/renderer used on the outbound/inbound
+        // protocol paths. String parameter bytes remain opaque after that
+        // outbound parse; a later incoming edit cannot pass the prefix proof.
+        std::vector<std::string> parts;
+        if (!parsed.content.empty()) parts.push_back(parsed.content);
+        for (const auto &call : parsed.calls) {
+            const auto text = native_tool_call_text(call);
+            if (text.empty()) return false;
+            parts.push_back(text);
+        }
+        std::vector<uint32_t> projected_turn;
+        for (size_t part = 0; part < parts.size(); ++part) {
+            projected_turn.push_back(start_id);
+            if (append_text_ids(state, assistant_header + parts[part], &projected_turn) != AXIOM_OK)
+                return false;
+            // A manifest may end BEFORE the final im_end (the predicted EOS
+            // is not committed). Leave it in the incoming suffix so the real
+            // native state consumes it exactly once on resumption.
+            if (part + 1 < parts.size() || closed) projected_turn.push_back(end_id);
+        }
+        changed |= projected_turn.size() != next - start ||
+                !std::equal(projected_turn.begin(), projected_turn.end(), ids.begin() + start);
+        projected->insert(projected->end(), projected_turn.begin(), projected_turn.end());
+        if (projected->size() > state->max_context) return false;
+        start = next;
+    }
+    return changed;
+}
+
 bool vision_part_type(const std::string &type) {
     return type == "image" || type == "image_url" || type == "input_image" ||
             type == "video" || type == "video_url" || type == "input_video";
@@ -6855,6 +7021,7 @@ int append_generated_token(
         return AXIOM_ERR_IO;
     }
     out->ids.push_back(token);
+    if (sink && sink->progress) sink->progress->decode(static_cast<uint32_t>(out->ids.size()));
     if (!sink || !sink->emit) return AXIOM_OK;
 
     char piece[65536]{};
@@ -7068,7 +7235,7 @@ int native_generate_streaming(
         rc = activate_session(
                 state, session_id, profile, prompt_ids, session_suffix_ids,
                 true, !vision_owner, allow_stateful_resume, resume_prompt_limit,
-                &activation, failure_stage);
+                &activation, failure_stage, sink ? sink->codex_replay_tools : nullptr);
     } else {
         *failure_stage = "target_reset";
         if (state->kv_tier) rc = axiom_qwen38_kv_tier_reset(state->kv_tier);
@@ -7088,6 +7255,8 @@ int native_generate_streaming(
     }
     out->session_restored = persistent_session && activation.restored;
     out->session_stateful_resume = persistent_session && activation.stateful_resume;
+    out->session_prefix_retokenized = persistent_session && activation.prefix_retokenized;
+    out->session_tool_projection = persistent_session && activation.tool_projection;
 
     uint32_t anchor = 0u;
     float anchor_logit = 0.0f;
@@ -7121,6 +7290,9 @@ int native_generate_streaming(
         size_t next_trace = prefill_start;
         size_t m8_prompt_tokens = 0u;
         for (size_t index = prefill_start; index < model_prompt_ids.size(); ++index) {
+            if (sink && sink->progress) sink->progress->prefill(
+                    static_cast<uint32_t>(prefill_start), static_cast<uint32_t>(index),
+                    static_cast<uint32_t>(model_prompt_ids.size()));
             if (trace_prefill && index >= next_trace) {
                 std::fprintf(stderr, "axiom-target-prefill: session=%s path=%s position=%zu total=%zu m8=%zu elapsed_s=%.6f\n",
                         session_id.c_str(), out->decode_path.c_str(), index,
@@ -7238,6 +7410,12 @@ int native_generate_streaming(
         (void)axiom_qwen38_model_reset(state->model);
         return rc;
     }
+        if (sink && sink->progress) {
+            sink->progress->prefill(static_cast<uint32_t>(prefill_start),
+                    static_cast<uint32_t>(model_prompt_ids.size()),
+                    static_cast<uint32_t>(model_prompt_ids.size()));
+            sink->progress->decode(0u);
+        }
         const auto prefill_end = std::chrono::steady_clock::now();
         out->prefill_seconds =
                 std::chrono::duration<double>(prefill_end - prefill_begin).count();
@@ -7506,7 +7684,7 @@ int native_generate(
         rc = activate_session(
                 state, session_id, profile, prompt_ids, session_suffix_ids,
                 false, !vision_owner, allow_stateful_resume, resume_prompt_limit,
-                &activation, failure_stage);
+                &activation, failure_stage, sink ? sink->codex_replay_tools : nullptr);
     } else if (rc == AXIOM_OK) {
         *failure_stage = "target_reset";
         if (state->kv_tier) rc = axiom_qwen38_kv_tier_reset(state->kv_tier);
@@ -7525,6 +7703,8 @@ int native_generate(
     }
     out->session_restored = persistent_session && activation.restored;
     out->session_stateful_resume = persistent_session && activation.stateful_resume;
+    out->session_prefix_retokenized = persistent_session && activation.prefix_retokenized;
+    out->session_tool_projection = persistent_session && activation.tool_projection;
     if (rc == AXIOM_OK &&
         (activation.start_position > graph_context ||
          static_cast<uint64_t>(model_prompt_ids.size()) +
@@ -7594,6 +7774,8 @@ int native_generate(
     uint32_t graph_prompt_tokens = 0u;
     for (uint32_t index = activation.start_position;
          index < model_prompt_ids.size() && rc == AXIOM_OK;) {
+        if (sink && sink->progress) sink->progress->prefill(activation.start_position,
+                index, static_cast<uint32_t>(model_prompt_ids.size()));
         if (generation_cancelled(sink)) {
             *failure_stage = "client_disconnect";
             rc = AXIOM_ERR_IO;
@@ -7765,6 +7947,12 @@ int native_generate(
                 static_cast<uint32_t>(model_prompt_ids.size()), failure_stage);
     }
 
+    if (rc == AXIOM_OK && sink && sink->progress) {
+        sink->progress->prefill(activation.start_position,
+                static_cast<uint32_t>(model_prompt_ids.size()),
+                static_cast<uint32_t>(model_prompt_ids.size()));
+        sink->progress->decode(0u);
+    }
     const auto prefill_end = std::chrono::steady_clock::now();
     out->prefill_seconds =
             std::chrono::duration<double>(prefill_end - prefill_begin).count();
@@ -8608,6 +8796,7 @@ int native_generate_with_thinking(
     }
     const uint32_t visible_budget = plan.visible_budget - visible_already;
     generation_result visible;
+    if (sink && sink->progress) sink->progress->next_pass();
     rc = native_generate(
             state, continuation, visible_budget, session_id, profile,
             nullptr, false, nullptr,
@@ -8855,6 +9044,8 @@ ajson models_response(const server_state *state, bool client_tool_search = false
 
 const char *session_resume_mode(const generation_result &result) {
     if (!result.session_restored) return "none";
+    if (result.session_tool_projection) return "codex_wire_equivalent_prefix";
+    if (result.session_prefix_retokenized) return "tokenization_equivalent_prefix";
     return result.session_stateful_resume ? "stateful_tail" : "exact_prefix";
 }
 
@@ -9500,6 +9691,8 @@ struct swarm_request_guard {
 struct active_request_guard {
     server_state *state = nullptr;
     uint64_t sequence = 0u;
+    std::shared_ptr<axiom::qwen38::request_progress> progress =
+            std::make_shared<axiom::qwen38::request_progress>();
 
     active_request_guard(
             server_state *selected_state, const uint64_t selected_sequence,
@@ -9509,6 +9702,7 @@ struct active_request_guard {
         std::lock_guard<std::mutex> lock(state->active_request_mutex);
         state->active_request_sequence = sequence;
         state->active_request_session_id = session_id;
+        state->active_request_progress = progress;
     }
 
     ~active_request_guard() {
@@ -9521,6 +9715,7 @@ struct active_request_guard {
             if (state->active_request_sequence == sequence) {
                 state->active_request_sequence = 0u;
                 state->active_request_session_id.clear();
+                state->active_request_progress.reset();
                 cleared = true;
             }
         }
@@ -9741,6 +9936,7 @@ void close_live_chat_stream(live_chat_stream *stream) {
 }
 
 struct live_responses_stream {
+    std::shared_ptr<axiom::qwen38::request_progress> progress;
     const axiom_codex::tool_wire_map *codex_wire = nullptr;
     int fd = -1;
     uint64_t sequence_number = 0u;
@@ -9756,6 +9952,26 @@ struct live_responses_stream {
     bool io_failed = false;
 };
 
+ajson request_progress_json(const std::shared_ptr<axiom::qwen38::request_progress> &progress) {
+    if (!progress) return ajson::jnull();
+    const auto value = progress->read();
+    using phase = axiom::qwen38::request_progress::phase;
+    ajson result = ajson::jobj();
+    result.set("scope", ajson::jstr("current_request_observed_work_not_durable_commit"));
+    result.set("phase", ajson::jstr(value.stage == phase::prefill ? "prefill" :
+            value.stage == phase::decode ? "decode" : "session_setup"));
+    result.set("cached_tokens", ajson::jint(value.cached_tokens));
+    result.set("prompt_tokens", ajson::jint(value.prompt_tokens));
+    result.set("prefill_tokens_processed", ajson::jint(value.processed_tokens));
+    result.set("prefill_tokens_total", ajson::jint(value.prompt_tokens - value.cached_tokens));
+    result.set("generated_tokens", ajson::jint(value.generated_tokens));
+    result.set("pass", ajson::jint(value.pass));
+    result.set("revision", ajson::jint(static_cast<long long>(value.revision)));
+    result.set("elapsed_seconds", ajson::jnum(value.elapsed_seconds));
+    result.set("seconds_since_advance", ajson::jnum(value.seconds_since_advance));
+    return result;
+}
+
 ajson live_responses_stub(const live_responses_stream *stream) {
     ajson response = ajson::jobj();
     response.set("id", ajson::jstr(stream ? stream->response_id : "resp-axiom"));
@@ -9768,6 +9984,7 @@ ajson live_responses_stub(const live_responses_stream *stream) {
     response.set("parallel_tool_calls", ajson::jbool(true));
     ajson axiom = ajson::jobj();
     axiom.set("session_id", ajson::jstr(stream ? stream->session_id : ""));
+    if (stream && stream->progress) axiom.set("progress", request_progress_json(stream->progress));
     response.set("axiom", std::move(axiom));
     return response;
 }
@@ -9788,7 +10005,8 @@ bool live_responses_send_event(
     const bool sent = write_http_chunk(stream->fd, body);
     if (!sent) stream->io_failed = true;
     if (sent && (std::strcmp(event_type, "response.completed") == 0 ||
-                 std::strcmp(event_type, "response.failed") == 0)) {
+                 std::strcmp(event_type, "response.failed") == 0 ||
+                 std::strcmp(event_type, "response.incomplete") == 0)) {
         stream->terminal_sent = true;
     }
     return sent;
@@ -9880,7 +10098,7 @@ bool live_responses_progress(void *user) {
 }
 
 bool live_responses_finish_message(
-        live_responses_stream *stream, const std::string &text) {
+        live_responses_stream *stream, const std::string &text, bool incomplete = false) {
     if (!stream || !stream->open || !stream->message_started) return true;
     ajson done = ajson::jobj();
     done.set("item_id", ajson::jstr(stream->message_id));
@@ -9905,7 +10123,7 @@ bool live_responses_finish_message(
     ajson item = ajson::jobj();
     item.set("id", ajson::jstr(stream->message_id));
     item.set("type", ajson::jstr("message"));
-    item.set("status", ajson::jstr("completed"));
+    item.set("status", ajson::jstr(incomplete ? "incomplete" : "completed"));
     item.set("role", ajson::jstr("assistant"));
     ajson content = ajson::jarr();
     ajson final_part = ajson::jobj();
@@ -10057,6 +10275,26 @@ bool live_responses_send_error(
             stream, "error", error_json(message, "server_error"));
 }
 
+const char *codex_response_status(const generation_result &result,
+        bool have_tool_calls, const std::string &visible) {
+    if (result.finish_reason == "length") return "incomplete";
+    return !have_tool_calls && trim_text(visible).empty() ? "failed" : "completed";
+}
+
+void apply_codex_response_status(ajson *response, const char *status) {
+    response->set("status", ajson::jstr(status));
+    if (std::strcmp(status, "incomplete") == 0) {
+        ajson details = ajson::jobj();
+        details.set("reason", ajson::jstr("max_output_tokens"));
+        response->set("incomplete_details", std::move(details));
+    } else if (std::strcmp(status, "failed") == 0) {
+        ajson error = ajson::jobj();
+        error.set("code", ajson::jstr("empty_model_response"));
+        error.set("message", ajson::jstr("The model stopped without visible text or a tool call"));
+        response->set("error", std::move(error));
+    }
+}
+
 bool finish_live_responses_stream(
         live_responses_stream *stream,
         const ajson &response,
@@ -10086,16 +10324,20 @@ bool finish_live_responses_stream(
             return false;
         }
     }
+    const char *terminal_status = stream->codex_wire
+            ? codex_response_status(result, have_tool_calls, stream->raw_text) : "completed";
+    const bool successful = std::strcmp(terminal_status, "completed") == 0;
     if (!live_responses_flush_text(stream, true)) return false;
-    if (!live_responses_finish_message(stream, stream->raw_text)) return false;
+    if (!live_responses_finish_message(stream, stream->raw_text, !successful)) return false;
     const uint32_t output_index_start = stream->message_started ? 1u : 0u;
-    if (have_tool_calls && !live_responses_send_tool_calls(
+    if (have_tool_calls && successful && !live_responses_send_tool_calls(
             stream, tool_result->calls, normalized_tools, output_index_start)) return false;
 
     ajson completed = ajson::jobj();
     ajson final_response = response;
     final_response.set("created_at", ajson::jint(stream->created_at));
     if (stream->codex_wire) {
+        apply_codex_response_status(&final_response, terminal_status);
         // Construct final text from the same accumulator that supplied deltas.
         // Tool items remain opaque; item IDs/call IDs are not reconstructed.
         final_response.set("output_text", ajson::jstr(stream->raw_text));
@@ -10105,16 +10347,17 @@ bool finish_live_responses_stream(
             part.set("type", ajson::jstr("output_text")); part.set("text", ajson::jstr(stream->raw_text));
             part.set("annotations", ajson::jarr()); content.push(std::move(part));
             message.set("id", ajson::jstr(stream->message_id)); message.set("type", ajson::jstr("message"));
-            message.set("status", ajson::jstr("completed")); message.set("role", ajson::jstr("assistant"));
+            message.set("status", ajson::jstr(successful ? "completed" : "incomplete")); message.set("role", ajson::jstr("assistant"));
             message.set("content", std::move(content)); output.push(std::move(message));
         }
-        if (const auto *items = response.get("output")) for (const auto &item : items->arr)
+        if (const auto *items = response.get("output"); successful && items) for (const auto &item : items->arr)
             if (axiom_codex::string_field(item, "type") != "message") output.push(item);
         final_response.set("output", std::move(output));
     }
     completed.set("response", std::move(final_response));
-    if (!live_responses_send_event(
-            stream, "response.completed", std::move(completed))) return false;
+    const char *terminal_event = successful ? "response.completed" :
+            std::strcmp(terminal_status, "incomplete") == 0 ? "response.incomplete" : "response.failed";
+    if (!live_responses_send_event(stream, terminal_event, std::move(completed))) return false;
     if (!write_http_chunk(stream->fd, "data: [DONE]\n\n")) {
         stream->io_failed = true;
         return false;
@@ -10416,11 +10659,14 @@ ajson responses_response(
         const generation_result &result, uint64_t sequence,
         const std::string &reasoning_effort,
         const ajson *normalized_tools,
-        const native_tool_result *tool_result = nullptr) {
+        const native_tool_result *tool_result = nullptr, bool codex_provider = false) {
     const bool have_tool_calls = tool_result && tool_result->status == "pass" &&
             !tool_result->calls.empty();
     const std::string text = tool_result && tool_result->status == "pass"
             ? tool_result->content : visible_model_text(result.text);
+    const char *terminal_status = codex_provider
+            ? codex_response_status(result, have_tool_calls, text) : "completed";
+    const bool successful = std::strcmp(terminal_status, "completed") == 0;
     char message_id[64]{};
     std::snprintf(message_id, sizeof(message_id), "msg-axiom-%llu",
                   static_cast<unsigned long long>(sequence));
@@ -10433,14 +10679,14 @@ ajson responses_response(
         ajson message = ajson::jobj();
         message.set("id", ajson::jstr(message_id));
         message.set("type", ajson::jstr("message"));
-        message.set("status", ajson::jstr("completed"));
+        message.set("status", ajson::jstr(successful ? "completed" : "incomplete"));
         message.set("role", ajson::jstr("assistant"));
         ajson content = ajson::jarr();
         content.push(std::move(text_content));
         message.set("content", std::move(content));
         output.push(std::move(message));
     }
-    if (have_tool_calls) {
+    if (have_tool_calls && successful) {
         for (const ajson &call : tool_result->calls) {
             const ajson *function = call.get("function");
             const ajson *name = function && function->is_object() ? function->get("name") : nullptr;
@@ -10496,6 +10742,7 @@ ajson responses_response(
     root.set("object", ajson::jstr("response"));
     root.set("created_at", ajson::jint(static_cast<long long>(std::time(nullptr))));
     root.set("status", ajson::jstr("completed"));
+    if (codex_provider) apply_codex_response_status(&root, terminal_status);
     root.set("model", ajson::jstr(kModelId));
     root.set("output", std::move(output));
     root.set("output_text", ajson::jstr(text));
@@ -10868,10 +11115,12 @@ ajson ops_runtime_status(const server_state *state) {
     const session_status_snapshot session = capture_session_status(state);
     uint64_t active_request_sequence = 0u;
     std::string active_request_session_id;
+    std::shared_ptr<axiom::qwen38::request_progress> progress;
     if (state) {
         std::lock_guard<std::mutex> lock(state->active_request_mutex);
         active_request_sequence = state->active_request_sequence;
         active_request_session_id = state->active_request_session_id;
+        progress = state->active_request_progress;
     }
     root.set("schema", ajson::jstr("axiom_runtime_status_v1"));
     root.set("persistence_last_job", persistence_profile_snapshot(state));
@@ -10896,6 +11145,7 @@ ajson ops_runtime_status(const server_state *state) {
             ? static_cast<long long>(state->session_leases_peak.load()) : 0ll));
     root.set("generation_scheduler", ajson::jstr("swarm_queue_serialized_native_model"));
     root.set("generation_busy", ajson::jbool(active_request_sequence != 0u));
+    root.set("active_request_progress", request_progress_json(progress));
     if (active_request_sequence != 0u) {
         root.set("active_request_sequence", ajson::jint(
                 static_cast<long long>(active_request_sequence)));
@@ -11789,8 +12039,9 @@ void handle_client(int fd, server_state *state) {
         return;
     }
     const bool codex_provider = request.path == "/codex/v1/responses";
-    // An absent deadline must not mean an unbounded Codex turn. This is a
-    // cooperative deadline, checked between native steps, NOT GPU preemption.
+    // Only an explicit request/operator policy installs a total deadline.
+    // Slow but advancing prefill must not be cancelled by an implicit 600s cap.
+    // Cancellation remains cooperative between native steps, NOT GPU preemption.
     if (codex_provider && !swarm_metadata.deadline) {
         uint64_t deadline_ms = 0;
         if (!axiom_codex::request_deadline_ms(std::getenv("AXIOM_CODEX_REQUEST_DEADLINE_MS"), &deadline_ms)) {
@@ -11799,7 +12050,7 @@ void handle_client(int fd, server_state *state) {
                     "invalid_codex_bridge_configuration")));
             return;
         }
-        swarm_metadata.deadline = std::chrono::milliseconds(deadline_ms);
+        if (deadline_ms != 0u) swarm_metadata.deadline = std::chrono::milliseconds(deadline_ms);
     }
     const bool responses_api = request.path == "/v1/responses" || codex_provider;
     axiom_codex::tool_wire_map codex_wire;
@@ -12021,7 +12272,10 @@ void handle_client(int fd, server_state *state) {
         cancel_probe.deadline = swarm_context.submitted_at + *swarm_metadata.deadline;
     }
     generation_stream_sink stream_sink;
+    stream_sink.progress = active_guard.progress;
     stream_sink.codex_target_prefill = codex_provider;
+    if (codex_provider && no_think && !context_compacted)
+        stream_sink.codex_replay_tools = &normalized_tools;
     stream_sink.user = &cancel_probe;
     stream_sink.cancelled = &http_client_cancelled;
     stream_sink.cancel_user = &cancel_probe;
@@ -12048,6 +12302,7 @@ void handle_client(int fd, server_state *state) {
             return;
         }
         stream_sink.user = &responses_stream;
+        responses_stream.progress = active_guard.progress;
         stream_sink.emit = &live_responses_emit_token;
         stream_cancel.stream_open = &responses_stream.open;
         stream_cancel.http = &cancel_probe;
@@ -12244,7 +12499,7 @@ void handle_client(int fd, server_state *state) {
             ? responses_response(result, response_sequence,
                                  effective_reasoning_effort(state, payload),
                                  &normalized_tools,
-                                 tools_enabled ? &tool_result : nullptr)
+                                 tools_enabled ? &tool_result : nullptr, codex_provider)
             : anthropic
             ? anthropic_response(result, response_sequence,
                                  tools_enabled ? &tool_result : nullptr)
@@ -12252,14 +12507,20 @@ void handle_client(int fd, server_state *state) {
                                   tools_enabled ? &tool_result : nullptr);
     attach_swarm_response(
             &response, swarm_context, axiom::qwen38::swarm_clock::now());
+    const std::string response_status = codex_provider
+            ? axiom_codex::string_field(response, "status") : "completed";
+    const auto response_outcome = response_status == "incomplete"
+            ? axiom::qwen38::swarm_task_outcome::budget_exhausted
+            : response_status == "failed" ? axiom::qwen38::swarm_task_outcome::failed
+            : axiom::qwen38::swarm_task_outcome::succeeded;
     if (live_responses_stream_requested) {
         const bool sent = finish_live_responses_stream(
                 &responses_stream, response, result,
                 tools_enabled ? &tool_result : nullptr, &normalized_tools);
         swarm_guard.finish(
-                sent ? axiom::qwen38::swarm_task_outcome::succeeded
+                sent ? response_outcome
                      : axiom::qwen38::swarm_task_outcome::cancelled,
-                result.ids.size(), sent ? "completed" : "client_disconnect");
+                result.ids.size(), sent ? response_status.c_str() : "client_disconnect");
         if (!sent) {
             close_live_responses_stream(&responses_stream);
         }
@@ -12268,8 +12529,7 @@ void handle_client(int fd, server_state *state) {
     if (codex_provider) codex_wire.restore(response);
     send_session_response(fd, 200, ajson_dumps(response), session_id);
     swarm_guard.finish(
-            axiom::qwen38::swarm_task_outcome::succeeded,
-            result.ids.size(), "completed");
+            response_outcome, result.ids.size(), response_status.c_str());
 }
 
 int open_listener(const listen_spec &spec) {
@@ -12331,7 +12591,7 @@ int run_stream_progress_self_test() {
     const auto finish = [&](const char *failure) {
         if (pair[0] >= 0) close(pair[0]);
         if (pair[1] >= 0) close(pair[1]);
-        std::printf("SSE_PROGRESS_TEST %s%s\n", failure ? "FAIL " : "PASS cases=9 ", failure ? failure : "");
+        std::printf("SSE_PROGRESS_TEST %s%s\n", failure ? "FAIL " : "PASS cases=13 ", failure ? failure : "");
         return failure ? 1 : 0;
     };
     const auto read_wire = [&]() {
@@ -12347,6 +12607,9 @@ int run_stream_progress_self_test() {
     live_responses_stream stream;
     if (!start_live_responses_stream(&stream, pair[0], 42, "qa-progress")) return finish("start");
     const auto initial_wire = read_wire();
+    stream.progress = std::make_shared<axiom::qwen38::request_progress>();
+    if (!stream.progress->prefill(55503u, 65536u, 68575u)) return finish("observed-progress-fixture");
+    const auto observed = stream.progress->read();
     const std::string stamp = "\"created_at\":" + std::to_string(stream.created_at);
     if (initial_wire.find(stamp) == std::string::npos) return finish("initial-timestamp");
     http_cancel_probe http;
@@ -12361,6 +12624,10 @@ int run_stream_progress_self_test() {
     if (live_generation_cancelled_at(&probe, zero + std::chrono::seconds(14)) || !read_wire().empty()) return finish("early-write");
     if (live_generation_cancelled_at(&probe, zero + std::chrono::seconds(15))) return finish("progress");
     const auto wire = read_wire();
+    if (wire.find("\"prefill_tokens_processed\":10033") == std::string::npos ||
+        wire.find("\"prefill_tokens_total\":13072") == std::string::npos ||
+        wire.find("\"cached_tokens\":55503") == std::string::npos ||
+        stream.progress->read().revision != observed.revision) return finish("heartbeat-must-not-invent-progress");
     if (wire.find("event: response.in_progress\n") == std::string::npos ||
         wire.find("resp-axiom-42") == std::string::npos || wire.find(stamp) == std::string::npos || wire.find("\"sequence_number\":2") == std::string::npos ||
         wire.find("output_text.delta") != std::string::npos || stream.message_started || !stream.raw_text.empty()) return finish("identity-or-fake-output");
@@ -12380,6 +12647,15 @@ int run_stream_progress_self_test() {
     if (!live_generation_cancelled_at(&probe, zero + std::chrono::seconds(105)) || !read_wire().empty()) return finish("real-write-failure-latched");
     close(pair[1]); pair[1] = -1;
     if (!live_generation_cancelled_at(&probe, zero + std::chrono::seconds(120))) return finish("disconnect");
+    server_state state;
+    auto old = std::make_unique<active_request_guard>(&state, 100u, "old");
+    old->progress->prefill(10, 15, 20);
+    auto successor = std::make_unique<active_request_guard>(&state, 101u, "new");
+    old.reset();
+    if (state.active_request_sequence != 101u || state.active_request_progress != successor->progress ||
+        state.active_request_progress->read().revision != 0u) return finish("successor-isolation");
+    successor.reset();
+    if (state.active_request_progress || state.active_request_sequence != 0u) return finish("idle-clears-progress");
     return finish(nullptr);
 }
 

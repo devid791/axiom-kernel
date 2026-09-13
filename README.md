@@ -51,6 +51,10 @@ boundary and maturity of each public integration.
 
 The public source now includes the `/codex/v1` provider bridge, subsequent
 known-token/paged prefill improvements and dynamic vision memory budgeting.
+The September 13 [conversation reliability update](docs/CONVERSATION_RELIABILITY.md)
+adds safe text/tool cache continuation, opt-in mixed resident/cold attention,
+observed request progress and image-history replay fixes. The report separates
+verified scenarios from remaining gaps, including multimodal KV reuse.
 See [Codex App Server integration](docs/CODEX_APP_SERVER.md) for build commands,
 route distinctions and exact qualification limits. Authentication, tool execution
 policy and network exposure remain separately audited application responsibilities.

@@ -9,10 +9,13 @@
 #include <stdexcept>
 
 namespace axiom_codex {
-// Optional finite bridge budget for unusually large inline catalogs. Explicit
-// per-request deadlines remain authoritative. Legacy endpoints never use it.
+// An unconfigured bridge must not interrupt a healthy long-context prefill at
+// an invented wall-clock deadline. Zero denotes ABSENT configuration only;
+// explicit operator/per-request deadlines remain finite and authoritative.
+// Disconnect/cancellation and token/context limits remain independently active.
 inline bool request_deadline_ms(const char *configured, uint64_t *out) {
-    *out = 600000u;
+    if (!out) return false;
+    *out = 0u;
     if (!configured || !*configured) return true;
     uint64_t value = 0;
     for (const char *p = configured; *p; ++p) {

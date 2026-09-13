@@ -30,6 +30,7 @@
 #include "axiom/qwen38_flashinfer.h"
 #include "axiom/qwen38_fp8.h"
 #include "axiom/qwen38_kv_tier.h"
+#include "axiom/qwen38_mixed_kv.hpp"
 
 namespace {
 
@@ -571,7 +572,8 @@ __global__ void qwen38_attention_core_gqa_splitk8_kernel(
         const uint32_t *__restrict__ base_position_device,
         uint32_t max_context,
         const uint8_t *const *__restrict__ page_table = nullptr,
-        uint32_t hot_pages = 0u) {
+        uint32_t hot_pages = 0u,
+        uint32_t paged_token_offset = 0u) {
     const uint32_t kv_head = blockIdx.x;
     const uint32_t row = blockIdx.y;
     const uint32_t split = blockIdx.z;
@@ -625,7 +627,7 @@ __global__ void qwen38_attention_core_gqa_splitk8_kernel(
                     (static_cast<uint64_t>(tile_begin + tile_token) * kKvHeads + kv_head) *
                     kHeadDim + dim;
             if constexpr (kPaged) {
-                const uint32_t token = tile_begin + tile_token;
+                const uint32_t token = paged_token_offset + tile_begin + tile_token;
                 const uint8_t *page = page_table[(token / AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS) % hot_pages];
                 const uint64_t offset = (static_cast<uint64_t>(token % AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS) * kKvHeads + kv_head) * kHeadDim + dim;
                 tile_k[index] = qwen38_kv_decode_e4m3fn_scale1(page[offset]);
@@ -1579,6 +1581,7 @@ __global__ void qwen38_stream_reference_hot_pages_kernel(
 /* Merge the split-K result for one resident page into the chronological
  * online-softmax state.  Each GQA warp owns one query head; distinct KV heads
  * write disjoint portions of the state, so no atomics are needed. */
+template <bool kScalarPaged = false>
 __global__ void qwen38_stream_accumulate_page_kernel(
         const float *__restrict__ split_values,
         const float *__restrict__ split_maxima,
@@ -1599,9 +1602,11 @@ __global__ void qwen38_stream_accumulate_page_kernel(
     }
     float maximum = maxima[query_head];
     float denominator = denominators[query_head];
-    for (uint32_t split = 0u; split < kAttentionSplitK; ++split) {
+    for (uint32_t split = 0u; split < (kScalarPaged ? kBatch * kAttentionSplitK : kAttentionSplitK); ++split) {
+        const uint32_t stats_row = kScalarPaged ? split / kAttentionSplitK : 0u;
+        const uint32_t stats_split = kScalarPaged ? split % kAttentionSplitK : split;
         const uint64_t stats_index = qwen38_attention_split_stats_index(
-                0u, kv_head, split, warp);
+                stats_row, kv_head, stats_split, warp);
         const float partial_denominator = split_denominators[stats_index];
         if (partial_denominator == 0.0f) continue;
         const float partial_maximum = split_maxima[stats_index];
@@ -1613,7 +1618,7 @@ __global__ void qwen38_stream_accumulate_page_kernel(
         for (uint32_t part = 0u; part < kHeadDim / 32u; ++part) {
             const uint32_t dim = lane + part * 32u;
             const float partial = split_values[qwen38_attention_split_value_index(
-                    0u, kv_head, split, warp, dim)];
+                    stats_row, kv_head, stats_split, warp, dim)];
             accumulators[part] = fmaf(
                     partial_correction, partial, accumulators[part] * correction);
         }
@@ -2743,9 +2748,14 @@ int forward_streaming_kv(
                 static_cast<float *>(stream_maxima), static_cast<float *>(stream_denominators),
                 static_cast<float *>(stream_values));
         if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-        const bool streaming_fast = env_enabled("AXIOM_QWEN38_KV_STREAMING_FAST");
+        const bool mixed_split = env_enabled("AXIOM_QWEN38_KV_MIXED_SPLIT64");
+        const uint32_t resident_begin = mixed_split
+                ? axiom_qwen38::resident_suffix_begin(layer->stream_current_page,
+                        layer->stream_hot_pages, layer->stream_hot_page_ids)
+                : page_count;
+        const bool streaming_fast = mixed_split || env_enabled("AXIOM_QWEN38_KV_STREAMING_FAST");
         for (uint32_t logical_page = 0u;
-             logical_page <= layer->stream_current_page; ++logical_page) {
+             logical_page < resident_begin; ++logical_page) {
             const uint8_t *page = static_cast<const uint8_t *>(current_page);
             uint32_t page_tokens = AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
             if (logical_page == layer->stream_current_page) {
@@ -2763,19 +2773,31 @@ int forward_streaming_kv(
                         static_cast<float *>(stream_denominators),
                         static_cast<float *>(stream_values));
             } else {
-                cudaError_t clear_split_status = cudaMemset(
+                if (mixed_split) {
+                    // All eight state slots are written, including empty splits;
+                    // no synchronous workspace memset is needed for this path.
+                    qwen38_attention_core_gqa_splitk8_kernel<false, kAttentionSplitK><<<
+                            dim3(kKvHeads, 1u, kAttentionSplitK), kAttentionThreads>>>(
+                            static_cast<const float *>(q), page,
+                            page + AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES / 2u,
+                            static_cast<float *>(split_values), static_cast<float *>(split_maxima),
+                            static_cast<float *>(split_denominators), page_tokens, 0u, nullptr,
+                            AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS);
+                } else {
+                    cudaError_t clear_split_status = cudaMemset(
                         split_denominators, 0,
                         static_cast<size_t>(kBatch) * kHeads * kAttentionSplitK * sizeof(float));
-                if (clear_split_status != cudaSuccess) return cuda_status(clear_split_status);
-                qwen38_attention_core_gqa_splitk8_kernel<false, 1u><<<
+                    if (clear_split_status != cudaSuccess) return cuda_status(clear_split_status);
+                    qwen38_attention_core_gqa_splitk8_kernel<false, 1u><<<
                         dim3(kKvHeads, 1u, 1u), kAttentionThreads>>>(
                         static_cast<const float *>(q), page,
                         page + AXIOM_QWEN38_ATTENTION_KV_PAGE_BYTES / 2u,
                         static_cast<float *>(split_values), static_cast<float *>(split_maxima),
                         static_cast<float *>(split_denominators), page_tokens, 0u, nullptr,
                         AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS);
+                }
                 if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
-                qwen38_stream_accumulate_page_kernel<<<kKvHeads, kAttentionThreads>>>(
+                qwen38_stream_accumulate_page_kernel<><<<kKvHeads, kAttentionThreads>>>(
                         static_cast<const float *>(split_values),
                         static_cast<const float *>(split_maxima),
                         static_cast<const float *>(split_denominators),
@@ -2783,6 +2805,30 @@ int forward_streaming_kv(
                         static_cast<float *>(stream_denominators),
                         static_cast<float *>(stream_values));
             }
+            if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+        }
+        if (resident_begin < page_count) {
+            // Cascade attention: merge cold-page states with one split-K pass
+            // over the VERIFIED resident suffix. Never drop old pages or
+            // normalize/round a partial attention output before merging it.
+            void *table = nullptr;
+            rc = buffer_pointer(layer->stream_hot_page_table, &table);
+            if (rc != AXIOM_OK) return rc;
+            const uint32_t offset = resident_begin * AXIOM_QWEN38_ATTENTION_KV_PAGE_TOKENS;
+            const uint32_t count = layer->position + 1u - offset;
+            qwen38_attention_core_gqa_splitk8_kernel<false, kBatch * kAttentionSplitK, true><<<
+                    dim3(kKvHeads, 1u, kBatch * kAttentionSplitK), kAttentionThreads>>>(
+                    static_cast<const float *>(q), nullptr, nullptr,
+                    static_cast<float *>(split_values), static_cast<float *>(split_maxima),
+                    static_cast<float *>(split_denominators), count, 0u, nullptr, count,
+                    reinterpret_cast<const uint8_t *const *>(table), layer->stream_hot_pages, offset);
+            if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
+            qwen38_stream_accumulate_page_kernel<true><<<kKvHeads, kAttentionThreads>>>(
+                    static_cast<const float *>(split_values),
+                    static_cast<const float *>(split_maxima),
+                    static_cast<const float *>(split_denominators),
+                    static_cast<float *>(stream_maxima), static_cast<float *>(stream_denominators),
+                    static_cast<float *>(stream_values));
             if (cudaGetLastError() != cudaSuccess) return AXIOM_ERR_CUDA;
         }
         qwen38_stream_finalize_stats_kernel<<<kKvHeads, kAttentionThreads>>>(

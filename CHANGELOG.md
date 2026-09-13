@@ -1,5 +1,19 @@
 # Changelog
 
+## Conversation reliability source update — 2026-09-13
+
+- Reuse byte/control-equivalent committed text prefixes and exact Codex
+  parallel-tool history projections without ignoring authoritative edits.
+- Add opt-in mixed resident/cold split-K attention with checked ring identities;
+  preserve complete history and existing speculation/precision boundaries.
+- Report real active-request progress, incomplete output budgets and empty
+  response failures; preserve explicit deadlines without an invented default.
+- Fix image-history follow-up normalization of assistant `output_text`.
+- Include CPU/GPU regression gates and explicit live QA runners. Publish
+  aggregate evidence and limitations in [Conversation reliability](docs/CONVERSATION_RELIABILITY.md),
+  including the still-disabled multimodal persistent KV reuse.
+- Source-only publication: no new app packages, weights or production deployment.
+
 ## Codex provider source update — 2026-09-11
 
 - Added the native `/codex/v1` provider and its schema/name/custom-tool boundary,
