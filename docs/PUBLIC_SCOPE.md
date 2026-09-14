@@ -1,5 +1,15 @@
 # Public release scope
 
+## September 14 reasoning and compaction update
+
+Selectively imported the provider/test delta through
+`543e93667637a52a743be994b2c3d87a139fd250` without importing private history.
+Public build targets and documentation are maintained separately. Loopback
+defaults, request serialization, MIT licensing and all existing publication
+exclusions remain unchanged. Aggregate QA and independent attribution findings
+are documented in [REASONING_AND_COMPACTION.md](REASONING_AND_COMPACTION.md);
+private transcripts, operational topology and checkpoint assets are excluded.
+
 ## September 13 conversation reliability update
 
 Selectively imported continuity, progress, image-replay and mixed-attention

@@ -1,5 +1,23 @@
 # Changelog
 
+## Reasoning and compaction source update — 2026-09-14
+
+- Preserve the full current user/tool exchange when compacting old history;
+  retain pinned instructions and reject an oversized current task explicitly.
+- Keep archived tool calls inert and use the current effective tool catalog,
+  including discovered tools, as the authority for new calls.
+- Match native text/multimodal ChatML framing, effort conditioning, assistant
+  history and grouped tool results; version durable prompt compatibility.
+- Enforce visible-output caps before committing tokens, keep hidden planning
+  out of tool execution, and forward the visible first-pass prefix through SSE.
+- Remove only the native two-newline reasoning separator; preserve actual
+  answer whitespace and literal closing tags in reasoning-disabled mode.
+- Add reproducible provider, template, streaming and compaction regressions.
+  Publish [QA results and remaining limitations](docs/REASONING_AND_COMPACTION.md),
+  including independently observed model-answer errors. No universal GO claim.
+- Source only, MIT: no private history, credentials, model assets, new app
+  packages, production restart or new inference campaign for publication.
+
 ## Conversation reliability source update — 2026-09-13
 
 - Reuse byte/control-equivalent committed text prefixes and exact Codex

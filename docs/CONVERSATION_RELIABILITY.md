@@ -1,5 +1,10 @@
 # Conversation continuity and long-context reliability
 
+For the subsequent current-exchange/tool-authority correction and native
+reasoning-template fixes, see the
+[September 14 update](REASONING_AND_COMPACTION.md). The evidence below remains
+the original September 13 publication record, not a rerun of all these cases.
+
 ## September 13, 2026 source update
 
 This update imports reviewed fixes from source

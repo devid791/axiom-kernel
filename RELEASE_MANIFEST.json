@@ -1,22 +1,24 @@
 {
-  "release_id": "axiom-kernel-conversation-reliability-20260913",
-  "release_date": "2026-09-13",
+  "release_id": "axiom-kernel-reasoning-compaction-20260914",
+  "release_date": "2026-09-14",
   "release_type": "sanitized-source-reliability-update",
   "project": "Axiom Kernel",
   "license": "MIT",
-  "previous_public_commit": "31006240b2c6119e3b2852590c9d40f527bc6e8c",
-  "previous_release_manifest": "docs/releases/codex-provider-20260911.json",
-  "source_commit": "fffdaf0588b05589fdbeb5bdf517031d3f68f8b6",
-  "source_commit_scope": "Selective source delta on sanitized public history; private history and reports excluded.",
+  "previous_public_commit": "bf597857ba6cef8ee680cda5f128af28bc738068",
+  "previous_release_manifest": "docs/releases/conversation-reliability-20260913.json",
+  "source_commit": "543e93667637a52a743be994b2c3d87a139fd250",
+  "source_commit_scope": "Selective provider/test delta from fffdaf0588b05589fdbeb5bdf517031d3f68f8b6 onto public history; public build integration and aggregate documentation maintained separately.",
   "included": [
-    "byte-control-equivalent-prefix-reuse",
-    "codex-tool-history-projection",
-    "opt-in-mixed-resident-cold-attention",
-    "actual-request-progress",
-    "explicit-incomplete-and-empty-response-status",
-    "operator-authoritative-deadlines",
-    "multimodal-assistant-output-text-replay",
-    "regression-tests-and-explicit-live-qa-runners"
+    "current-exchange-preserving-compaction",
+    "current-catalog-tool-authority-and-inert-archives",
+    "native-text-and-multimodal-chat-template",
+    "versioned-durable-template-compatibility",
+    "seven-effort-native-conditioning-metadata",
+    "pre-commit-visible-output-budget",
+    "reasoning-safe-tool-parsing",
+    "streaming-visible-prefix-handoff",
+    "exact-reasoning-separator-handling",
+    "reproducible-provider-tokenizer-regressions"
   ],
   "public_provider_differences": [
     "loopback-only-default",
@@ -29,43 +31,64 @@
     "cuda_arch": "sm_120",
     "vision": true,
     "media_decoder": true,
-    "native_reference_global_fast_math": false
+    "native_reference_global_fast_math": false,
+    "cuda_library": "unchanged from previous public build"
   },
-  "artifact_scope": "Local compile/link and host-test evidence only. No binaries distributed, no public executable deployed and no new model inference run for publication.",
+  "artifact_scope": "Incremental public provider/test compile-link and CPU verification against the unchanged previously built public CUDA library. No binary distribution, deployment or new model inference for publication.",
   "artifact_hashes": {
     "lib/libaxiom.so": "ac36e89e75fcfd1c7d79c2644a52fca07c58a4638b71a94f83581b188a5f01bb",
-    "bin/axiom-qwen38-api": "7102cd49fa057b280f911634a56491a7a6ae34e7b7b312138e84c47f4fadc559",
-    "bin/axiom-codex-provider-api-test": "0f61e91aa46779bcba9270f0045a6e6e720e46a5fd04631560929e0a33927f37"
+    "bin/axiom-qwen38-api": "9fe5ce3e59447e05665d5492b51f6c94c9e84805cb4587c6a5e01c99ad18731e",
+    "bin/axiom-codex-provider-api-test": "df2b16b17f19b5d1b6f6416110b52e5e162fd893707d2b31e890552eca079068",
+    "bin/axiom-qwen38-reasoning-test": "16eb208336100f6c4ecc274ad1f9ef5e4d88f4ce183e772be2ca2675643798f8",
+    "bin/axiom-qwen38-chat-template-test": "ec0ef55d477e9753ea699adea310d0d3309b761cb15421b45fde7bfb1bc21c60",
+    "bin/axiom-qwen38-reasoning-stream-test": "64b2dcbcfcf0bb2240cdaac0611952f1d353cf2d08f9300e57e6519eacaef02a",
+    "bin/axiom-qwen38-compaction-test": "40dc6e919a5deffde4b3f91c6825c1d68616d4ea2f8d9915dcace855a2ae13da",
+    "bin/axiom-codex-prefix-replay-test": "72bb34982dbdf6d077ed6a2c24d1ae3500b6b6db1830367db41f105920431f26"
   },
   "gate_results": {
-    "native_compile_link": "pass",
+    "provider_compile_link": "pass",
     "codex_host_tests": "pass",
-    "mixed_kv_cpu": "pass-10108-checks",
-    "request_progress": "pass-39-checks",
-    "stream_progress": "pass-13-cases",
-    "prefix_reuse": "pass",
-    "multimodal_replay": "pass",
-    "live_runner_syntax": "pass",
-    "tokenizer_replay_binary_build": "pass",
-    "gpu_matrix_binary_build": "pass",
+    "reasoning_parser_budget": "pass-77-checks",
+    "chat_template_and_multimodal_text_slots": "pass-108-checks",
+    "reasoning_stream_handoff": "pass-87-checks",
+    "exact_codex_prefix_replay": "pass-120-checks",
+    "compaction": "pass-16-checks",
+    "api_self_tests": "pass-tool-contract-stream-progress-utf8-speculative-routing-listeners",
     "public_scan": "pass",
-    "gitleaks_staged_review": "4 reviewed false positives: API executable SHA-256 values in current and preserved previous manifests; no credentials and no suppressed rules",
+    "gitleaks_staged_review": "4 reviewed false positives: API and API-test executable SHA-256 values in current and preserved previous manifests; no credentials, no rule suppression",
     "public_build_gpu_inference": "not-run",
-    "public_build_gpu_matrix": "not-run"
+    "public_build_gpu_performance": "not-run"
   },
   "source_deployment_evidence": {
-    "scope": "Prior source-derived native deployment, not the independent public build",
-    "gpu_attention_cases": 59,
-    "live_conversation_checks": 23,
-    "live_control_checks": 9,
-    "core_tool_execution": "pass-linux-0.153.4",
-    "details": "docs/CONVERSATION_RELIABILITY.md"
+    "scope": "Prior source-derived qualified deployment; not inference on this public executable",
+    "backend_checks": {
+      "passed": 54,
+      "total": 54,
+      "matrix_requests": 51,
+      "copy_probe_requests": 1,
+      "image_requests": 2
+    },
+    "real_tool_call_and_result_requests": 14,
+    "same_session_effort_transition_requests": 8,
+    "normal_answer_quality": {
+      "passed": 14,
+      "total": 21,
+      "wrong_off_answers": 3,
+      "enabled_format_failures": 4
+    },
+    "target_only_off_controls": "3 separately preserved failures, same original wrong bytes",
+    "image_checker": "Corrected offline total-versus-visible accounting using the same two saved requests; original report retained",
+    "strict_visible_prefix_handoff": "Dedicated exact 4299-byte copy passed; generic probe did not exercise the strict condition",
+    "independent_attribution": "Same-checkpoint CPU reference also exhibits wrong-answer behavior; not bitwise CUDA parity or proof all Axiom paths are correct",
+    "details": "docs/REASONING_AND_COMPACTION.md",
+    "blanket_production_go": false
   },
   "remaining_gaps": [
+    "model-answer-and-strict-format-quality",
     "multimodal-persistent-KV-reuse-disabled",
     "full-model-million-token-inference-not-qualified",
     "arbitrary-history-compaction-quality-not-qualified",
-    "all-desktop-plugin-bot-workflows-not-qualified"
+    "all-desktop-plugin-bot-tutor-workflows-not-qualified"
   ],
   "exclusions": [
     "model-weights-and-tokenizer-assets",

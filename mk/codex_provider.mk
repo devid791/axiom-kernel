@@ -36,6 +36,7 @@ codex-host-tests: codex-provider-test codex-provider-api-test vision-memory-budg
 	$(BIN_DIR)/axiom-qwen38-api --self-test-stream-progress
 	$(BIN_DIR)/axiom-qwen38-api --self-test-utf8
 	$(BIN_DIR)/axiom-qwen38-api --self-test-speculative-routing
+	$(BIN_DIR)/axiom-qwen38-api --self-test-listeners
 
 # Conversation continuity gates are model-free unless a tokenizer/live endpoint
 # is explicitly supplied. No test target starts a production service.
@@ -75,3 +76,29 @@ $(BIN_DIR)/axiom-qwen38-mixed-kv-microbench: tools/axiom_qwen38_mixed_kv_microbe
 .PHONY: qwen38-mixed-kv-microbench
 qwen38-mixed-kv-microbench: $(BIN_DIR)/axiom-qwen38-mixed-kv-microbench
 	$<
+
+# Actual provider translation-unit regressions: build and run without model
+# weights, GPU inference, HTTP listeners or persisted production sessions.
+QWEN38_PROVIDER_TEST_DEPS := tools/axiom_qwen38_api.cpp tools/axiom_codex_provider.h tools/axiom_codex_schema.h tools/axiom_codex_prefill_graph.h tools/axiom_aliced_json.h include/axiom/qwen38_prefix_reuse.hpp include/axiom/qwen38_request_progress.hpp $(BUILD_DIR)/axiom_qwen38_spec_identity_lib.o $(LIB_DIR)/libaxiom.so
+
+define qwen38_provider_regression
+$(BIN_DIR)/axiom-qwen38-$(subst _,-,$(1))-test: tests/axiom_qwen38_$(1)_test.cpp $(QWEN38_PROVIDER_TEST_DEPS) | $(BIN_DIR) codex-media-check
+	$$(CXX) $$(CPPFLAGS) $$(CXXFLAGS) -Itools $$< $$(BUILD_DIR)/axiom_qwen38_spec_identity_lib.o -L$$(LIB_DIR) -laxiom $$(COMMON_LINK_LIBS) -Wl,-rpath,'$$$$ORIGIN/../lib' -o $$@
+endef
+$(foreach suite,reasoning chat_template reasoning_stream compaction,$(eval $(call qwen38_provider_regression,$(suite))))
+
+.PHONY: qwen38-reasoning-test qwen38-chat-template-test qwen38-reasoning-stream-test qwen38-compaction-test qwen38-tokenizer-tests
+qwen38-reasoning-test: $(BIN_DIR)/axiom-qwen38-reasoning-test
+	$<
+codex-host-tests: qwen38-reasoning-test
+
+qwen38-chat-template-test: $(BIN_DIR)/axiom-qwen38-chat-template-test
+	@test -n "$(QWEN38_TOKENIZER_PATH)" || { echo 'Set QWEN38_TOKENIZER_PATH'; exit 2; }
+	$< "$(QWEN38_TOKENIZER_PATH)"
+qwen38-reasoning-stream-test: $(BIN_DIR)/axiom-qwen38-reasoning-stream-test
+	@test -n "$(QWEN38_TOKENIZER_PATH)" || { echo 'Set QWEN38_TOKENIZER_PATH'; exit 2; }
+	$< "$(QWEN38_TOKENIZER_PATH)"
+qwen38-compaction-test: $(BIN_DIR)/axiom-qwen38-compaction-test
+	@test -n "$(QWEN38_TOKENIZER_PATH)" || { echo 'Set QWEN38_TOKENIZER_PATH'; exit 2; }
+	$< "$(QWEN38_TOKENIZER_PATH)"
+qwen38-tokenizer-tests: codex-prefix-replay-test qwen38-chat-template-test qwen38-reasoning-stream-test qwen38-compaction-test

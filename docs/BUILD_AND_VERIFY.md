@@ -1,5 +1,23 @@
 # Build and verification
 
+## Reasoning and compaction regressions
+
+`codex-host-tests` includes the model-free reasoning/parser/output-budget
+regression and all five API self-tests. Additional CPU tests use an
+operator-supplied compatible tokenizer, without loading weights, starting an
+HTTP listener or running GPU inference:
+
+```sh
+make -j3 MEDIA=1 VISION=1 codex-host-tests
+make -j3 MEDIA=1 VISION=1 qwen38-tokenizer-tests QWEN38_TOKENIZER_PATH=/path/to/tokenizer.json
+make public-scan
+```
+
+The tokenizer group includes exact prefix replay, native text/multimodal
+text-slot templates, socketpair SSE phase handoff and large synthetic history
+compaction. Supplying a tokenizer does not qualify actual image inference or
+model-answer quality. See [results and limits](REASONING_AND_COMPACTION.md).
+
 ## Codex provider follow-up
 
 The optional public HTTP integration requires the image and FFmpeg development

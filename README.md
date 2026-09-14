@@ -55,6 +55,12 @@ The September 13 [conversation reliability update](docs/CONVERSATION_RELIABILITY
 adds safe text/tool cache continuation, opt-in mixed resident/cold attention,
 observed request progress and image-history replay fixes. The report separates
 verified scenarios from remaining gaps, including multimodal KV reuse.
+The September 14 [reasoning and compaction update](docs/REASONING_AND_COMPACTION.md)
+preserves the current exchange during compaction, follows the native chat
+template, and fixes visible-output budgets and streaming phase handoff.
+Its QA report distinguishes transport correctness from remaining model-answer
+errors; the [seven reasoning profiles](docs/qwen38/REASONING_PROFILES.md)
+retain their original identifiers and budgets.
 See [Codex App Server integration](docs/CODEX_APP_SERVER.md) for build commands,
 route distinctions and exact qualification limits. Authentication, tool execution
 policy and network exposure remain separately audited application responsibilities.

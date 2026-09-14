@@ -79,6 +79,10 @@ constexpr char kSessionHeader[] = "X-Axiom-Session-ID";
  * predicted, not-yet-committed continuation.  Keeping the version in the
  * namespace prevents a v1 manifest from being interpreted with v2 semantics. */
 constexpr char kSessionConfigVersion[] = "session-kv-v2";
+// Prompt bytes are part of the recurrent/KV state contract. Never extend a
+// pre-template-fix native session through the stateful-tail fallback. Existing
+// files remain intact; clients replay their history once into the new namespace.
+constexpr char kChatTemplateVersion[] = "qwen38-chatml-v1";
 constexpr uint32_t kMaxNativeContext = 1024u * 1024u;
 constexpr uint32_t kDefaultRequestContext = 262144u;
 /* The process owns the full logical ceiling so an explicit request can opt
@@ -246,6 +250,40 @@ struct generation_result {
     bool session_tool_projection = false;
 };
 
+// Bound the visible suffix even when the first reasoning pass also generates
+// the answer. Apply this BEFORE scheduling scalar steps or speculative batches;
+// trimming returned IDs afterwards would leave recurrent/KV state ahead of the
+// history that is actually returned to the client.
+struct generation_output_budget {
+    std::vector<uint32_t> reasoning_end_marker;
+    uint32_t visible_limit = 0u;
+    uint32_t visible_count = 0u;
+    bool reasoning_ended = false;
+
+    uint32_t allowance(uint32_t remaining) const {
+        if (reasoning_end_marker.empty()) return remaining;
+        if (reasoning_ended) {
+            return std::min(remaining, visible_count >= visible_limit
+                    ? 0u : visible_limit - visible_count);
+        }
+        // The next token could close reasoning (including a split marker).
+        // At most visible_limit further tokens may be committed in this batch.
+        return static_cast<uint32_t>(std::min<uint64_t>(
+                remaining, static_cast<uint64_t>(visible_limit) + 1u));
+    }
+
+    void observe(const std::vector<uint32_t> &ids) {
+        if (reasoning_end_marker.empty()) return;
+        if (reasoning_ended) {
+            ++visible_count;
+        } else if (ids.size() >= reasoning_end_marker.size() &&
+                std::equal(reasoning_end_marker.rbegin(), reasoning_end_marker.rend(),
+                           ids.rbegin())) {
+            reasoning_ended = true;
+        }
+    }
+};
+
 /* Optional wire sink owned by the HTTP handler.  The native decode paths
  * stay transport-agnostic: they append each committed token to the result
  * and, when present, hand only its decoded piece to this callback. */
@@ -264,13 +302,25 @@ struct generation_stream_sink {
      * boundaries. Keep an incomplete suffix here so every SSE JSON event is
      * independently valid UTF-8 rather than emitting arbitrary token bytes. */
     std::string utf8_pending;
+    // Only for a natural reasoning close: consume the template's exact two-LF
+    // separator before emitting text, never arbitrary answer whitespace.
+    bool reasoning_separator_pending = false;
     // Provider-specific optimization opt-in; legacy callers retain their
     // existing target prefill selection.
     bool codex_target_prefill = false;
     // Request-owned native catalog: permits ONLY reconstruction of the same
     // Core wire projection, never approximate tail/history replacement.
     const ajson *codex_replay_tools = nullptr;
+    generation_output_budget output_budget;
 };
+
+uint32_t generation_tokens_remaining(
+        const generation_result &result, uint32_t max_new,
+        const generation_stream_sink *sink) {
+    if (result.ids.size() >= max_new) return 0u;
+    const uint32_t remaining = max_new - static_cast<uint32_t>(result.ids.size());
+    return sink ? sink->output_budget.allowance(remaining) : remaining;
+}
 
 bool generation_cancelled(const generation_stream_sink *sink) {
     if (!sink || !sink->cancelled) return false;
@@ -2793,7 +2843,8 @@ axiom::qwen38::qwen38_session_key make_session_key(
     key.model_id = kModelId;
     key.target_identity = state->target_identity;
     key.dspark_identity = state->dspark_identity;
-    key.config_signature = state->kv_config_signature;
+    key.config_signature = state->kv_config_signature +
+            ";chat_template=" + kChatTemplateVersion;
     key.profile = profile;
     return key;
 }
@@ -3457,6 +3508,22 @@ std::string effective_reasoning_effort(const server_state *state, const ajson &p
         return enable_thinking->b ? "medium" : "ultra-fast";
     }
     return state && state->no_think ? "ultra-fast" : "medium";
+}
+
+// Public effort IDs/budgets remain independent from the three instruction
+// families actually supported by this model's chat_template.jinja.
+const char *native_reasoning_conditioning(const std::string &effort) {
+    if (effort == "ultra-fast") return "off";
+    if (effort == "minimal" || effort == "low") return "low";
+    if (effort == "medium") return "medium";
+    return "xhigh";
+}
+
+std::string native_reasoning_instruction(const std::string &effort) {
+    const std::string family = native_reasoning_conditioning(effort);
+    if (family == "low") return "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+    if (family == "xhigh") return "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+    return {};
 }
 
 bool resolve_session_id(
@@ -5002,13 +5069,22 @@ std::string safe_tool_name(const std::string &name) {
 }
 
 native_tool_result parse_native_tool_calls(
-        const std::string &text, const ajson &tools) {
+        const std::string &text, const ajson &tools,
+        bool implicit_thinking = false) {
     native_tool_result result;
     result.status = "none";
-    result.content = text;
     const std::string thinkless = [&]() {
         std::string out;
         size_t pos = 0u;
+        // A reasoning-enabled prompt already supplies <think>. Its generated
+        // continuation need not repeat that opening tag. Only the real visible
+        // suffix may authorize a call; planning examples are inert. Use the
+        // generation mode, not a guessed closing tag inside an off-mode tool.
+        if (implicit_thinking) {
+            const size_t end = text.find("</think>");
+            if (end == std::string::npos) return out;
+            pos = end + 8u;
+        }
         while (pos < text.size()) {
             const size_t start = text.find("<think>", pos);
             if (start == std::string::npos) {
@@ -5023,6 +5099,7 @@ native_tool_result parse_native_tool_calls(
         return out;
     }();
     result.raw = thinkless;
+    result.content = trim_text(thinkless);
 
     size_t scan = 0u;
     size_t first_call = std::string::npos;
@@ -5573,16 +5650,21 @@ int run_native_tool_contract_self_test() {
     return 0;
 }
 
-std::string visible_model_text(const std::string &text) {
-    const size_t end = text.rfind("</think>");
-    if (end != std::string::npos) return trim_text(text.substr(end + 8u));
+std::string visible_model_text(const std::string &text, bool reasoning_enabled = true) {
+    if (!reasoning_enabled) return text;
+    const size_t end = text.find("</think>");
+    if (end != std::string::npos) {
+        const size_t first = end + 8u;
+        return text.substr(first + (text.compare(first, 2u, "\n\n") == 0 ? 2u : 0u));
+    }
     const size_t start = text.find("<think>");
     if (start != std::string::npos) return trim_text(text.substr(0u, start));
     return text;
 }
 
-std::string reasoning_model_text(const std::string &text) {
-    const size_t end = text.rfind("</think>");
+std::string reasoning_model_text(const std::string &text, bool reasoning_enabled = true) {
+    if (!reasoning_enabled) return {};
+    const size_t end = text.find("</think>");
     if (end == std::string::npos) return {};
     const size_t start = text.find("<think>");
     const size_t first = start != std::string::npos && start < end
@@ -5593,12 +5675,55 @@ std::string reasoning_model_text(const std::string &text) {
 struct chat_turn {
     std::string role;
     std::string content;
+    // Tool replies use Qwen's user role, but do not start a new user request.
+    bool tool_response = false;
 };
 
 struct encoded_chat_turn {
     chat_turn turn;
     std::vector<uint32_t> ids;
 };
+
+// Shared by text and vision: conditioning, tools, then the initial system
+// message, in one native system turn. Keep content parts/bytes intact so vision
+// slots and authoritative replay edits are not lost to text normalization.
+ajson initial_chat_system(const server_state *state, const ajson &payload,
+        const ajson &messages, const ajson &tools, bool no_think,
+        size_t *first_message) {
+    ajson parts = ajson::jarr();
+    const auto append = [&](const ajson &content) {
+        if (content.is_null() || (content.is_string() && content.s.empty()) ||
+            (content.is_array() && content.arr.empty())) return;
+        if (!parts.arr.empty()) parts.push(ajson::jstr("\n\n"));
+        if (content.is_array()) {
+            for (const auto &part : content.arr) parts.push(part);
+        } else parts.push(content);
+    };
+    if (!no_think) append(ajson::jstr(native_reasoning_instruction(
+            effective_reasoning_effort(state, payload))));
+    append(ajson::jstr(render_qwen_tools_prompt(tools, payload.get("tool_choice"))));
+    if (const auto *system = payload.get("system")) append(*system);
+    *first_message = 0u;
+    if (!messages.arr.empty()) {
+        const auto &first = messages.arr.front();
+        const auto *role = first.get("role");
+        if (role && role->is_string() && role->s == "system" && first.get("content")) {
+            append(*first.get("content"));
+            *first_message = 1u;
+        }
+    }
+    return parts;
+}
+
+std::string assistant_history_prefix(const ajson &message) {
+    const auto *reasoning = message.get("reasoning_content");
+    if (reasoning && reasoning->is_string()) {
+        return "<think>\n" + trim_text(reasoning->s) + "\n</think>\n\n";
+    }
+    // Preserve the native full-text representation accepted by older clients.
+    if (message_content_text(message.get("content")).rfind("<think>", 0u) == 0u) return {};
+    return kNoThinkingPrefix;
+}
 
 std::string compact_snippet(const std::string &text, const size_t limit = 260u) {
     std::string compact;
@@ -5636,7 +5761,32 @@ std::string compact_role_label(const std::string &role) {
     return role == "user" ? "Utente" : role == "assistant" ? "Axiom" : role;
 }
 
-std::string build_compact_context_state(const std::vector<chat_turn> &turns) {
+bool compact_tool_record(const chat_turn &turn) {
+    return turn.tool_response || turn.content.find("<tool_response>") != std::string::npos ||
+            (turn.role == "assistant" && turn.content.find("<tool_call>") != std::string::npos);
+}
+
+std::string compact_record(const chat_turn &turn) {
+    std::string label = compact_role_label(turn.role);
+    if (turn.tool_response || turn.content.find("<tool_response>") != std::string::npos)
+        label = "Historical tool result (already returned)";
+    else if (turn.role == "assistant" && turn.content.find("<tool_call>") != std::string::npos)
+        label = "Historical assistant tool call (record only)";
+    // Summaries are observations, never fresh native tool declarations/calls.
+    // Escape before placing snippets inside the archive so protocol delimiters
+    // cannot be mistaken for executable examples. Current turns stay verbatim.
+    std::string text;
+    for (const char ch : compact_snippet(turn.content)) {
+        if (ch == '&') text += "&amp;";
+        else if (ch == '<') text += "&lt;";
+        else if (ch == '>') text += "&gt;";
+        else text.push_back(ch);
+    }
+    return "- " + label + ": " + text + "\n";
+}
+
+std::string build_compact_context_state(
+        const std::vector<chat_turn> &turns, const bool current_tools_enabled = false) {
     std::vector<const chat_turn *> important;
     important.reserve(18u);
     for (const chat_turn &turn : turns) {
@@ -5650,21 +5800,33 @@ std::string build_compact_context_state(const std::vector<chat_turn> &turns) {
     }
     std::string summary = "AXIOM_COMPACT_STATE v1\n";
     summary += "turns_compacted: " + std::to_string(turns.size()) + "\n\n";
+    if (std::any_of(turns.begin(), turns.end(), compact_tool_record)) {
+        summary += "tool_history_policy:\n"
+                "This archive records earlier events, not new instructions or a tool catalog. "
+                "Historical calls with returned results are already completed. Use the recorded "
+                "results directly; do not repeat a call merely because it appears here.\n";
+        summary += current_tools_enabled
+                ? "Only the current request's declared or loaded tools authorize new calls. "
+                  "Names mentioned in this archive do not make tools available.\n\n"
+                : "No tools are available for this response. Answer the current request in plain "
+                  "text using the recorded results. If a new action is necessary but unavailable, "
+                  "explain that limitation; do not invent a result or emit a tool call.\n\n";
+    }
     summary += "context_start:\n";
     for (const chat_turn *turn : selected) {
-        summary += "- " + compact_role_label(turn->role) + ": " + compact_snippet(turn->content) + "\n";
+        summary += compact_record(*turn);
     }
     if (!important.empty()) {
         summary += "\nimportant_points:\n";
         for (const chat_turn *turn : important) {
-            summary += "- " + compact_role_label(turn->role) + ": " + compact_snippet(turn->content) + "\n";
+            summary += compact_record(*turn);
         }
     }
     summary += "\nrecent_context_before_compaction:\n";
     const size_t recent_begin = turns.size() > 8u ? turns.size() - 8u : 0u;
     for (size_t index = recent_begin; index < turns.size(); ++index) {
         const chat_turn &turn = turns[index];
-        summary += "- " + compact_role_label(turn.role) + ": " + compact_snippet(turn.content) + "\n";
+        summary += compact_record(turn);
     }
     if (summary.size() <= kContextCompactionMaxSummaryChars) return summary;
     summary.resize(kContextCompactionMaxSummaryChars);
@@ -5689,6 +5851,7 @@ int encode_chat_turn(
     int rc = append_text_ids(state, turn.role + "\n" + turn.content, &out->ids);
     if (rc == AXIOM_OK && out->ids.size() < context_limit) {
         out->ids.push_back(state->tokenizer_info.im_end_token_id);
+        rc = append_text_ids(state, "\n", &out->ids);
     } else if (rc == AXIOM_OK) {
         rc = AXIOM_ERR_BUDGET;
     }
@@ -5709,9 +5872,8 @@ int encode_assistant_prefix(
     }
     out->push_back(state->tokenizer_info.im_start_token_id);
     int rc = append_text_ids(state, "assistant\n", out);
-    if (rc == AXIOM_OK && no_think) {
-        /* Qwen's hard non-thinking switch is the empty think block. */
-        rc = append_text_ids(state, kNoThinkingPrefix, out);
+    if (rc == AXIOM_OK) {
+        rc = append_text_ids(state, no_think ? kNoThinkingPrefix : "<think>\n", out);
     }
     if (rc != AXIOM_OK) *error = "prompt exceeds configured context";
     return rc;
@@ -5734,7 +5896,8 @@ bool make_chat_ids(
         std::vector<uint32_t> *session_suffix_ids,
         std::string *error,
         uint32_t *original_tokens,
-        bool *compacted) {
+        bool *compacted,
+        const ajson *tool_authority = nullptr) {
     if (!state || !out || !session_suffix_ids || !error || !original_tokens || !compacted) {
         return false;
     }
@@ -5760,20 +5923,14 @@ bool make_chat_ids(
     if (!normalize_tools(payload.get("tools"), anthropic, &normalized_tools, error)) return false;
     const ajson *tool_choice = payload.get("tool_choice");
     const bool tools_enabled = !normalized_tools.arr.empty() && tools_are_enabled(tool_choice);
-    /* Anthropic sends system as a top-level field; represent it with the
-     * native Qwen system ChatML turn so both API surfaces share one prompt. */
-    const ajson *system = payload.get("system");
-    std::string system_text;
-    if (system) {
-        system_text = message_content_text(system);
-    }
-    if (tools_enabled) {
-        const std::string tool_prompt = render_qwen_tools_prompt(normalized_tools, tool_choice);
-        if (!system_text.empty()) system_text += "\n\n";
-        system_text += tool_prompt;
-    }
+    size_t first_message = 0u;
+    const ajson system = initial_chat_system(state, payload, *messages,
+            normalized_tools, no_think, &first_message);
+    const std::string system_text = message_content_text(&system);
     if (!system_text.empty()) all_turns.push_back(chat_turn{"system", system_text});
-    for (const ajson &message : messages->arr) {
+    bool previous_tool = false;
+    for (size_t message_index = first_message; message_index < messages->arr.size(); ++message_index) {
+        const ajson &message = messages->arr[message_index];
         const ajson *role = message.get("role");
         const ajson *content = message.get("content");
         if (!message.is_object() || !role || !role->is_string() ||
@@ -5802,40 +5959,47 @@ bool make_chat_ids(
                 if (!content_text.empty()) content_text += "\n\n";
                 content_text += tool_call_text;
             }
-            /* The current no-thinking generation prefix includes an empty
-             * <think> block. Reconstruct the same token sequence for prior
-             * assistant turns so a stable session_id can restore the durable
-             * KV prefix instead of missing at the first assistant token. */
-            if (no_think && content_text.rfind("<think>", 0u) != 0u) {
-                content_text.insert(0u, kNoThinkingPrefix);
-            }
+            content_text.insert(0u, assistant_history_prefix(message));
         }
         if (role->s == "tool") {
             content_text = "<tool_response>\n" + content_text + "\n</tool_response>";
-            all_turns.push_back(chat_turn{"user", content_text});
+            if (previous_tool) all_turns.back().content += "\n" + content_text;
+            else all_turns.push_back(chat_turn{"user", content_text, true});
         } else {
-            all_turns.push_back(chat_turn{role->s, content_text});
+            const bool tool_response = role->s == "user" &&
+                    content_text.find("<tool_response>") != std::string::npos;
+            all_turns.push_back(chat_turn{role->s, content_text, tool_response});
         }
+        previous_tool = role->s == "tool";
     }
 
     std::vector<encoded_chat_turn> encoded;
     encoded.reserve(all_turns.size());
     uint64_t raw_tokens = 0u;
-    for (const chat_turn &turn : all_turns) {
-        encoded_chat_turn item;
-        if (encode_chat_turn(state, turn, &item, error) != AXIOM_OK) return false;
-        raw_tokens += item.ids.size();
-        if (raw_tokens > context_limit) {
-            *error = "prompt exceeds configured context";
-            return false;
+    // Historical replay may cross the selected window precisely when the
+    // governor is needed. Bound tokenization by the loaded model's ceiling,
+    // then enforce the selected window on the actual compacted prompt. This
+    // never extends the generation/KV budget or truncates a one-shot document.
+    const uint32_t history_limit = state->context_compaction
+            ? std::max(context_limit, state->max_context) : context_limit;
+    {
+        request_context_scope history_scope(state, history_limit);
+        for (const chat_turn &turn : all_turns) {
+            encoded_chat_turn item;
+            if (encode_chat_turn(state, turn, &item, error) != AXIOM_OK) return false;
+            raw_tokens += item.ids.size();
+            if (raw_tokens > history_limit) {
+                *error = "prompt exceeds configured context";
+                return false;
+            }
+            encoded.push_back(std::move(item));
         }
-        encoded.push_back(std::move(item));
     }
 
     std::vector<uint32_t> assistant_prefix;
     if (encode_assistant_prefix(state, no_think, &assistant_prefix, error) != AXIOM_OK) return false;
     raw_tokens += assistant_prefix.size();
-    if (raw_tokens > context_limit) {
+    if (raw_tokens > history_limit) {
         *error = "prompt exceeds configured context";
         return false;
     }
@@ -5853,6 +6017,12 @@ bool make_chat_ids(
             continue;
         }
         try {
+            // The saved cursor consumes the assistant's im_end exactly once;
+            // its trailing ChatML newline belongs to the new replay suffix.
+            if (append_text_ids(state, "\n", session_suffix_ids) != AXIOM_OK) {
+                *error = "session resume tail exceeds configured context";
+                return false;
+            }
             for (size_t tail = assistant_index + 1u; tail < encoded.size(); ++tail) {
                 session_suffix_ids->insert(
                         session_suffix_ids->end(),
@@ -5875,6 +6045,11 @@ bool make_chat_ids(
         out->clear();
         append_encoded_turns(encoded, raw_indices, out);
         out->insert(out->end(), assistant_prefix.begin(), assistant_prefix.end());
+        if (out->empty() || out->size() > context_limit) {
+            *error = "prompt exceeds configured context";
+            return false;
+        }
+        return true;
     };
 
     const uint32_t active_limit = kContextCompactionBoundary >
@@ -5883,8 +6058,7 @@ bool make_chat_ids(
                     kContextCompactionBuffer
             : kContextCompactionBoundary;
     if (!state->context_compaction || raw_tokens <= active_limit || encoded.empty()) {
-        emit_raw();
-        return !out->empty() && out->size() <= context_limit;
+        return emit_raw();
     }
 
     std::vector<size_t> pinned;
@@ -5903,42 +6077,69 @@ bool make_chat_ids(
      * is for multi-turn history, where summarising older turns preserves the
      * current request while keeping the logical context ceiling at 1M. */
     if (history.size() < 2u || prefix_tokens >= active_limit) {
-        emit_raw();
-        return !out->empty() && out->size() <= context_limit;
+        return emit_raw();
     }
 
     uint32_t available = static_cast<uint32_t>(active_limit - prefix_tokens);
     const uint32_t keep_budget = std::min<uint32_t>(available * 3u / 5u,
                                                     kContextCompactionRecentTokens);
-    uint32_t keep_tokens = 0u;
-    std::vector<size_t> keep_recent;
-    for (auto iterator = history.rbegin(); iterator != history.rend(); ++iterator) {
-        const uint32_t count = static_cast<uint32_t>(encoded[*iterator].ids.size());
-        if (keep_tokens + count > keep_budget) break;
-        keep_recent.push_back(*iterator);
-        keep_tokens += count;
+    // Always retain the entire latest user request and its assistant/tool
+    // continuation. The recent-history target is a soft budget for OLDER
+    // exchanges, not permission to summarize away the current task. Keep
+    // complete exchanges so a retained tool result cannot lose its call.
+    std::vector<size_t> exchange_starts{0u};
+    for (size_t position = 1u; position < history.size(); ++position) {
+        const chat_turn &turn = encoded[history[position]].turn;
+        if (turn.role == "user" && !turn.tool_response)
+            exchange_starts.push_back(position);
     }
-    std::reverse(keep_recent.begin(), keep_recent.end());
+    size_t first_exchange = exchange_starts.size() - 1u;
+    size_t keep_begin = exchange_starts[first_exchange];
+    uint64_t keep_tokens = 0u;
+    for (size_t position = keep_begin; position < history.size(); ++position)
+        keep_tokens += encoded[history[position]].ids.size();
+    while (first_exchange > 0u) {
+        const size_t begin = exchange_starts[first_exchange - 1u];
+        uint64_t count = 0u;
+        for (size_t position = begin; position < keep_begin; ++position)
+            count += encoded[history[position]].ids.size();
+        if (keep_tokens + count > keep_budget) break;
+        keep_tokens += count;
+        keep_begin = begin;
+        --first_exchange;
+    }
+    std::vector<size_t> keep_recent(history.begin() + keep_begin, history.end());
 
     const size_t compact_count = history.size() - keep_recent.size();
     if (compact_count == 0u) {
-        emit_raw();
-        return !out->empty() && out->size() <= context_limit;
+        return emit_raw();
     }
     std::vector<chat_turn> compacted_turns;
     compacted_turns.reserve(compact_count);
     for (size_t index = 0u; index < compact_count; ++index) {
         compacted_turns.push_back(encoded[history[index]].turn);
     }
+    // Codex's append-only prompt catalog may omit tools discovered later in
+    // the history. Availability must come from the effective validated request,
+    // not from that prefix-preserving projection or old call names.
+    bool current_tools_enabled = tools_enabled;
+    if (tool_authority) {
+        ajson current_tools;
+        if (!normalize_tools(tool_authority->get("tools"), anthropic, &current_tools, error))
+            return false;
+        current_tools_enabled = !current_tools.arr.empty() &&
+                tools_are_enabled(tool_authority->get("tool_choice"));
+    }
     const std::string summary = "[Contesto precedente compatto]\n" +
-            build_compact_context_state(compacted_turns);
+            build_compact_context_state(compacted_turns, current_tools_enabled);
     encoded_chat_turn summary_turn;
     if (encode_chat_turn(state, chat_turn{"user", summary}, &summary_turn, error) != AXIOM_OK) {
         return false;
     }
     encoded_chat_turn ack_turn;
     if (encode_chat_turn(
-            state, chat_turn{"assistant", "Ho caricato il contesto compatto. Continuo dal punto corrente."},
+            state, chat_turn{"assistant", std::string(kNoThinkingPrefix) +
+                    "Ho caricato il contesto compatto. Continuo dal punto corrente."},
             &ack_turn, error) != AXIOM_OK) {
         return false;
     }
@@ -5949,8 +6150,10 @@ bool make_chat_ids(
     out->insert(out->end(), ack_turn.ids.begin(), ack_turn.ids.end());
     append_encoded_turns(encoded, keep_recent, out);
     out->insert(out->end(), assistant_prefix.begin(), assistant_prefix.end());
-    while (out->size() > active_limit && !keep_recent.empty()) {
-        keep_recent.erase(keep_recent.begin());
+    while ((out->size() > active_limit || out->size() > context_limit) &&
+            first_exchange + 1u < exchange_starts.size()) {
+        ++first_exchange;
+        keep_recent.assign(history.begin() + exchange_starts[first_exchange], history.end());
         out->clear();
         append_encoded_turns(encoded, pinned, out);
         out->insert(out->end(), summary_turn.ids.begin(), summary_turn.ids.end());
@@ -5959,8 +6162,7 @@ bool make_chat_ids(
         out->insert(out->end(), assistant_prefix.begin(), assistant_prefix.end());
     }
     if (out->size() > active_limit || out->size() > context_limit) {
-        emit_raw();
-        return !out->empty() && out->size() <= context_limit;
+        return emit_raw();
     }
     *compacted = true;
     return !out->empty();
@@ -5982,6 +6184,8 @@ bool project_codex_tool_prefix(server_state *state,
     const size_t committed = manifest.committed_tokens;
     const auto start_id = state->tokenizer_info.im_start_token_id;
     const auto end_id = state->tokenizer_info.im_end_token_id;
+    std::vector<uint32_t> newline;
+    if (append_text_ids(state, "\n", &newline) != AXIOM_OK || newline.empty()) return false;
     const std::string assistant_header = std::string("assistant\n") + kNoThinkingPrefix;
     std::string decoded(4u << 20, '\0');
     size_t total_bytes = 0;
@@ -5994,7 +6198,14 @@ bool project_codex_tool_prefix(server_state *state,
             ++end;
         }
         const bool closed = end < committed;
-        const size_t next = end + (closed ? 1 : 0);
+        size_t next = end + (closed ? 1 : 0);
+        bool has_newline = false;
+        if (closed && next < committed) {
+            if (committed - next < newline.size() ||
+                !std::equal(newline.begin(), newline.end(), ids.begin() + next)) return false;
+            next += newline.size();
+            has_newline = true;
+        }
         uint32_t bytes = 0;
         if (axiom_tokenizer_decode_ids(state->tokenizer, ids.data() + start + 1,
                 end - start - 1, decoded.data(), decoded.size(), &bytes) != AXIOM_OK)
@@ -6033,6 +6244,9 @@ bool project_codex_tool_prefix(server_state *state,
             // is not committed). Leave it in the incoming suffix so the real
             // native state consumes it exactly once on resumption.
             if (part + 1 < parts.size() || closed) projected_turn.push_back(end_id);
+            if (part + 1 < parts.size() || has_newline) {
+                projected_turn.insert(projected_turn.end(), newline.begin(), newline.end());
+            }
         }
         changed |= projected_turn.size() != next - start ||
                 !std::equal(projected_turn.begin(), projected_turn.end(), ids.begin() + start);
@@ -6379,13 +6593,15 @@ bool append_multimodal_turn(
         server_state *state, const std::string &role, const ajson *content,
         const std::shared_ptr<vision_request> &request,
         std::vector<uint32_t> *ids, std::vector<int32_t> *slots,
-        std::string *error, const std::string &suffix = {}) {
+        std::string *error, const std::string &suffix = {}, const std::string &prefix = {}) {
     if (!state || !ids || !slots || !error) return false;
     if (!append_prompt_token(state->tokenizer_info.im_start_token_id, -1, ids, slots, error) ||
         !append_prompt_text(state, role + "\n", ids, slots, error) ||
+        !append_prompt_text(state, prefix, ids, slots, error) ||
         !append_multimodal_content(state, content, request, ids, slots, error) ||
         !append_prompt_text(state, suffix, ids, slots, error) ||
-        !append_prompt_token(state->tokenizer_info.im_end_token_id, -1, ids, slots, error)) {
+        !append_prompt_token(state->tokenizer_info.im_end_token_id, -1, ids, slots, error) ||
+        !append_prompt_text(state, "\n", ids, slots, error)) {
         return false;
     }
     return ids->size() <= effective_context_limit(state);
@@ -6491,7 +6707,7 @@ bool finalize_vision_request(
     return true;
 }
 
-bool make_multimodal_chat_ids(
+bool encode_multimodal_chat_ids(
         server_state *state, const ajson &payload, bool anthropic,
         std::vector<uint32_t> *out, std::shared_ptr<vision_request> *out_request,
         std::string *error, uint32_t *original_tokens, bool *compacted) {
@@ -6515,26 +6731,17 @@ bool make_multimodal_chat_ids(
     if (!error->empty() && !no_think) return false;
     ajson normalized_tools;
     if (!normalize_tools(payload.get("tools"), anthropic, &normalized_tools, error)) return false;
-    const ajson *tool_choice = payload.get("tool_choice");
-    const bool tools_enabled = !normalized_tools.arr.empty() && tools_are_enabled(tool_choice);
-
-    const ajson *system = payload.get("system");
-    if (system) {
-        if (!append_multimodal_turn(state, "system", system, request, out,
+    size_t first_message = 0u;
+    const ajson system = initial_chat_system(state, payload, *messages,
+            normalized_tools, no_think, &first_message);
+    out->clear();
+    if (!system.arr.empty()) {
+        if (!append_multimodal_turn(state, "system", &system, request, out,
                                     &request->embedding_slots, error)) return false;
     }
-    if (tools_enabled) {
-        std::string tool_prompt = render_qwen_tools_prompt(normalized_tools, tool_choice);
-        if (!tool_prompt.empty()) {
-            ajson tool_prompt_json = ajson::jstr(std::move(tool_prompt));
-            if (!append_multimodal_turn(
-                    state, "system", &tool_prompt_json, request, out,
-                    &request->embedding_slots, error)) {
-                return false;
-            }
-        }
-    }
-    for (const ajson &message : messages->arr) {
+    bool previous_tool = false;
+    for (size_t message_index = first_message; message_index < messages->arr.size(); ++message_index) {
+        const ajson &message = messages->arr[message_index];
         const ajson *role = message.get("role");
         const ajson *content = message.get("content");
         if (!message.is_object() || !role || !role->is_string() ||
@@ -6560,24 +6767,34 @@ bool make_multimodal_chat_ids(
             }
         }
         if (role->s == "tool") {
-            if (!append_prompt_token(state->tokenizer_info.im_start_token_id, -1, out,
-                                     &request->embedding_slots, error) ||
-                !append_prompt_text(state, "user\n<tool_response>\n", out,
+            if (!previous_tool &&
+                (!append_prompt_token(state->tokenizer_info.im_start_token_id, -1, out,
+                                      &request->embedding_slots, error) ||
+                 !append_prompt_text(state, "user", out, &request->embedding_slots, error))) return false;
+            if (!append_prompt_text(state, "\n<tool_response>\n", out,
                                     &request->embedding_slots, error) ||
                 !append_multimodal_content(state, content, request, out,
                                             &request->embedding_slots, error) ||
                 !append_prompt_text(state, "\n</tool_response>", out,
-                                    &request->embedding_slots, error) ||
-                !append_prompt_token(state->tokenizer_info.im_end_token_id, -1, out,
-                                     &request->embedding_slots, error)) {
+                                    &request->embedding_slots, error)) {
                 return false;
+            }
+            const ajson *next_role = message_index + 1u < messages->arr.size()
+                    ? messages->arr[message_index + 1u].get("role") : nullptr;
+            if (!next_role || !next_role->is_string() || next_role->s != "tool") {
+                if (!append_prompt_token(state->tokenizer_info.im_end_token_id, -1, out,
+                                         &request->embedding_slots, error) ||
+                    !append_prompt_text(state, "\n", out, &request->embedding_slots, error)) return false;
             }
         } else if (!append_multimodal_turn(
                 state, role->s, content, request, out,
                 &request->embedding_slots, error,
-                tool_call_text.empty() ? std::string{} : "\n\n" + tool_call_text)) {
+                tool_call_text.empty() ? std::string{} :
+                    (message_content_text(content).empty() ? "" : "\n\n") + tool_call_text,
+                role->s == "assistant" ? assistant_history_prefix(message) : std::string{})) {
             return false;
         }
+        previous_tool = role->s == "tool";
     }
     std::vector<uint32_t> assistant_prefix;
     if (encode_assistant_prefix(state, no_think, &assistant_prefix, error) != AXIOM_OK) return false;
@@ -6593,9 +6810,21 @@ bool make_multimodal_chat_ids(
         return false;
     }
     *original_tokens = static_cast<uint32_t>(out->size());
-    if (!finalize_vision_request(state, request, error)) return false;
     *out_request = std::move(request);
     return !out->empty();
+}
+
+bool make_multimodal_chat_ids(
+        server_state *state, const ajson &payload, bool anthropic,
+        std::vector<uint32_t> *out, std::shared_ptr<vision_request> *out_request,
+        std::string *error, uint32_t *original_tokens, bool *compacted) {
+    if (!encode_multimodal_chat_ids(state, payload, anthropic, out, out_request,
+            error, original_tokens, compacted)) return false;
+    if (!finalize_vision_request(state, *out_request, error)) {
+        *out_request = nullptr;
+        return false;
+    }
+    return true;
 }
 
 bool make_completion_ids(server_state *state, const ajson &payload, std::vector<uint32_t> *out, std::string *error) {
@@ -6703,6 +6932,11 @@ int drain_generation_utf8(
         generation_stream_sink *sink, const bool final,
         std::string *failure_stage) {
     if (!sink || !sink->emit || !failure_stage) return AXIOM_OK;
+    if (sink->reasoning_separator_pending) {
+        if (!final && (sink->utf8_pending.empty() || sink->utf8_pending == "\n")) return AXIOM_OK;
+        if (sink->utf8_pending.compare(0u, 2u, "\n\n") == 0) sink->utf8_pending.erase(0u, 2u);
+        sink->reasoning_separator_pending = false;
+    }
     std::string ready;
     size_t consumed = 0u;
     try {
@@ -6884,7 +7118,9 @@ int run_utf8_normalization_self_test() {
     };
     constexpr thinking_case thinking_cases[] = {
         {"hidden work</think>visible answer", "hidden work", "visible answer"},
-        {"<think>hidden work</think> visible answer", "hidden work", "visible answer"},
+        {"<think>hidden work</think>\n\nvisible answer", "hidden work", "visible answer"},
+        {"hidden</think>\n\n  answer  \n", "hidden", "  answer  \n"},
+        {"hidden</think>\n\nLiteral </think> stays", "hidden", "Literal </think> stays"},
         {"plain answer", "", "plain answer"},
     };
     for (const thinking_case &entry : thinking_cases) {
@@ -7009,19 +7245,16 @@ int run_speculative_routing_self_test() {
     return 0;
 }
 
-int append_generated_token(
+int emit_generated_token_piece(
         server_state *state,
-        generation_result *out,
         uint32_t token,
         generation_stream_sink *sink,
         std::string *failure_stage) {
-    if (!state || !out || !failure_stage) return AXIOM_ERR_INVALID_ARGUMENT;
+    if (!state || !failure_stage) return AXIOM_ERR_INVALID_ARGUMENT;
     if (generation_cancelled(sink)) {
         *failure_stage = "client_disconnect";
         return AXIOM_ERR_IO;
     }
-    out->ids.push_back(token);
-    if (sink && sink->progress) sink->progress->decode(static_cast<uint32_t>(out->ids.size()));
     if (!sink || !sink->emit) return AXIOM_OK;
 
     char piece[65536]{};
@@ -7041,6 +7274,40 @@ int append_generated_token(
         }
     }
     return drain_generation_utf8(sink, false, failure_stage);
+}
+
+int append_generated_token(
+        server_state *state, generation_result *out, uint32_t token,
+        generation_stream_sink *sink, std::string *failure_stage) {
+    if (!state || !out || !failure_stage) return AXIOM_ERR_INVALID_ARGUMENT;
+    if (generation_cancelled(sink)) {
+        *failure_stage = "client_disconnect";
+        return AXIOM_ERR_IO;
+    }
+    out->ids.push_back(token);
+    if (sink) sink->output_budget.observe(out->ids);
+    if (sink && sink->progress) sink->progress->decode(static_cast<uint32_t>(out->ids.size()));
+    return emit_generated_token_piece(state, token, sink, failure_stage);
+}
+
+int emit_thinking_visible_prefix(
+        server_state *state, const generation_result &thinking,
+        uint32_t visible_tokens, generation_stream_sink *sink,
+        std::string *failure_stage) {
+    if (visible_tokens > thinking.ids.size()) return AXIOM_ERR_INVALID_ARGUMENT;
+    if (!sink || !sink->emit) return AXIOM_OK;
+    // The first pass can already contain the start of the visible answer.
+    // Publish that prefix BEFORE the second pass streams its continuation.
+    // Decode original token pieces, not trimmed/finalized text: whitespace,
+    // partial UTF-8 and split tool markers must carry across the boundary.
+    // These tokens are already committed/accounted; do not append them again.
+    for (size_t index = thinking.ids.size() - visible_tokens;
+         index < thinking.ids.size(); ++index) {
+        const int rc = emit_generated_token_piece(
+                state, thinking.ids[index], sink, failure_stage);
+        if (rc != AXIOM_OK) return rc;
+    }
+    return AXIOM_OK;
 }
 
 uint64_t next_sampling_random(uint64_t *state) {
@@ -7438,7 +7705,8 @@ int native_generate_streaming(
                 rc = append_token(anchor);
             }
         }
-        while (rc == AXIOM_OK && !stopped && out->ids.size() < max_new) {
+        while (rc == AXIOM_OK && !stopped &&
+               generation_tokens_remaining(*out, max_new, sink) != 0u) {
             if (generation_cancelled(sink)) {
                 *failure_stage = "client_disconnect";
                 rc = AXIOM_ERR_IO;
@@ -7976,7 +8244,8 @@ int native_generate(
         }
     }
 
-    if (rc == AXIOM_OK && !stopped && out->ids.size() < max_new) {
+    if (rc == AXIOM_OK && !stopped &&
+        generation_tokens_remaining(*out, max_new, sink) != 0u) {
         if (!session.stream) {
             rc = allocate_device_decode(
                     state, &session, kDeviceChunkCycles, failure_stage);
@@ -8013,7 +8282,8 @@ int native_generate(
     bool device_session_handed_off = false;
     bool device_session_active = false;
     const auto decode_begin = std::chrono::steady_clock::now();
-    while (rc == AXIOM_OK && !stopped && out->ids.size() < max_new &&
+    while (rc == AXIOM_OK && !stopped &&
+           generation_tokens_remaining(*out, max_new, sink) != 0u &&
            committed_position < session_context) {
         if (generation_cancelled(sink)) {
             *failure_stage = "client_disconnect";
@@ -8025,7 +8295,7 @@ int native_generate(
             rc = AXIOM_ERR_BUDGET;
             break;
         }
-        const uint32_t needed = max_new - static_cast<uint32_t>(out->ids.size());
+        const uint32_t needed = generation_tokens_remaining(*out, max_new, sink);
         /* A graph cycle commits between one and VERIFY_WIDTH tokens. Never
          * enqueue a cycle unless its worst-case output fits inside the public
          * max_tokens boundary. The final zero-to-seven slots are completed by
@@ -8414,16 +8684,18 @@ int native_generate(
      * The one-token speculative prefill ABI is not usable here because it is
      * implemented by an eight-token target verification internally. */
     if (rc == AXIOM_OK && device_session_active && !stopped &&
-        out->ids.size() < max_new) {
+        generation_tokens_remaining(*out, max_new, sink) != 0u) {
         rc = end_device_session_exact(committed_position);
     }
     bool hybrid_scalar = false;
-    if (rc == AXIOM_OK && !stopped && out->ids.size() < max_new &&
+    if (rc == AXIOM_OK && !stopped &&
+        generation_tokens_remaining(*out, max_new, sink) != 0u &&
         explicit_speculative) {
         *failure_stage = "explicit_speculative_unexpected_target_handoff";
         rc = AXIOM_ERR_RUNTIME;
     }
-    if (rc == AXIOM_OK && !stopped && out->ids.size() < max_new) {
+    if (rc == AXIOM_OK && !stopped &&
+        generation_tokens_remaining(*out, max_new, sink) != 0u) {
         if (committed_position > session_context ||
             session_context - committed_position >=
                     AXIOM_QWEN38_SPECULATIVE_VERIFY_WIDTH ||
@@ -8456,7 +8728,7 @@ int native_generate(
         }
     }
     while (rc == AXIOM_OK && hybrid_scalar && !stopped &&
-           out->ids.size() < max_new) {
+           generation_tokens_remaining(*out, max_new, sink) != 0u) {
         if (generation_cancelled(sink)) {
             *failure_stage = "client_disconnect";
             rc = AXIOM_ERR_IO;
@@ -8602,13 +8874,11 @@ int native_generate(
     return rc;
 }
 
-size_t find_last_token_sequence(
+size_t find_first_token_sequence(
         const std::vector<uint32_t> &ids, const std::vector<uint32_t> &needle) {
     if (needle.empty() || ids.size() < needle.size()) return std::string::npos;
-    for (size_t end = ids.size(); end >= needle.size(); --end) {
-        const size_t start = end - needle.size();
+    for (size_t start = 0u; start <= ids.size() - needle.size(); ++start) {
         if (std::equal(needle.begin(), needle.end(), ids.begin() + start)) return start;
-        if (end == needle.size()) break;
     }
     return std::string::npos;
 }
@@ -8624,7 +8894,7 @@ int refresh_generation_text(
     if (decode_rc != AXIOM_OK) return decode_rc;
     std::vector<uint32_t> end_marker;
     if (append_text_ids(state, "</think>", &end_marker) == AXIOM_OK) {
-        const size_t marker_start = find_last_token_sequence(result->ids, end_marker);
+        const size_t marker_start = find_first_token_sequence(result->ids, end_marker);
         if (marker_start != std::string::npos) {
             result->thinking_tokens = static_cast<uint32_t>(marker_start + end_marker.size());
             result->visible_output_tokens = static_cast<uint32_t>(
@@ -8751,16 +9021,24 @@ int native_generate_with_thinking(
         thinking_sink.emit = nullptr;
         thinking_sink.user = nullptr;
     }
-    int rc = native_generate(
+    thinking_sink.output_budget = generation_output_budget{};
+    thinking_sink.output_budget.visible_limit = plan.visible_budget;
+    int rc = append_text_ids(state, "</think>",
+                            &thinking_sink.output_budget.reasoning_end_marker);
+    if (rc != AXIOM_OK || thinking_sink.output_budget.reasoning_end_marker.empty()) {
+        *failure_stage = "thinking_end_marker_tokenize";
+        return rc != AXIOM_OK ? rc : AXIOM_ERR_RUNTIME;
+    }
+    rc = native_generate(
             state, prompt_ids, plan.thinking_budget, session_id, profile,
             session_suffix_ids, allow_stateful_resume, &effective_thinking_prompt,
             vision_owner,
             &thinking, failure_stage,
-            sampling, sink ? &thinking_sink : nullptr, requested_mode,
+            sampling, &thinking_sink, requested_mode,
             speculative_max_commit_tokens);
     if (rc != AXIOM_OK) return rc;
 
-    const bool has_end_marker = thinking.text.find("</think>") != std::string::npos;
+    const bool has_end_marker = thinking_sink.output_budget.reasoning_ended;
     const bool naturally_finished = has_end_marker && thinking.finish_reason == "stop";
     if (naturally_finished) {
         return merge_generation_results(
@@ -8778,23 +9056,19 @@ int native_generate_with_thinking(
             return rc;
         }
     }
-    uint32_t visible_already = 0u;
-    if (has_end_marker) {
-        std::vector<uint32_t> end_marker;
-        if (append_text_ids(state, "</think>", &end_marker) == AXIOM_OK) {
-            const size_t marker_start = find_last_token_sequence(thinking.ids, end_marker);
-            if (marker_start != std::string::npos) {
-                visible_already = static_cast<uint32_t>(
-                        thinking.ids.size() - marker_start - end_marker.size());
-            }
-        }
-    }
+    // Reuse the generation-time count. A literal closing tag in the visible
+    // answer must not reset the allowance and authorize another visible pass.
+    const uint32_t visible_already = thinking_sink.output_budget.visible_count;
     if (visible_already >= plan.visible_budget) {
         return merge_generation_results(
                 state, thinking, nullptr, original_prompt_tokens,
                 plan.thinking_budget, out, failure_stage);
     }
     const uint32_t visible_budget = plan.visible_budget - visible_already;
+    if (sink) sink->reasoning_separator_pending = has_end_marker;
+    rc = emit_thinking_visible_prefix(
+            state, thinking, visible_already, sink, failure_stage);
+    if (rc != AXIOM_OK) return rc;
     generation_result visible;
     if (sink && sink->progress) sink->progress->next_pass();
     rc = native_generate(
@@ -8837,6 +9111,7 @@ ajson reasoning_profiles_json() {
         item.set("label", ajson::jstr(selected.label));
         item.set("thinking", ajson::jbool(selected.thinking));
         item.set("thinking_budget_tokens", ajson::jint(selected.thinking_budget_tokens));
+        item.set("native_conditioning", ajson::jstr(native_reasoning_conditioning(selected.id)));
         item.set("max_thinking_budget_tokens",
                  ajson::jint(axiom::reasoning::kMaxThinkingBudgetTokens));
         item.set("budget_fraction_of_max", ajson::jnum(ratio));
@@ -9199,8 +9474,8 @@ ajson session_proof_json(const generation_result &result) {
 ajson completion_response(
         const generation_result &result, bool chat, uint64_t sequence,
         const native_tool_result *tool_result = nullptr) {
-    const std::string visible_text = visible_model_text(result.text);
-    const std::string reasoning_text = reasoning_model_text(result.text);
+    const std::string visible_text = visible_model_text(result.text, result.thinking_budget != 0u);
+    const std::string reasoning_text = reasoning_model_text(result.text, result.thinking_budget != 0u);
     ajson choice = ajson::jobj();
     choice.set("index", ajson::jint(0));
     const bool have_tool_calls = chat && tool_result && tool_result->status == "pass" &&
@@ -9904,7 +10179,7 @@ bool finish_live_chat_stream(
     const bool have_tool_calls = tool_result && tool_result->status == "pass" &&
             !tool_result->calls.empty();
     stream->raw_text = tool_result && !tool_result->content.empty()
-            ? tool_result->content : visible_model_text(result.text);
+            ? tool_result->content : visible_model_text(result.text, result.thinking_budget != 0u);
     if (have_tool_calls) {
         const size_t tool_start = stream->raw_text.find("<tool_call>");
         if (tool_start != std::string::npos) {
@@ -10307,7 +10582,7 @@ bool finish_live_responses_stream(
     const std::string emitted_prefix = stream->raw_text.substr(0, stream->emitted_bytes);
     const std::string accumulated_visible = stream->raw_text.substr(0, live_chat_safe_text_end(stream->raw_text, true));
     stream->raw_text = tool_result && !tool_result->content.empty()
-            ? tool_result->content : visible_model_text(result.text);
+            ? tool_result->content : visible_model_text(result.text, result.thinking_budget != 0u);
     if (have_tool_calls) {
         const size_t tool_start = stream->raw_text.find("<tool_call>");
         if (tool_start != std::string::npos) {
@@ -10550,7 +10825,7 @@ bool finish_live_anthropic_stream(
     const bool have_tool_calls = tool_result && tool_result->status == "pass" &&
             !tool_result->calls.empty();
     stream->raw_text = tool_result && !tool_result->content.empty()
-            ? tool_result->content : visible_model_text(result.text);
+            ? tool_result->content : visible_model_text(result.text, result.thinking_budget != 0u);
     if (have_tool_calls) {
         const size_t tool_start = stream->raw_text.find("<tool_call>");
         if (tool_start != std::string::npos) {
@@ -10594,7 +10869,7 @@ ajson anthropic_response(
     const bool have_tool_calls = tool_result && tool_result->status == "pass" &&
             !tool_result->calls.empty();
     std::string text = tool_result && !tool_result->content.empty()
-            ? tool_result->content : visible_model_text(result.text);
+            ? tool_result->content : visible_model_text(result.text, result.thinking_budget != 0u);
     if (have_tool_calls) {
         const size_t tool_start = text.find("<tool_call>");
         if (tool_start != std::string::npos) text = trim_text(text.substr(0u, tool_start));
@@ -10663,7 +10938,7 @@ ajson responses_response(
     const bool have_tool_calls = tool_result && tool_result->status == "pass" &&
             !tool_result->calls.empty();
     const std::string text = tool_result && tool_result->status == "pass"
-            ? tool_result->content : visible_model_text(result.text);
+            ? tool_result->content : visible_model_text(result.text, result.thinking_budget != 0u);
     const char *terminal_status = codex_provider
             ? codex_response_status(result, have_tool_calls, text) : "completed";
     const bool successful = std::strcmp(terminal_status, "completed") == 0;
@@ -12203,7 +12478,7 @@ void handle_client(int fd, server_state *state) {
         prompt_ok = make_chat_ids(
                                   state, chat_prompt_payload, anthropic, &prompt_ids,
                                   &session_suffix_ids, &error,
-                                  &original_prompt_tokens, &context_compacted);
+                                  &original_prompt_tokens, &context_compacted, &payload);
     }
 
     const bool allow_stateful_session_resume = axiom_codex::allow_stateful_tail(codex_provider,
@@ -12403,7 +12678,7 @@ void handle_client(int fd, server_state *state) {
     result.original_prompt_tokens = original_prompt_tokens;
     result.context_compacted = context_compacted;
     if (tools_enabled || codex_provider) {
-        tool_result = parse_native_tool_calls(result.text, normalized_tools);
+        tool_result = parse_native_tool_calls(result.text, normalized_tools, plan.enabled);
         if (codex_provider && tool_result.status != "fail") {
             std::vector<std::string> call_names;
             for (const auto &call : tool_result.calls) {

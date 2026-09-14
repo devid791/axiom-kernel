@@ -1,0 +1,81 @@
+{
+  "release_id": "axiom-kernel-conversation-reliability-20260913",
+  "release_date": "2026-09-13",
+  "release_type": "sanitized-source-reliability-update",
+  "project": "Axiom Kernel",
+  "license": "MIT",
+  "previous_public_commit": "31006240b2c6119e3b2852590c9d40f527bc6e8c",
+  "previous_release_manifest": "docs/releases/codex-provider-20260911.json",
+  "source_commit": "fffdaf0588b05589fdbeb5bdf517031d3f68f8b6",
+  "source_commit_scope": "Selective source delta on sanitized public history; private history and reports excluded.",
+  "included": [
+    "byte-control-equivalent-prefix-reuse",
+    "codex-tool-history-projection",
+    "opt-in-mixed-resident-cold-attention",
+    "actual-request-progress",
+    "explicit-incomplete-and-empty-response-status",
+    "operator-authoritative-deadlines",
+    "multimodal-assistant-output-text-replay",
+    "regression-tests-and-explicit-live-qa-runners"
+  ],
+  "public_provider_differences": [
+    "loopback-only-default",
+    "activation-controls-removed",
+    "request-serialization-retained",
+    "MEDIA=1-VISION=1-required",
+    "live-runner-default-is-loopback"
+  ],
+  "build_snapshot": {
+    "cuda_arch": "sm_120",
+    "vision": true,
+    "media_decoder": true,
+    "native_reference_global_fast_math": false
+  },
+  "artifact_scope": "Local compile/link and host-test evidence only. No binaries distributed, no public executable deployed and no new model inference run for publication.",
+  "artifact_hashes": {
+    "lib/libaxiom.so": "ac36e89e75fcfd1c7d79c2644a52fca07c58a4638b71a94f83581b188a5f01bb",
+    "bin/axiom-qwen38-api": "7102cd49fa057b280f911634a56491a7a6ae34e7b7b312138e84c47f4fadc559",
+    "bin/axiom-codex-provider-api-test": "0f61e91aa46779bcba9270f0045a6e6e720e46a5fd04631560929e0a33927f37"
+  },
+  "gate_results": {
+    "native_compile_link": "pass",
+    "codex_host_tests": "pass",
+    "mixed_kv_cpu": "pass-10108-checks",
+    "request_progress": "pass-39-checks",
+    "stream_progress": "pass-13-cases",
+    "prefix_reuse": "pass",
+    "multimodal_replay": "pass",
+    "live_runner_syntax": "pass",
+    "tokenizer_replay_binary_build": "pass",
+    "gpu_matrix_binary_build": "pass",
+    "public_scan": "pass",
+    "gitleaks_staged_review": "4 reviewed false positives: API executable SHA-256 values in current and preserved previous manifests; no credentials and no suppressed rules",
+    "public_build_gpu_inference": "not-run",
+    "public_build_gpu_matrix": "not-run"
+  },
+  "source_deployment_evidence": {
+    "scope": "Prior source-derived native deployment, not the independent public build",
+    "gpu_attention_cases": 59,
+    "live_conversation_checks": 23,
+    "live_control_checks": 9,
+    "core_tool_execution": "pass-linux-0.153.4",
+    "details": "docs/CONVERSATION_RELIABILITY.md"
+  },
+  "remaining_gaps": [
+    "multimodal-persistent-KV-reuse-disabled",
+    "full-model-million-token-inference-not-qualified",
+    "arbitrary-history-compaction-quality-not-qualified",
+    "all-desktop-plugin-bot-workflows-not-qualified"
+  ],
+  "exclusions": [
+    "model-weights-and-tokenizer-assets",
+    "private-history-reports-and-network-configuration",
+    "credentials-and-deployment-profiles",
+    "activation-controls-and-DFlash2"
+  ],
+  "health_snapshot": {
+    "production_modified_for_publication": false,
+    "production_restarted_for_publication": false,
+    "new_inference_started_for_publication": false
+  }
+}
